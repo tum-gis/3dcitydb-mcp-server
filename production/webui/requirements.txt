@@ -1,0 +1,19 @@
+# Runtime dependencies for the Gradio webui (production/webui).
+# Pinned with compatible-release operators so patch updates flow in while
+# breaking minors do not.
+
+gradio>=5.0.0,<6.0.0
+litellm~=1.48
+
+python-dotenv~=1.0
+docker~=7.0
+
+# Required to talk to the bundled MCP server over stdio.
+mcp~=1.0
+
+# Local-model agent path (ReAct over Ollama / LangChain).
+langchain~=0.3.0
+langchain-core~=0.3.0
+langchain-openai~=0.2.0
+langchain-anthropic~=0.3.0
+langchain-ollama~=0.2.0

@@ -1,0 +1,63 @@
+services:
+
+  # ── PostgreSQL + 3DCityDB v5 with SFCGAL ───────────────────────────────────
+  postgres:
+    image: khaoulakanna1/3dcitydb-v5-docker-sfcgal-patched:latest
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-citydb}
+      POSTGRES_USER: ${POSTGRES_USER:-citydb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-citydb}
+      SRID: ${SRID:-25832}
+      SRS_NAME: "urn:ogc:def:crs:EPSG::${SRID:-25832}"
+      POSTGIS_SFCGAL: ${POSTGIS_SFCGAL:-true}
+    volumes:
+      - citydb-data:/var/lib/postgresql/data
+    networks:
+      - citydb-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-citydb} -d ${POSTGRES_DB:-citydb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ── Gradio chat UI + importer ──────────────────────────────────────────────
+  citydb-agent:
+    image: khaoulakanna1/citydb-mcp-agent:latest
+    # build: section kept for local builds (see README for Windows note).
+    # Context is the repo root so the Dockerfile can COPY both production/webui
+    # and src/citydb_mcp into the image.
+    build:
+      context: ..
+      dockerfile: production/docker/Dockerfile
+    env_file:
+      - .env
+    environment:
+      - CITYDB_MCP_VARIANT=fullstack
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-citydb}:${POSTGRES_PASSWORD:-citydb}@postgres:5432/${POSTGRES_DB:-citydb}
+      - CITYDB_HOST=postgres
+      - CITYDB_PORT=5432
+      - CITYDB_NAME=${POSTGRES_DB:-citydb}
+      - CITYDB_USER=${POSTGRES_USER:-citydb}
+      - CITYDB_PASSWORD=${POSTGRES_PASSWORD:-citydb}
+      - CITYDB_SCHEMA=${CITYDB_SCHEMA:-citydb}
+      # CITYDB_DOCKER_NETWORK / CITYDB_HOST_DATA_DIR are auto-detected from the
+      # running container; set them only if you need to override the defaults.
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./data:/app/data
+      # Docker socket — needed so Gradio can launch the citydb-tool container
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - citydb-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  citydb-net:
+
+volumes:
+  citydb-data:

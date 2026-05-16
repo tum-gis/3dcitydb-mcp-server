@@ -1,0 +1,25 @@
+# Runtime dependencies for the 3DCityDB MCP server (stdio + SSE) and the
+# bundled LangChain agent CLI. Pinned with compatible-release operators so
+# patch updates flow in but breaking-change minors do not.
+#
+# The Gradio webui has its own pinned set under production/webui/requirements.txt.
+# Starlette/uvicorn are needed only for the SSE transport; the stdio path
+# (used by the webui) does not import them.
+
+mcp~=1.0
+psycopg2-binary~=2.9
+python-dotenv~=1.0
+sqlglot~=23.0
+
+# SSE transport (3dcitydb-mcp-sse). Pinned below the versions that break
+# Gradio 5's TemplateResponse usage when the webui is co-installed.
+starlette~=0.36.0
+uvicorn~=0.27.0
+
+# LangChain agent CLI (3dcitydb-agent). Optional; remove if you only need the
+# MCP server transports.
+langchain~=0.3.0
+langchain-core~=0.3.0
+langchain-openai~=0.2.0
+langchain-anthropic~=0.3.0
+langchain-ollama~=0.2.0

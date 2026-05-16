@@ -1,0 +1,41 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Secrets
+.env
+*.env
+!.env.example
+
+# Dev/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/
+
+# Test & CI
+tests/
+.coverage
+htmlcov/
+
+# Data files (can be large)
+production/data/*.gml
+production/data/*.xml
+production/data/*.zip
+
+# Git
+.git/

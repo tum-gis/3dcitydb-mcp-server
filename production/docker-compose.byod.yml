@@ -1,0 +1,22 @@
+services:
+
+  # ── Gradio chat UI (BYOD: bring your own database) ─────────────────────────
+  # The agent connects to a pre-existing 3DCityDB.
+  # Set DATABASE_URL in production/.env (copy from production/.env.example).
+  citydb-agent:
+    image: khaoulakanna1/citydb-mcp-agent:latest
+    # build: section kept for local builds (see README for Windows note).
+    # Context is the repo root so the Dockerfile can COPY both production/webui
+    # and src/citydb_mcp into the image.
+    build:
+      context: ..
+      dockerfile: production/docker/Dockerfile
+    env_file:
+      - .env
+    environment:
+      - CITYDB_MCP_VARIANT=byod
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

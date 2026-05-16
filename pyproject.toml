@@ -1,0 +1,94 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "3dcitydb-mcp-server"
+version = "0.2.0"
+description = "MCP server for natural-language querying of 3DCityDB v5 semantic city models"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "Khaoula Kanna", email = "khaoula.kanna@tum.de" },
+]
+keywords = [
+    "citygml",
+    "3dcitydb",
+    "mcp",
+    "model-context-protocol",
+    "gis",
+    "llm",
+    "3d-city-models",
+    "spatial-database",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "mcp>=1.0.0",
+    "psycopg2-binary>=2.9.0",
+    "python-dotenv>=1.0.0",
+    "starlette>=0.36.0",
+    "uvicorn>=0.27.0",
+    "sqlglot>=23.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2",
+    "twine>=5.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+3dcitydb-mcp = "citydb_mcp.server:main"
+3dcitydb-mcp-sse = "citydb_mcp.server_sse:main"
+3dcitydb-agent = "citydb_mcp.agent:main"
+3dcitydb-doctor = "citydb_mcp.doctor:main"
+
+[project.urls]
+Homepage = "https://github.com/tum-gis/3dcitydb-mcp-server"
+Documentation = "https://github.com/tum-gis/3dcitydb-mcp-server#readme"
+Issues = "https://github.com/tum-gis/3dcitydb-mcp-server/issues"
+Repository = "https://github.com/tum-gis/3dcitydb-mcp-server"
+Changelog = "https://github.com/tum-gis/3dcitydb-mcp-server/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/citydb_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENCE",
+    "/.env.example",
+    "/pyproject.toml",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]  # line length handled by formatter
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
