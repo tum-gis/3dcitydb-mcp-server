@@ -159,7 +159,7 @@ Run the Gradio chat UI as a Docker container, connected to your existing 3DCityD
 - Docker with Compose (V2)
 - A running **3DCityDB v5** PostgreSQL instance accessible from the Docker host
 
-> **⚠️ Spatial function support:** The AI agent uses SFCGAL functions (`CG_Volume`, `CG_3DArea`, `CG_MakeSolid`) for geometry calculations. These require PostGIS to be compiled with SFCGAL support. Standard PostgreSQL/PostGIS installations (e.g. from `apt`, Homebrew, or plain Docker Hub images) often **do not** include SFCGAL.
+> **⚠️ Spatial function support:** The AI agent uses SFCGAL functions (`CG_Volume`, `CG_3DArea`, `CG_MakeSolid`) for geometry calculations. These require PostGIS to be compiled with SFCGAL support.
 >
 > If your database lacks SFCGAL, volume and 3D area queries will fail silently or return errors. To get full spatial support, use **Option 3 (Fullstack)** instead — it ships a pre-patched `3dcitydb-pg` image with PostGIS + SFCGAL already enabled.
 >
