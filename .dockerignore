@@ -25,14 +25,13 @@ env/
 Thumbs.db
 .idea/
 .vscode/
-.claude/
 
 # Test & CI
 tests/
 .coverage
 htmlcov/
 
-# Data files (can be large)
+# Data files 
 production/data/*.gml
 production/data/*.xml
 production/data/*.zip

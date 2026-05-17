@@ -49,8 +49,8 @@ from webui.mcp_client import assemble_system_prompt_sync, run_tool_sync
 
 _LOCAL_PROVIDERS = ("ollama",)
 
-_CTX_OPTIONS = ["8K (8,192)", "32K (32,768)", "128K (131,072)"]
-_CTX_VALUES = {"8K (8,192)": 8192, "32K (32,768)": 32768, "128K (131,072)": 131072}
+_CTX_OPTIONS = ["8K (8,192)", "32K (32,768)",  "64K (65,536)","128K (131,072)", "256K (262,144)"]
+_CTX_VALUES = {"8K (8,192)": 8192, "32K (32,768)": 32768, "64K (65,536)": 65536, "128K (131,072)": 131072, "256K (262,144)": 262144}
 _CTX_DEFAULT = "32K (32,768)"
 
 VARIANT = os.environ.get("CITYDB_MCP_VARIANT", "byod")
@@ -188,12 +188,23 @@ def _refresh_system_prompt() -> None:
 
 # ── Status checks ──────────────────────────────────────────────────────────────
 
-def _check_db_status() -> bool:
+def _check_db_status() -> str:
+    """Return 'ok', 'empty', or 'unreachable'."""
+    import json as _json
     try:
-        run_tool_sync("get_db_context_snapshot", {})
-        return True
+        raw = run_tool_sync("run_query", {"sql": "SELECT COUNT(*) AS n FROM feature"})
+        try:
+            data = _json.loads(raw)
+            if data.get("error"):
+                return "unreachable"
+            rows = data.get("preview_rows") or data.get("all_rows") or []
+            if rows and int(rows[0].get("n", 1)) == 0:
+                return "empty"
+        except Exception:
+            pass
+        return "ok"
     except Exception:
-        return False
+        return "unreachable"
 
 
 def _check_mcp_status() -> bool:
@@ -216,6 +227,24 @@ def _check_provider_status(provider: str, model: str) -> bool:
 
 def _dot(ok: bool) -> str:
     return "🟢" if ok else "🔴"
+
+
+def _dot_db(status: str) -> str:
+    if status == "ok":
+        return "🟢"
+    if status == "empty":
+        return "🟠"
+    return "🔴"
+
+
+_DB_EMPTY_WARNING = (
+    '<div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;'
+    'padding:10px 14px;margin-bottom:8px;color:#9a3412;font-size:0.87rem;">'
+    "⚠️ <strong>The database is empty</strong> — please import CityGML data first, "
+    "or click <strong>Refresh assembled prompt</strong> in the MCP Inspector tab "
+    "if you are sure the CityGML was already imported."
+    "</div>"
+)
 
 
 def _make_ctx_bar(n_tok: int, ctx_limit: int) -> str:
@@ -253,15 +282,16 @@ def _log_nav_html(page: int, total: int) -> str:
     )
 
 
-def get_status_html(provider: str = "", model: str = "", prompt_mode_label: str = "") -> str:
-    db_ok = _check_db_status()
+def get_status_html(provider: str = "", model: str = "", prompt_mode_label: str = "", db_status: str | None = None) -> str:
+    if db_status is None:
+        db_status = _check_db_status()
     mcp_ok = _check_mcp_status()
     prov_ok = _check_provider_status(provider, model) if provider else False
     prov_label = f"Provider ({provider})" if provider else "Provider"
     mode_span = f'<span>📄 {prompt_mode_label}</span>' if prompt_mode_label else ""
     return (
         f'<div style="display:flex;gap:16px;font-size:0.85rem;padding:6px 0;">'
-        f'<span>{_dot(db_ok)} DB</span>'
+        f'<span>{_dot_db(db_status)} DB</span>'
         f'<span>{_dot(mcp_ok)} MCP server</span>'
         f'<span>{_dot(prov_ok)} {prov_label}</span>'
         f'{mode_span}'
@@ -493,7 +523,23 @@ def chat_stream(
         print(f"[chat] agent_stream raised {type(exc).__name__}: {exc}", flush=True)
         traceback.print_exc()
         trace_md = log(f"❌ **Exception:** `{type(exc).__name__}: {exc}`")
-        history[-1][1] = f"**Error `{type(exc).__name__}`:** {exc}"
+        _exc_name = type(exc).__name__
+        _exc_str = str(exc).lower()
+        _is_auth = (
+            _exc_name in ("AuthenticationError", "PermissionDeniedError", "UnauthorizedError")
+            or "401" in str(exc)
+            or "authentication" in _exc_str
+            or "invalid_api_key" in _exc_str
+            or "api key" in _exc_str
+        )
+        if _is_auth:
+            _key_var = "ANTHROPIC_API_KEY" if provider == "anthropic" else "OPENAI_API_KEY" if provider == "openai" else "API key"
+            history[-1][1] = (
+                f"**Authentication failed.** Your `{_key_var}` appears to be invalid or missing. "
+                f"Check the `.env` file and restart the server."
+            )
+        else:
+            history[-1][1] = f"**Error `{_exc_name}`:** {exc}"
         yield history, history, trace_md, "", gr.update(visible=False), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out
         return
 
@@ -556,22 +602,29 @@ def refresh_ollama_models() -> gr.update:
 # ── Import tab (fullstack only) ────────────────────────────────────────────────
 
 def build_import_tab(reload_tiles_state: gr.State | None = None) -> None:
-    from webui.importer import import_citygml, list_gml_files, run_tiler
+    from webui.importer import import_city_file, list_gml_files, run_tiler
 
-    with gr.Tab("Import CityGML"):
-        gr.Markdown("### Import a CityGML file into 3DCityDB")
+    with gr.Tab("Import CityGML / CityJSON"):
+        gr.Markdown("### Import a CityGML or CityJSON file into 3DCityDB")
         gr.Markdown(
-            "Place your `.gml` file in `./production/data/`, "
-            "then select it below and click **Import**."
+            "Place your file in `./production/data/`, then select it below and click **Import**.  \n"
+            "Supported formats: `.gml`, `.xml` (CityGML) · `.json`, `.jsonl` (CityJSON) · `.gz`, `.gzip`, `.zip` (compressed)"
         )
         with gr.Row():
             file_dropdown = gr.Dropdown(
                 choices=list_gml_files(),
-                label="GML file",
+                label="City model file",
                 info="Files in ./production/data/",
                 scale=4,
             )
             refresh_files_btn = gr.Button("Refresh", scale=1, size="sm")
+
+        format_radio = gr.Radio(
+            choices=["auto", "citygml", "cityjson"],
+            value="auto",
+            label="Format",
+            info="Auto-detect works for most files. Override for plain .zip archives whose format cannot be inferred from the filename.",
+        )
 
         auto_tile_checkbox = gr.Checkbox(
             label="Generate 3D tiles after import",
@@ -598,12 +651,12 @@ def build_import_tab(reload_tiles_state: gr.State | None = None) -> None:
         tiling_done = reload_tiles_state is not None
         extra_outputs = [reload_tiles_state] if tiling_done else []
 
-        def run_import_and_tile(filename: str, auto_tile: bool, current_reload: int = 0):
+        def run_import_and_tile(filename: str, fmt_override: str, auto_tile: bool, current_reload: int = 0):
             log = ""
             import_succeeded = False
             no_change = current_reload
 
-            for line in import_citygml(filename):
+            for line in import_city_file(filename, fmt_override):
                 log += line
                 if "Import finished successfully" in line:
                     import_succeeded = True
@@ -641,7 +694,7 @@ def build_import_tab(reload_tiles_state: gr.State | None = None) -> None:
 
         import_btn.click(
             fn=run_import_and_tile,
-            inputs=[file_dropdown, auto_tile_checkbox] + ([reload_tiles_state] if tiling_done else []),
+            inputs=[file_dropdown, format_radio, auto_tile_checkbox] + ([reload_tiles_state] if tiling_done else []),
             outputs=[import_log] + extra_outputs,
         )
 
@@ -814,6 +867,7 @@ def build_ui() -> gr.Blocks:
                     if ENABLE_VIZ:
                         with gr.Row(equal_height=True):
                             with gr.Column(scale=1, min_width=360):
+                                db_warning = gr.HTML(value="")
                                 chatbot = gr.Chatbot(
                                     height=460,
                                     type="tuples",
@@ -855,6 +909,7 @@ def build_ui() -> gr.Blocks:
                     else:
                         with gr.Row(equal_height=False):
                             with gr.Column(scale=3, min_width=380):
+                                db_warning = gr.HTML(value="")
                                 chatbot = gr.Chatbot(
                                     height=500,
                                     type="tuples",
@@ -1126,12 +1181,15 @@ window._reloadTiles = function() {
 
         def _on_load(provider: str, model: str, prompt_mode: str, num_ctx_label: str):
             _, label = _resolve_compact(prompt_mode, provider, model)
-            return get_status_html(provider, model, prompt_mode_label=label), clear_chat(provider, model, prompt_mode, num_ctx_label)[5]
+            db_status = _check_db_status()
+            status_html = get_status_html(provider, model, prompt_mode_label=label, db_status=db_status)
+            warning_html = _DB_EMPTY_WARNING if db_status == "empty" else ""
+            return status_html, clear_chat(provider, model, prompt_mode, num_ctx_label)[5], warning_html
 
         demo.load(
             fn=_on_load,
             inputs=[provider_radio, model_dropdown, prompt_mode_radio, num_ctx_dropdown],
-            outputs=[status_bar, context_bar],
+            outputs=[status_bar, context_bar, db_warning],
         )
 
     return demo

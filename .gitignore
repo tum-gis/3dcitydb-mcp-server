@@ -1,0 +1,6 @@
+.env
+# Data files 
+production/data/*.gml
+production/data/*.xml
+production/data/*.zip
+production/data/*.json

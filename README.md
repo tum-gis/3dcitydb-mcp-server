@@ -15,7 +15,7 @@ It dynamically resolves object classes, properties, codelists, and generic attri
 - **Read-only query execution** — `run_query` enforces SELECT-only; writes are blocked
 - **Prompt assembly** — `assemble_prompt` orchestrates all tools into a complete system prompt in one call
 - **Gradio chat UI** — browser-based interface with multi-LLM support (Anthropic, OpenAI, Ollama)
-- **CityGML import** — one-click import via the Gradio UI (fullstack Docker mode only)
+- **CityGML/CityJSON import** — one-click import via the Gradio UI (fullstack Docker mode only)
 
 ---
 
@@ -28,7 +28,7 @@ There are three ways to run the 3DCityDB MCP Server:
 | **Best for** | Claude Code / Claude Desktop power users | Existing 3DCityDB instances | Starting from a `.gml` file |
 | **Requires** | Python 3.10+, running 3DCityDB | Docker, running 3DCityDB | Docker only |
 | **Gradio UI** | No (uses your AI client directly) | Yes (`localhost:7860`) | Yes (`localhost:7860`) |
-| **CityGML import** | Manual | Manual | Via Gradio UI |
+| **CityGML/CityJSON import** | Manual | Manual | Via Gradio UI |
 | **Database** | Your own | Your own | Bundled (PostgreSQL + PostGIS + SFCGAL) |
 
 ---
@@ -264,7 +264,7 @@ Run everything — PostgreSQL (with PostGIS and SFCGAL), the 3DCityDB schema, th
 ### Prerequisites
 
 - Docker with Compose (V2)
-- A `.gml` CityGML file to import (optional — the database starts empty)
+- A CityGML or CityJSON file to import (optional — the database starts empty)
 
 ### Quick Start
 
@@ -320,13 +320,13 @@ $env:DOCKER_BUILDKIT=0; docker compose -f docker-compose.fullstack.yml up -d --b
 > **Windows note:** Only needed when building locally with `--build`.
 > The default `docker compose up -d` (pull from Docker Hub) works on Windows without any workaround.
 
-### Import CityGML
+### Import CityGML/CityJSON
 
 Once the UI is open:
 
-1. Go to the **Import CityGML** tab
+1. Go to the **Import CityGML/CityJSON** tab
 2. Click **Refresh** to see files in `./production/data/`
-3. Select your `.gml` file and click **Import**
+3. Select your file and click **Import**
 4. Watch the live log — the import runs via [`ghcr.io/3dcitydb/citydb-tool`](https://github.com/3dcitydb/citydb-tool) (pulled automatically)
 
 > The data directory is mounted at `./production/data/` on the host and `/app/data/` inside the container.

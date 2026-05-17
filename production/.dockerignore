@@ -25,7 +25,6 @@ env/
 Thumbs.db
 .idea/
 .vscode/
-.claude/
 
 # Test & CI
 tests/

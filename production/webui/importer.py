@@ -96,12 +96,32 @@ def _tiles_volume_name(client) -> str:
     return "production_tiles_data"
 
 
+_SUPPORTED_EXTENSIONS = (".gml", ".xml", ".citygml", ".json", ".jsonl", ".gz", ".gzip", ".zip")
+
+
+def _detect_format(filename: str) -> str:
+    """Return 'cityjson' or 'citygml' based on file extension.
+
+    For compressed files (.gz, .gzip, .zip), the inner extension is checked
+    (e.g. 'model.json.gz' → cityjson). Plain archives with no recognisable
+    inner extension default to 'citygml'.
+    """
+    name = filename.lower()
+    for ext in (".gz", ".gzip", ".zip"):
+        if name.endswith(ext):
+            name = name[: -len(ext)]
+            break
+    if name.endswith((".json", ".jsonl")):
+        return "cityjson"
+    return "citygml"
+
+
 def list_gml_files() -> list[str]:
     if not DATA_DIR.exists():
         return []
     return sorted(
         f.name for f in DATA_DIR.iterdir()
-        if f.suffix.lower() in (".gml", ".xml", ".citygml")
+        if f.suffix.lower() in _SUPPORTED_EXTENSIONS
     )
 
 
@@ -214,7 +234,7 @@ def run_tiler() -> Generator[str, None, None]:
             pass
 
 
-def import_citygml(filename: str) -> Generator[str, None, None]:
+def import_city_file(filename: str, fmt_override: str = "auto") -> Generator[str, None, None]:
     try:
         import docker
     except ImportError:
@@ -248,7 +268,24 @@ def import_citygml(filename: str) -> Generator[str, None, None]:
         yield f"ERROR: File not found: {gml_path}\n"
         return
 
-    yield f"Starting import of {filename}...\n"
+    if fmt_override in ("citygml", "cityjson"):
+        fmt = fmt_override
+        yield f"Starting import of {filename} (format: {fmt}, manually selected)...\n"
+    else:
+        fmt = _detect_format(filename)
+        _lower = filename.lower()
+        _ambiguous = _lower.endswith(".zip") and not (
+            _lower.endswith(".json.zip") or _lower.endswith(".jsonl.zip")
+        )
+        if _ambiguous:
+            yield (
+                f"Starting import of {filename} (format: {fmt}, auto-detected)...\n"
+                f"  ⚠ ZIP archive detected — defaulted to {fmt}. "
+                f"Use the Format selector if the archive contains "
+                f"{'CityGML' if fmt == 'cityjson' else 'CityJSON'} files instead.\n"
+            )
+        else:
+            yield f"Starting import of {filename} (format: {fmt}, auto-detected)...\n"
 
     try:
         client = docker.from_env()
@@ -263,7 +300,7 @@ def import_citygml(filename: str) -> Generator[str, None, None]:
     try:
         container = client.containers.run(
             image=CITYDB_TOOL_IMAGE,
-            command=f"import citygml /data/{filename}",
+            command=f"import {fmt} /data/{filename}",
             environment=_db_env(),
             volumes={host_data_dir: {"bind": "/data", "mode": "rw"}},
             network=network,

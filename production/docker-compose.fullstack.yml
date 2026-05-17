@@ -55,6 +55,7 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    user: root
 
 networks:
   citydb-net:
