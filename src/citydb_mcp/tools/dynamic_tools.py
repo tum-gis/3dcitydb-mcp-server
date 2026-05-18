@@ -1297,12 +1297,13 @@ def get_geometry_types_per_class(db: DatabaseConnection) -> dict:
 
     geometry_properties is a JSON column encoding the geometry hierarchy.
     The 'type' field at the top level tells you the outermost geometry kind:
-      3 = MultiSurface      (surface collection — use for surface area)
-      4 = CompositeSurface  (connected surfaces — use for surface area)
       5 = Polygon           (single face — leaf geometry)
-      6 = TriangulatedSurface
-      8 = Solid             (enclosed volume — use CG_Volume for volume)
-      9 = CompositeSolid    (multiple solids — use CG_Volume for volume)
+      6 = CompositeSurface  (connected surfaces — use CG_3DArea)
+      7 = TriangulatedSurface (use CG_3DArea)
+      8 = MultiSurface      (surface collection — use CG_3DArea)
+      9 = Solid             (enclosed volume — use CG_Volume)
+      10 = CompositeSolid   (multiple solids — use CG_Volume)
+      11 = MultiSolid       (multiple solids — use CG_Volume)
     """
     TYPE_LABELS = {
         1: "Point",
