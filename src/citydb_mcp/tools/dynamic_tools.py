@@ -87,7 +87,7 @@ def _get_country_from_epsg(epsg_code: int) -> str:
     return "UNKNOWN"
 
 
-# Standardized CityGML roofType codes (same everywhere, SIG3D standard)
+# Standardized CityGML roofType codes (SIG3D standard, used for non-DE countries)
 _ROOFTYPE_STANDARD = {
     "1000": "flat roof",
     "1010": "monopitch roof",
@@ -109,19 +109,21 @@ _ROOFTYPE_STANDARD = {
 COUNTRY_CODELISTS = {
     "DE": {
         "roofType": {
-            **_ROOFTYPE_STANDARD,
-            # ALKIS roof type codes
-            "2100": "gabled roof",
-            "2200": "hipped roof",
-            "3100": "flat roof",
-            "3200": "monopitch roof",
-            "3300": "dual pent roof",
-            "3400": "gabled roof",
-            "3500": "hipped roof",
-            "3600": "half-hipped roof",
-            "3700": "mansard roof",
-            "3800": "pavilion roof",
-            "3900": "other roof form",
+            "1000": "Flachdach",
+            "2100": "Pultdach",
+            "2200": "Versetztes Pultdach",
+            "3100": "Satteldach",
+            "3200": "Walmdach",
+            "3300": "Krüppelwalmdach",
+            "3400": "Mansardendach",
+            "3500": "Zeltdach",
+            "3600": "Kegeldach",
+            "3700": "Kuppeldach",
+            "3800": "Sheddach",
+            "3900": "Bogendach",
+            "4000": "Turmdach",
+            "5000": "Mischform",
+            "9999": "Sonstiges",
         },
         "function": {
             # ALKIS building function codes (AdV)
@@ -159,14 +161,6 @@ COUNTRY_CODELISTS = {
             "2000": "commercial/industrial",
             "3000": "public use",
         },
-    },
-    "JP": {
-        "roofType": _ROOFTYPE_STANDARD,
-        # Japan uses different building classification (用途)
-        # stored as generic attributes in PLATEAU datasets
-    },
-    "NL": {
-        "roofType": _ROOFTYPE_STANDARD,
     },
     "DEFAULT": {
         "roofType": _ROOFTYPE_STANDARD,
@@ -920,7 +914,7 @@ def get_examples(available_objectclass_ids: list[int]) -> ExamplesLibrary:
 
         "0_volume_query":
 """-- Volume of a feature (use geometry_properties type filter to target Solid rows only)
--- Filter (geometry_properties->>'type')::int IN (8,9) ensures only Solid/CompositeSolid rows
+-- Filter (geometry_properties->>'type')::int IN (9,10,11) ensures only Solid/CompositeSolid/MultiSolid rows
 -- are joined — avoids processing MultiSurface rows that also exist for the same feature.
 SELECT f.objectid, CG_Volume(CG_MakeSolid(g.geometry)) AS volume_m3
 FROM feature f
@@ -928,18 +922,18 @@ JOIN geometry_data g ON g.feature_id = f.id
 WHERE f.objectclass_id = <ID>
   AND g.geometry IS NOT NULL
   AND ST_IsClosed(g.geometry) = true
-  AND (g.geometry_properties->>'type')::int IN (8, 9)
+  AND (g.geometry_properties->>'type')::int IN (9, 10, 11)
 ORDER BY volume_m3 DESC LIMIT 10;""",
 
         "1_direct_query":
-"""-- Surface area of a feature (target MultiSurface/CompositeSurface rows only)
--- Filter (geometry_properties->>'type')::int IN (3,4) avoids Solid rows that may also exist.
+"""-- Surface area of a feature (target CompositeSurface/MultiSurface rows only)
+-- Filter (geometry_properties->>'type')::int IN (6,8) avoids Solid rows that may also exist.
 SELECT COUNT(*), SUM(CG_3DArea(g.geometry)) AS total_area_m2
 FROM feature f
 JOIN geometry_data g ON g.feature_id = f.id
 WHERE f.objectclass_id = <ID>
   AND g.geometry IS NOT NULL
-  AND (g.geometry_properties->>'type')::int IN (3, 4);""",
+  AND (g.geometry_properties->>'type')::int IN (6, 8);""",
 
         "2_boundary_1hop":
 """-- val_relation_type=1: parent→boundary children (e.g. TrafficSpace→TrafficArea, Building→WallSurface)
@@ -1311,12 +1305,17 @@ def get_geometry_types_per_class(db: DatabaseConnection) -> dict:
       9 = CompositeSolid    (multiple solids — use CG_Volume for volume)
     """
     TYPE_LABELS = {
-        3: "MultiSurface (area)",
-        4: "CompositeSurface (area)",
+        1: "Point",
+        2: "MultiPoint",
+        3: "LineString",
+        4: "MultiLineString",
         5: "Polygon (leaf)",
-        6: "TriangulatedSurface",
-        8: "Solid (volume)",
-        9: "CompositeSolid (volume)",
+        6: "CompositeSurface (area)",
+        7: "TriangulatedSurface (area)",
+        8: "MultiSurface (area)",
+        9: "Solid (volume)",
+        10: "CompositeSolid (volume)",
+        11: "MultiSolid (volume)",
     }
 
     # The ->>'type' cast to int will fail if any row has a non-integer "type"
@@ -1565,6 +1564,13 @@ def get_spatial_capabilities(db: DatabaseConnection) -> dict:
                 "CG_3DDistance(geomA, geomB) — 3D distance between geometries",
                 "CG_IsSolid(geometry) — check if geometry is a valid solid",
                 "CG_Tesselate(geometry) — triangulate surfaces",
+                "CG_3DIntersects(geomA, geomB) — tests if two 3D geometries intersect",
+                "CG_3DIntersection(geomA, geomB) — computes the 3D intersection of two geometries",
+                "CG_3DUnion(geomA, geomB) — computes the 3D union of two geometries",
+                "CG_3DDifference(geomA, geomB) — computes the 3D difference of two geometries",
+                "CG_Extrude(geom, x float, y float, z float) — extrudes a line to a surface or a surface to a volume",
+                "CG_3DBuffer(geom, radius float8, segments integer, buffer_type integer) — generates a 3D buffer around the input geometry; buffer_type: 0=rounded (default), 1=flat, 2=square; minimum 4 segments",
+                "CG_3DTranslate(geom, deltaX, deltaY, deltaZ) — translates (moves) a geometry by given offsets in 3D space",
             ]
     except Exception:
         pass
