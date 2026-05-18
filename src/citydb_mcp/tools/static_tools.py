@@ -168,7 +168,7 @@ def get_query_guidelines(db: DatabaseConnection) -> QueryGuidelines:
             "For 3D volume calculations, use CG_Volume(CG_MakeSolid(geometry)). Geometry must be a closed PolyhedralSurface.",
             "For true 3D surface area (accounting for tilted surfaces), use CG_3DArea(geometry). ST_Area only gives 2D projected area.",
             "Always check ST_IsClosed(geometry) = true before volume/solid calculations to avoid errors.",
-            "Filter geometry_data by type using (g.geometry_properties->>'type')::int: use IN (8,9) for Solid/CompositeSolid (volume), IN (3,4) for MultiSurface/CompositeSurface (area). A feature can have multiple geometry_data rows — always filter by type to avoid duplicates.",
+            "Filter geometry_data by type using (g.geometry_properties->>'type')::int: use IN (9,10,11) for Solid/CompositeSolid/MultiSolid (volume), IN (6,8) for CompositeSurface/MultiSurface (area). A feature can have multiple geometry_data rows — always filter by type to avoid duplicates.",
             "CG_3DDistance(geomA, geomB) gives true 3D distance between geometries.",
         ], 
         category="3dcitydb_v5",
