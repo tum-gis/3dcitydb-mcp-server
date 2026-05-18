@@ -721,8 +721,8 @@ def _render_examples(examples: ExamplesLibrary) -> str:
     lines.append("")
 
     pattern_labels = {
-        "0_volume_query":    "Pattern 0 — Volume query (Solid geometry, type IN (8,9))",
-        "1_direct_query":    "Pattern 1 — Surface area query (MultiSurface/CompositeSurface, type IN (3,4))",
+        "0_volume_query":    "Pattern 0 — Volume query (Solid geometry, type IN (9,10,11))",
+        "1_direct_query":    "Pattern 1 — Surface area query (CompositeSurface/MultiSurface, type IN (6,8))",
         "2_boundary_1hop":   "Pattern 2 — 1-hop boundary relationship (val_relation_type = 1)",
         "3_space_1hop":      "Pattern 3 — 1-hop space relationship (val_relation_type = 0)",
         "4_chain_2hop":      "Pattern 4 — 2-hop chain (grandparent → intermediate → leaf)",
