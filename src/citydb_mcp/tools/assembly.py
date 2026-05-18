@@ -24,7 +24,7 @@ _COMPACT_SCHEMA = """\
 | feature | id, objectclass_id (→objectclass.id), objectid, envelope |
 | property | id, feature_id (→feature.id), parent_id (→property.id), name, namespace_id, val_string, val_int, val_double, val_timestamp, val_address_id (→address.id), val_feature_id (→feature.id), val_relation_type |
 | address | id, street, house_number, zip_code, city |
-| geometry_data | id, feature_id (→feature.id), geometry, geometry_properties (JSON — type code: 3/4=MultiSurface/CompositeSurface for CG_3DArea, 8/9=Solid/CompositeSolid for CG_Volume) |
+| geometry_data | id, feature_id (→feature.id), geometry, geometry_properties (JSON — type code: 6=CompositeSurface, 8=MultiSurface → CG_3DArea; 9=Solid, 10=CompositeSolid, 11=MultiSolid → CG_Volume) |
 | objectclass | id, classname, is_toplevel, namespace_id |"""
 
 # Semantic hints for non-toplevel CityGML classes so the LLM can map
@@ -164,8 +164,8 @@ def assemble_prompt(
     if compact:
         sections.append(
             "## Geometry Type Reference\n\n"
-            "`geometry_properties->>'type'` codes: **8 or 9** → volume (Solid/CompositeSolid, use `CG_Volume`); "
-            "**3 or 4** → surface area (MultiSurface/CompositeSurface, use `CG_3DArea`). "
+            "`geometry_properties->>'type'` codes: **9, 10, 11** → volume (Solid/CompositeSolid/MultiSolid, use `CG_Volume`); "
+            "**6, 8** → surface area (CompositeSurface/MultiSurface, use `CG_3DArea`). "
             "Always filter by type code — a feature can have multiple geometry_data rows."
         )
     elif geom_types:
@@ -348,12 +348,17 @@ def _render_geometry_type_guide(geom_types: dict) -> str:
     lines.append("")
     lines.append("| type code | GML geometry kind       | Use for                           |")
     lines.append("|-----------|-------------------------|-----------------------------------|")
-    lines.append("| 3         | MultiSurface            | Surface area (CG_3DArea)          |")
-    lines.append("| 4         | CompositeSurface        | Surface area (CG_3DArea)          |")
+    lines.append("| 1         | Point                   | —                                 |")
+    lines.append("| 2         | MultiPoint              | —                                 |")
+    lines.append("| 3         | LineString              | —                                 |")
+    lines.append("| 4         | MultiLineString         | —                                 |")
     lines.append("| 5         | Polygon (single face)   | Leaf surface — usually not targeted directly |")
-    lines.append("| 6         | TriangulatedSurface     | Surface area (CG_3DArea)          |")
-    lines.append("| 8         | Solid                   | Volume (CG_Volume + CG_MakeSolid) |")
-    lines.append("| 9         | CompositeSolid          | Volume (CG_Volume + CG_MakeSolid) |")
+    lines.append("| 6         | CompositeSurface        | Surface area (CG_3DArea)          |")
+    lines.append("| 7         | TriangulatedSurface     | Surface area (CG_3DArea)          |")
+    lines.append("| 8         | MultiSurface            | Surface area (CG_3DArea)          |")
+    lines.append("| 9         | Solid                   | Volume (CG_Volume + CG_MakeSolid) |")
+    lines.append("| 10        | CompositeSolid          | Volume (CG_Volume + CG_MakeSolid) |")
+    lines.append("| 11        | MultiSolid              | Volume (CG_Volume + CG_MakeSolid) |")
     lines.append("")
     lines.append("**IMPORTANT:** A single feature may have multiple geometry_data rows (e.g. one Solid for")
     lines.append("volume AND one MultiSurface for surface area). Always filter by type code to avoid")
@@ -361,14 +366,14 @@ def _render_geometry_type_guide(geom_types: dict) -> str:
     lines.append("")
     lines.append("**Example filter patterns:**")
     lines.append("```sql")
-    lines.append("-- Volume query: target Solid / CompositeSolid rows")
+    lines.append("-- Volume query: target Solid / CompositeSolid / MultiSolid rows")
     lines.append("JOIN geometry_data g ON g.feature_id = f.id")
-    lines.append("WHERE (g.geometry_properties->>'type')::int IN (8, 9)")
+    lines.append("WHERE (g.geometry_properties->>'type')::int IN (9, 10, 11)")
     lines.append("  AND g.geometry IS NOT NULL")
     lines.append("")
-    lines.append("-- Surface area query: target MultiSurface / CompositeSurface rows")
+    lines.append("-- Surface area query: target CompositeSurface / MultiSurface rows")
     lines.append("JOIN geometry_data g ON g.feature_id = f.id")
-    lines.append("WHERE (g.geometry_properties->>'type')::int IN (3, 4)")
+    lines.append("WHERE (g.geometry_properties->>'type')::int IN (6, 8)")
     lines.append("  AND g.geometry IS NOT NULL")
     lines.append("```")
     lines.append("")
@@ -378,12 +383,17 @@ def _render_geometry_type_guide(geom_types: dict) -> str:
     lines.append("|----------------|-----------|-----------|---------------|-----------|")
 
     TYPE_LABELS = {
-        3: "MultiSurface",
-        4: "CompositeSurface",
+        1: "Point",
+        2: "MultiPoint",
+        3: "LineString",
+        4: "MultiLineString",
         5: "Polygon (leaf)",
-        6: "TriangulatedSurface",
-        8: "Solid",
-        9: "CompositeSolid",
+        6: "CompositeSurface",
+        7: "TriangulatedSurface",
+        8: "MultiSurface",
+        9: "Solid",
+        10: "CompositeSolid",
+        11: "MultiSolid",
     }
 
     for oc_id, info in sorted(geom_types.items()):
@@ -483,8 +493,8 @@ def _render_objectclasses(catalog: ObjectClassCatalog, compact: bool = False) ->
             lines.append("  Always query geometry_data directly (JOIN geometry_data g ON g.feature_id = f.id).")
             lines.append("  A single building may have multiple geometry_data rows (one solid, one surface).")
             lines.append("  Filter by geometry type using: (g.geometry_properties->>'type')::int")
-            lines.append("    - Volume queries:       WHERE (g.geometry_properties->>'type')::int IN (8, 9)  -- Solid / CompositeSolid")
-            lines.append("    - Surface area queries: WHERE (g.geometry_properties->>'type')::int IN (3, 4)  -- MultiSurface / CompositeSurface")
+            lines.append("    - Volume queries:       WHERE (g.geometry_properties->>'type')::int IN (9, 10, 11)  -- Solid / CompositeSolid / MultiSolid")
+            lines.append("    - Surface area queries: WHERE (g.geometry_properties->>'type')::int IN (6, 8)  -- CompositeSurface / MultiSurface")
             lines.append("  If geometry_data is empty/null, fall back to boundary surfaces (GroundSurface, RoofSurface, etc.).")
             lines.append("  Volume: CG_Volume(CG_MakeSolid(g.geometry)) — geometry must be closed (ST_IsClosed = true).")
             lines.append("")
@@ -679,7 +689,7 @@ def _render_query_guidelines_compact() -> str:
         "`JOIN property child ON child.parent_id = parent.id AND child.name = 'value'` — "
         "the parent row's `val_*` columns are NULL.",
         "- A single feature can have multiple `geometry_data` rows (one Solid, one MultiSurface). "
-        "Always add `WHERE (g.geometry_properties->>'type')::int IN (...)` to avoid duplicate rows in aggregations.",
+        "Always add `WHERE (g.geometry_properties->>'type')::int IN (9,10,11)` for volume or `IN (6,8)` for surface area to avoid duplicate rows in aggregations.",
     ])
 
 
