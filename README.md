@@ -1,8 +1,11 @@
 # 3DCityDB MCP Server
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that gives AI assistants direct, natural language access to the **3DCityDB v5**.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server giving AI assistants direct, natural language access to semantic 3D city models in CityGML managed within a **3DCityDB v5** geodatabase.
 
-It dynamically resolves object classes, properties, codelists, and generic attributes from the database so the AI can answer spatial questions, write and execute SQL queries, and reason about CityGML data — without any manual prompt engineering.
+It dynamically resolves object classes, properties, codelists, and generic attributes from the database so the AI can answer both spatial and semantic queries stated in natural language, write and execute SQL queries, and reason about CityGML data — without any manual prompt engineering. 
+By including the MCP server in agentic coding environments, it becomes very easy to create software that can read and write complex structured 3D city models compliant to the OGC CityGML standard (and using 3DCityDB V5 as the data repository).
+
+Furthermore, a **Chat Assistant** is included offering a simple GUI for interactive query asking, reasoning, and answering. It is an agentic AI tool based on LangChain utilising the ReAct pattern for carrying out multi-step reasoning and automated error corrections. The Chat Assistent currently can be configured to work with OpenAI and Anthropic commercial LLMs as well as with Ollama locally running LLMs. For example, when using the qwen3.6:27b LLM running in Ollama, the Chat Assistant is capable of performing very complex analyses of any kind of stored 3D city model. 
 
 ---
 
@@ -15,7 +18,7 @@ It dynamically resolves object classes, properties, codelists, and generic attri
 - **Read-only query execution** — `run_query` enforces SELECT-only; writes are blocked
 - **Prompt assembly** — `assemble_prompt` orchestrates all tools into a complete system prompt in one call
 - **Gradio chat UI** — browser-based interface with multi-LLM support (Anthropic, OpenAI, Ollama)
-- **CityGML/CityJSON import** — one-click import via the Gradio UI (fullstack Docker mode only)
+- **CityGML 1.0-3.0/CityJSON import** — one-click import via the Gradio UI (fullstack Docker mode only)
 
 ---
 
