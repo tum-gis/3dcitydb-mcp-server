@@ -1,11 +1,11 @@
 # 3DCityDB MCP Server
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server giving AI assistants direct, natural language access to semantic 3D city models in CityGML managed within a **3DCityDB v5** geodatabase.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server giving AI assistants direct, natural language access to semantic 3D city models in CityGML managed within a [**3DCityDB v5**](https://github.com/3dcitydb/3dcitydb) geodatabase.
 
-It dynamically resolves object classes, properties, codelists, and generic attributes from the database so the AI can answer both spatial and semantic queries stated in natural language, write and execute SQL queries, and reason about CityGML data — without any manual prompt engineering. 
-By including the MCP server in agentic coding environments, it becomes very easy to create software that can read and write complex structured 3D city models compliant to the OGC CityGML standard (and using 3DCityDB V5 as the data repository).
+It dynamically resolves CityGML object classes, properties, codelists, and generic attributes from the database so the AI can answer both spatial and semantic queries stated in natural language, write and execute SQL queries, and reason about CityGML data — without any manual prompt engineering. 
+By including the MCP server in agentic coding environments, it becomes easy to create software that can read and write complex structured 3D city models compliant to the [OGC CityGML standard](https://www.ogc.org/standards/citygml/) (and using [3DCityDB V5](https://github.com/3dcitydb/3dcitydb) as the data repository).
 
-Furthermore, a **Chat Assistant** is included offering a simple GUI for interactive query asking, reasoning, and answering. It is an agentic AI tool based on LangChain utilising the ReAct pattern for carrying out multi-step reasoning and automated error corrections. The Chat Assistent currently can be configured to work with OpenAI and Anthropic commercial LLMs as well as with Ollama locally running LLMs. For example, when using the qwen3.6:27b LLM running in Ollama, the Chat Assistant is capable of performing very complex analyses of any kind of stored 3D city model. 
+Furthermore, a **Chat Assistant** is included offering a simple GUI for interactive query asking, reasoning, and answering. It is an agentic AI tool based on [LangChain](https://github.com/langchain-ai) utilising the [ReAct pattern](https://reference.langchain.com/javascript/langchain-react) for carrying out multi-step reasoning and automated error corrections. The Chat Assistent currently can be configured to work with OpenAI and Anthropic commercial LLMs as well as with locally running [Ollama](https://github.com/ollama/ollama) LLMs. For example, when using the [`qwen3.6:27b](https://ollama.com/library/qwen3.6:27b) LLM running in Ollama, the Chat Assistant is capable of performing very complex analyses on any kind of stored 3D city model. 
 
 ---
 
