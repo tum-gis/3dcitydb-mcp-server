@@ -833,13 +833,41 @@ def get_db_context_snapshot(db: DatabaseConnection) -> DBContextSnapshot:
     available_ids = list(features_per_class.keys())
 
     # Coordinate system
-    coord_system = ""
-    if srs:
-        coord_system = f"EPSG:{srs['srid']}"
+    epsg_code = srs["srid"] if srs else 0
+    coord_system = f"EPSG:{epsg_code}" if epsg_code else ""
+
+    # Detect whether the SRID is a 2D CRS by querying spatial_ref_sys.
+    # A compound or geographic 3D CRS has COMPD_CS or GEOGCS[... with AXIS containing UP.
+    # For simplicity: absence of VERT_CS / COMPD_CS in srtext → 2D.
+    srid_is_2d = True
+    if epsg_code:
+        try:
+            srs_row = db.execute_single(
+                "SELECT srtext FROM spatial_ref_sys WHERE srid = %s", (epsg_code,)
+            )
+            if srs_row and srs_row["srtext"]:
+                srtext = srs_row["srtext"].upper()
+                srid_is_2d = "COMPD_CS" not in srtext and "VERT_CS" not in srtext
+        except Exception:
+            srid_is_2d = True  # assume 2D on error
+
+    # Actual geometry coordinate dimension from the data
+    coord_dim = 0
+    try:
+        dim_row = db.execute_single(
+            "SELECT ST_CoordDim(geometry) AS dim FROM geometry_data "
+            "WHERE geometry IS NOT NULL LIMIT 1"
+        )
+        if dim_row:
+            coord_dim = dim_row["dim"] or 0
+    except Exception:
+        coord_dim = 0
+
+    z_reference = os.getenv("CITYDB_Z_REFERENCE", "meters above sea level")
 
     return DBContextSnapshot(
         srs_name=srs["srs_name"] if srs else "",
-        epsg_code=srs["srid"] if srs else 0,
+        epsg_code=epsg_code,
         timestamp=datetime.now(),
         lod_available=lod_available,
         available_objectclass_ids=available_ids,
@@ -850,7 +878,7 @@ def get_db_context_snapshot(db: DatabaseConnection) -> DBContextSnapshot:
         ),
         spatial_context=SpatialContext(
             bounding_box=bbox["bbox"] if bbox and bbox["bbox"] else "",
-            coverage_area_km2=0.0,         
+            coverage_area_km2=0.0,
             spatial_index_type="GiST",
             coordinate_system=coord_system,
             supported_spatial_ops=[
@@ -858,6 +886,9 @@ def get_db_context_snapshot(db: DatabaseConnection) -> DBContextSnapshot:
                 "ST_DWithin", "ST_Distance", "ST_Area",
                 "ST_Buffer", "ST_Centroid"
             ],
+            coord_dim=coord_dim,
+            srid_is_2d=srid_is_2d,
+            z_reference=z_reference,
         ),
     )
 
@@ -887,27 +918,37 @@ def get_lod_config(db: DatabaseConnection) -> LoDConfig:
     default = max(lods, key=lambda x: x["cnt"])["val_lod"]
 
     lod_descriptions = {}
-    for lod in supported:
+    lod_counts = {}
+    for row in lods:
+        lod = row["val_lod"]
         if isinstance(lod, str):
             lod_descriptions[lod] = f"Level of Detail {lod}"
+        lod_counts[str(lod)] = row["cnt"]
 
     return LoDConfig(
         supported_lods=supported,
         default_lod=default,
         immutable_base=True,
         lod_descriptions=lod_descriptions,
+        lod_counts=lod_counts,
     )
 
 
 # ============================================================
 # get_examples
 # ============================================================
-def get_examples(available_objectclass_ids: list[int]) -> ExamplesLibrary:
+_TRANSPORT_IDS = {604, 610, 613}  # Intersection, TrafficSpace, TrafficArea
+_INTERIOR_CLASSNAMES = {           # Classes that imply LoD4/interior structure
+    "BuildingRoom", "Storey", "BuildingUnit", "IntBuildingInstallation",
+}
+
+
+def get_examples(available_objectclass_ids: list[int], classnames: set[str] | None = None) -> ExamplesLibrary:
     """
-    Returns 6 canonical query pattern templates — one per query shape.
-    Patterns use <PLACEHOLDER> values; the LLM substitutes the correct
-    objectclass_id from the non-toplevel class table in the system prompt.
-    This keeps the examples section O(1) regardless of dataset size.
+    Returns canonical query pattern templates filtered to this dataset.
+    Patterns 0–6 use generic <PLACEHOLDER> IDs and are always included.
+    Pattern 7 (transportation) is only included when transportation classes exist.
+    Pattern 8 (containment) is only included when interior/room classes exist.
     Maps to UML: ExamplesLibrary
     """
     patterns = {
@@ -993,31 +1034,46 @@ JOIN geometry_data g   ON g.feature_id = ta.id
 WHERE i.objectclass_id = 604 AND g.geometry IS NOT NULL
 GROUP BY i.objectid ORDER BY total_surface_m2 DESC;""",
 
-        "6_cte_arithmetic":
-"""-- CTE arithmetic: net = A − B. COALESCE handles missing B children.
-WITH a_total AS (
-    SELECT SUM(CG_3DArea(g.geometry)) AS total
-    FROM feature f
-    JOIN property p  ON p.feature_id = f.id AND p.val_relation_type = <REL_A>
-    JOIN feature  fa ON fa.id = p.val_feature_id AND fa.objectclass_id = <A_ID>
-    JOIN geometry_data g ON g.feature_id = fa.id
-    WHERE f.objectclass_id = <PARENT_ID> AND f.objectid = '<objectid>' AND g.geometry IS NOT NULL
-),
-b_total AS (
-    SELECT SUM(CG_3DArea(g.geometry)) AS total
-    FROM feature f
-    JOIN property p  ON p.feature_id = f.id AND p.val_relation_type = <REL_B>
-    JOIN feature  fb ON fb.id = p.val_feature_id AND fb.objectclass_id IN (<B_IDS>)
-    JOIN geometry_data g ON g.feature_id = fb.id
-    WHERE f.objectclass_id = <PARENT_ID> AND f.objectid = '<objectid>' AND g.geometry IS NOT NULL
-)
+        "8_containment":
+"""-- Spatial containment: which objects of type X lie inside objects of type Y?
+-- Use this ONLY as a fallback when no explicit val_relation_type relationship exists
+-- between the two classes (e.g. BuildingInstallation inside a Storey/BuildingRoom).
+-- Especially relevant for LoD4 / CityGML 3.0 datasets with interiors (IFC conversions).
+--
+-- Step 1: always check for explicit relationships first:
+--   SELECT 1 FROM property p
+--   WHERE p.feature_id = <inner_feature_id>
+--     AND p.val_relation_type IN (0, 1)
+--     AND p.val_feature_id = <container_feature_id>
+-- If rows exist, use the property-join approach (Pattern 2/3) — it is faster and correct.
+--
+-- Step 2 (spatial fallback): geom1 = inner object, geom2 = container (must be Solid/CompositeSolid).
 SELECT
-    ROUND(a_total.total::numeric, 2)                                 AS a_area_m2,
-    ROUND(COALESCE(b_total.total,0)::numeric, 2)                     AS b_area_m2,
-    ROUND((a_total.total - COALESCE(b_total.total,0))::numeric, 2)   AS net_area_m2
-FROM a_total, b_total;""",
+    inner_f.objectid  AS inner_object,
+    outer_f.objectid  AS container,
+    CG_3DIntersects(inner_g.geometry, outer_g.geometry)
+        AND ST_IsEmpty(CG_3DDifference(inner_g.geometry, outer_g.geometry)) AS is_within
+FROM feature       inner_f
+JOIN geometry_data inner_g ON inner_g.feature_id = inner_f.id
+JOIN feature       outer_f ON outer_f.objectclass_id = <CONTAINER_CLASS_ID>
+JOIN geometry_data outer_g ON outer_g.feature_id = outer_f.id
+WHERE inner_f.objectclass_id = <INNER_CLASS_ID>
+  AND inner_g.geometry IS NOT NULL
+  AND outer_g.geometry IS NOT NULL
+  AND (outer_g.geometry_properties->>'type')::int IN (9, 10, 11)  -- container must be Solid
+ORDER BY outer_f.objectid, inner_f.objectid;"""
 
     }
+
+    available = set(available_objectclass_ids)
+
+    # Pattern 7: transportation-specific (hardcoded IDs) — drop for non-transport datasets.
+    if not _TRANSPORT_IDS.issubset(available):
+        patterns.pop("7_intersection_surface", None)
+
+    # Pattern 8: spatial containment — only relevant when interior/room classes exist.
+    if classnames is not None and not classnames.intersection(_INTERIOR_CLASSNAMES):
+        patterns.pop("8_containment", None)
 
     all_queries = list(patterns.values())
 
@@ -1377,18 +1433,31 @@ def get_vocabulary(db: DatabaseConnection):
     if _vocab_cache and (now - _vocab_cache_ts) < _VOCAB_TTL:
         return _vocab_cache["data"]
 
-    # Street names ordered by frequency
+    # Street names: only include when there are fewer than 20 distinct values.
+    # Large datasets with thousands of streets add noise without helping the LLM.
     try:
-        street_rows = db.execute("""
-            SELECT street, COUNT(*) AS n
-            FROM address
-            WHERE street IS NOT NULL AND street != ''
-            GROUP BY street
-            ORDER BY n DESC
-            LIMIT 30
-        """)
-        street_names = [(r["street"], r["n"]) for r in street_rows]
+        count_row = db.execute_single(
+            "SELECT COUNT(DISTINCT street) AS n FROM address "
+            "WHERE street IS NOT NULL AND street != ''"
+        )
+        _distinct_streets = count_row["n"] if count_row else 0
     except Exception:
+        _distinct_streets = 999
+
+    if _distinct_streets < 20:
+        try:
+            street_rows = db.execute("""
+                SELECT street, COUNT(*) AS n
+                FROM address
+                WHERE street IS NOT NULL AND street != ''
+                GROUP BY street
+                ORDER BY n DESC
+                LIMIT 30
+            """)
+            street_names = [(r["street"], r["n"]) for r in street_rows]
+        except Exception:
+            street_names = []
+    else:
         street_names = []
 
     # Generic attribute distinct values per attribute (frequency-ordered)

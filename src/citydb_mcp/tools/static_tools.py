@@ -170,7 +170,14 @@ def get_query_guidelines(db: DatabaseConnection) -> QueryGuidelines:
             "Always check ST_IsClosed(geometry) = true before volume/solid calculations to avoid errors.",
             "Filter geometry_data by type using (g.geometry_properties->>'type')::int: use IN (9,10,11) for Solid/CompositeSolid/MultiSolid (volume), IN (6,8) for CompositeSurface/MultiSurface (area). A feature can have multiple geometry_data rows — always filter by type to avoid duplicates.",
             "CG_3DDistance(geomA, geomB) gives true 3D distance between geometries.",
-        ], 
+            "For 'which X is inside Y' containment questions: FIRST query the property table for "
+            "explicit parent/child relationships (val_relation_type IN (0,1) with val_feature_id). "
+            "Only if no such relationship exists, fall back to spatial containment using "
+            "CG_3DIntersects(inner_geom, container_geom) AND ST_IsEmpty(CG_3DDifference(inner_geom, container_geom)). "
+            "The container object MUST have a volume geometry (geometry_properties type IN (9,10,11) — "
+            "Solid/CompositeSolid/MultiSolid). This pattern is especially relevant for LoD4 / "
+            "CityGML 3.0 datasets with interior rooms (e.g. IFC conversions).",
+        ],
         category="3dcitydb_v5",
         severity="recommended",
         indexed_columns=indexed_columns,

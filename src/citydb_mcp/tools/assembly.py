@@ -123,7 +123,8 @@ def assemble_prompt(
     static_cl = get_static_codelists(epsg_code)
 
     available_ids = [oc.id for oc in catalog.object_classes]
-    examples = get_examples(available_ids) if include_query_agent_extras else None
+    available_classnames = {oc.classname for oc in catalog.object_classes}
+    examples = get_examples(available_ids, classnames=available_classnames) if include_query_agent_extras else None
 
     # Concrete synthesized examples using real DB values
     synth_examples = synthesize_examples(db, catalog, static_cl, vocab)
@@ -215,52 +216,68 @@ def _distinct_property_codes(db: DatabaseConnection, name: str, namespace_id: in
         return []
 
 
+def _lookup_codelist_entries(db: DatabaseConnection, property_name: str, codes: list[str]) -> dict:
+    """Return {code: definition} for codes found in codelist_entry, matched by property name."""
+    if not codes:
+        return {}
+    try:
+        codelists = db.execute("SELECT id, codelist_type FROM codelist")
+        matched_id = None
+        prop_lower = property_name.lower()
+        for cl in codelists:
+            if prop_lower in cl["codelist_type"].lower():
+                matched_id = cl["id"]
+                break
+        if matched_id is None:
+            return {}
+        placeholders = ",".join(["%s"] * len(codes))
+        entries = db.execute(
+            f"SELECT code, definition FROM codelist_entry "
+            f"WHERE codelist_id = %s AND code IN ({placeholders}) AND definition IS NOT NULL",
+            (matched_id, *codes),
+        )
+        return {str(e["code"]): e["definition"] for e in entries}
+    except Exception:
+        return {}
+
+
 def _render_quickref(db: DatabaseConnection, db_context, catalog, static_cl: dict) -> str:
     """Quick-reference block rendered first — highest attention weight for local models."""
     lines = ["## Quick Reference", ""]
 
-    count_map: dict = {}
-    for oc_id, info in db_context.statistics.features_per_class.items():
-        count_map[oc_id] = info.get("count", 0) if isinstance(info, dict) else int(info)
-
-    toplevel = sorted(
-        [oc for oc in catalog.object_classes if oc.is_toplevel],
-        key=lambda oc: count_map.get(oc.id, 0),
-        reverse=True,
-    )
-    boundary = [
-        oc for oc in catalog.object_classes
-        if not oc.is_toplevel and oc.classname in (
-            "WallSurface", "RoofSurface", "GroundSurface",
-            "WindowSurface", "DoorSurface", "BuildingInstallation", "BuildingPart",
-        )
-    ]
-
-    lines.append("### Object types (feature.objectclass_id)")
-    for oc in toplevel:
-        cnt = count_map.get(oc.id, 0)
-        lines.append(f"- {oc.id} = {oc.classname} ({cnt:,} features)")
-    for oc in boundary:
-        lines.append(f"- {oc.id} = {oc.classname} (boundary/installation, not toplevel)")
-
-    # Only show codes that are actually present in the database.
+    # Only show codes that are actually present in the database AND have a known label.
     all_func_codes = static_cl.get("function", {})
     db_func_codes = _distinct_property_codes(db, "function", 10)
     if db_func_codes:
-        lines.append("")
-        lines.append("### Building function codes (property.name='function', namespace_id=10, val_string)")
+        # Codes not in the static list: try codelist_entry table
+        missing = [c for c in db_func_codes if c not in all_func_codes]
+        db_func_labels = _lookup_codelist_entries(db, "function", missing) if missing else {}
+        resolved = []
         for code in db_func_codes:
-            label = all_func_codes.get(code, code)  # fall back to raw code if not in static list
-            lines.append(f"- {code} = {label}")
+            label = all_func_codes.get(code) or db_func_labels.get(code)
+            if label:
+                resolved.append((code, label))
+        if resolved:
+            lines.append("")
+            lines.append("### Building function codes (property.name='function', namespace_id=10, val_string)")
+            for code, label in resolved:
+                lines.append(f"- {code} = {label}")
 
     all_roof_codes = static_cl.get("roofType", {})
     db_roof_codes = _distinct_property_codes(db, "roofType", 8)
     if db_roof_codes:
-        lines.append("")
-        lines.append("### Roof type codes (property.name='roofType', namespace_id=8, val_string)")
+        missing_roof = [c for c in db_roof_codes if c not in all_roof_codes]
+        db_roof_labels = _lookup_codelist_entries(db, "roofType", missing_roof) if missing_roof else {}
+        resolved_roof = []
         for code in db_roof_codes:
-            label = all_roof_codes.get(code, code)
-            lines.append(f"- {code} = {label}")
+            label = all_roof_codes.get(code) or db_roof_labels.get(code)
+            if label:
+                resolved_roof.append((code, label))
+        if resolved_roof:
+            lines.append("")
+            lines.append("### Roof type codes (property.name='roofType', namespace_id=8, val_string)")
+            for code, label in resolved_roof:
+                lines.append(f"- {code} = {label}")
 
     return "\n".join(lines)
 
@@ -276,7 +293,7 @@ def _render_vocabulary(vocab, numeric_generic_attrs: dict | None = None) -> str:
     lines = ["## Known Values in This Database", ""]
 
     if vocab.street_names:
-        lines.append("### Street names (top 30 by frequency)")
+        lines.append("### Street names (max. 20 values, ordered by frequency)")
         parts = [f"{name} ({cnt})" for name, cnt in vocab.street_names]
         lines.append(", ".join(parts))
         lines.append("")
@@ -407,14 +424,94 @@ def _render_geometry_type_guide(geom_types: dict) -> str:
     return "\n".join(lines)
 
 
+_SCHEMA_NARRATIVE = """\
+3DCityDB v5 organises its tables into five logical modules:
+
+**Feature module** — the core of the schema. Every city object (building, road, \
+vegetation, etc.) is a row in `feature`, identified by `objectclass_id`. \
+Semantic attributes (height, function, address link, geometry link, …) are stored \
+as rows in `property`, linked back to `feature` via `feature_id`. \
+The `objectclass` table defines the class hierarchy (e.g. Building → AbstractBuilding \
+→ AbstractCityObject). Relationships between features (e.g. Building → WallSurface) \
+are encoded as `property` rows where `val_feature_id` points to the child feature and \
+`val_relation_type` indicates the relationship kind (0 = space, 1 = boundary).
+
+**Geometry module** — explicit 3D geometry lives in `geometry_data`, one row per \
+geometry object, linked to its owning feature via `feature_id`. The \
+`geometry_properties` JSON column encodes the outermost geometry type (9=Solid, \
+6=CompositeSurface, …). Implicit (template-based) geometry is stored in \
+`implicit_geometry` and referenced from `property.val_implicitgeom_id`.
+
+**Appearance module** — textures, materials, and surface colour information. These \
+tables (`appearance`, `surface_data`, …) are present in the schema but are not \
+relevant for analytical queries and are excluded from this reference.
+
+**Metadata module** — the `namespace` table maps namespace IDs to their URI prefixes \
+(e.g. namespace_id=1 → CityGML core, namespace_id=3 → generic attributes, \
+namespace_id=8 → building module). Always use `namespace_id` together with \
+`property.name` to unambiguously identify a property.
+
+**Codelist module** — the `codelist` table registers named codelists \
+(e.g. `bldg:RoofTypeValue`). `codelist_entry` holds the individual code–definition \
+pairs. Code-type properties (datatype_id=14) store their value in \
+`property.val_string`; join `codelist_entry` on `code` to obtain the human-readable \
+definition.
+"""
+
+
+_TABLE_DESCRIPTIONS = {
+    "feature": (
+        "One row per city object (building, road, tree, …). "
+        "`objectclass_id` identifies the class; `objectid` is the GML identifier used for "
+        "map highlighting; `envelope` is the 2D/3D bounding box used for spatial pre-filtering."
+    ),
+    "property": (
+        "One row per attribute value of a feature. Every semantic attribute — height, function, "
+        "address link, geometry link, relationship to a child feature — is stored here. "
+        "Use `name` + `namespace_id` to identify a property unambiguously. "
+        "`val_relation_type` encodes feature-to-feature relationships "
+        "(0 = space/composition, 1 = boundary surface). "
+        "Nested properties (e.g. height → value) are linked via `parent_id`."
+    ),
+    "objectclass": (
+        "Class registry for all CityGML object types. "
+        "`superclass_id` encodes the inheritance chain (e.g. Building → AbstractBuilding). "
+        "`is_toplevel=1` marks root-level objects that can exist independently; "
+        "`schema` (JSON) carries the property definitions for that class."
+    ),
+    "geometry_data": (
+        "Explicit 3D geometry storage. Each row holds one geometry object (solid, surface, etc.) "
+        "linked to its owning feature via `feature_id`. "
+        "`geometry_properties` (JSON) encodes the outermost geometry type code "
+        "(9=Solid, 10=CompositeSolid, 6=CompositeSurface, 8=MultiSurface, …) — "
+        "always filter by this to avoid joining the wrong geometry rows."
+    ),
+    "address": (
+        "Postal addresses linked to features via `property.val_address_id`. "
+        "Use `ILIKE '%street%'` on the `street` column for fuzzy name matching."
+    ),
+    "codelist": (
+        "Registry of named codelists (e.g. `bldg:RoofTypeValue`, `bldg:BuildingFunctionValue`). "
+        "Join with `codelist_entry` on `id` to resolve code strings to human-readable definitions."
+    ),
+    "codelist_entry": (
+        "Individual code–definition pairs for each codelist. "
+        "Join on `codelist_id` and match `code` against `property.val_string` "
+        "for Code-type properties (datatype_id = 14)."
+    ),
+}
+
+
 def _render_database_schema(schema: DatabaseSchema) -> str:
     rel_data = json.loads(schema.relationships) if schema.relationships else {}
     table_details = rel_data.get("table_details", {})
 
     lines = ["## Database Schema (3DCityDB v5)", ""]
+    lines.append(_SCHEMA_NARRATIVE)
     lines.append("### Key Tables")
     for table_name, columns in table_details.items():
-        lines.append(f"\n**{table_name}**:")
+        desc = _TABLE_DESCRIPTIONS.get(table_name, "")
+        lines.append(f"\n**{table_name}**:{('  ' + desc) if desc else ''}")
         for col in columns:
             flags = []
             if col.get("pk"):
@@ -432,7 +529,15 @@ def _render_database_schema(schema: DatabaseSchema) -> str:
 def _render_db_context(ctx, toplevel_ids: set = None) -> str:
     lines = ["## Database Context", ""]
     lines.append(f"- EPSG Code: {ctx.epsg_code}")
-    lines.append(f"- Bounding Box: {ctx.spatial_context.bounding_box}")
+    sc = ctx.spatial_context
+    if sc.srid_is_2d and sc.coord_dim == 3:
+        z_ref = sc.z_reference or "meters above sea level"
+        lines.append(
+            f"- ⚠️ **Note:** EPSG:{ctx.epsg_code} is a 2D coordinate reference system, "
+            f"but all geometries in this database carry Z coordinates "
+            f"(height values in {z_ref}). "
+        )
+    lines.append(f"- Bounding Box: {sc.bounding_box}")
 
     lines.append("")
     lines.append("### Feature Counts (toplevel classes only)")
@@ -448,10 +553,61 @@ def _render_db_context(ctx, toplevel_ids: set = None) -> str:
 
 
 def _render_lod_config(lod_config) -> str:
-    lines = ["## Level of Detail", ""]
-    lods = ", ".join(str(l) for l in lod_config.supported_lods)
-    lines.append(f"- Available LoDs: {lods}")
-    lines.append(f"- Default LoD: {lod_config.default_lod}")
+    lines = ["## Level of Detail (LoD)", ""]
+    multi_lod = len(lod_config.supported_lods) > 1
+
+    if not multi_lod:
+        # Single-LoD dataset — one line is sufficient, no agent guidance needed.
+        lines.append(f"This dataset uses **LoD {lod_config.default_lod}** only. No LoD filtering is needed.")
+        return "\n".join(lines)
+
+    # Multi-LoD dataset — full explanation + agent instructions.
+    lines.append(
+        "In CityGML, **Level of Detail** (LoD0–LoD4) describes the geometric complexity "
+        "of a feature. LoD0 is the coarsest (2D footprint); LoD1 adds a block extrusion; "
+        "LoD2 introduces roof structures; LoD3 adds windows and doors; LoD4 adds interiors. "
+        "Higher LoD means more geometry and more accurate area/volume results."
+    )
+    lines.append("")
+    lines.append(
+        "⚠️ **Critical — this dataset has multiple LoDs.** A single feature can have geometry "
+        "at several LoDs simultaneously in `geometry_data`. Aggregating geometric calculations "
+        "(area, volume, distance) without a LoD filter will **double- or triple-count** the "
+        "same feature. Always restrict to exactly one LoD:"
+    )
+    lines.append("")
+    lines.append("```sql")
+    lines.append("-- Restrict geometry_data to a single LoD via the linking property row")
+    lines.append("JOIN property lod_p")
+    lines.append("  ON lod_p.feature_id = f.id")
+    lines.append(f"  AND lod_p.val_lod = '{lod_config.default_lod}'   -- replace with desired LoD")
+    lines.append("  AND lod_p.val_geometry_id = g.id")
+    lines.append("```")
+    lines.append("")
+    lines.append("### LoDs Present in This Dataset")
+    lines.append("")
+
+    lod_notes = {
+        "0": "2D footprint / roof edge — no volume",
+        "1": "Block model — approximate volume",
+        "2": "Roof structure — recommended for most calculations",
+        "3": "Architectural detail — windows, doors",
+        "4": "Interior — rarely available",
+    }
+    lines.append("| LoD | Property rows | Notes |")
+    lines.append("|-----|--------------|-------|")
+    for lod in sorted(lod_config.lod_counts.keys()):
+        cnt = lod_config.lod_counts[lod]
+        note = lod_notes.get(str(lod), "")
+        default_marker = " ✅ **(default)**" if str(lod) == str(lod_config.default_lod) else ""
+        lines.append(f"| {lod} | {cnt:,} | {note}{default_marker} |")
+
+    lines.append("")
+    lines.append(
+        f"**Default LoD: `{lod_config.default_lod}`** (most common in this dataset). "
+        "When the user does not specify a LoD, use the default and state it in your answer, "
+        f'e.g. *"Calculated using LoD{lod_config.default_lod} geometry."*'
+    )
     return "\n".join(lines)
 
 
@@ -729,6 +885,7 @@ def _render_examples(examples: ExamplesLibrary) -> str:
         "5_exists_filter":   "Pattern 5 — EXISTS filter (parent has at least one child of type X)",
         "6_cte_arithmetic":  "Pattern 6 — CTE arithmetic (subtract / compare two aggregations)",
         "7_intersection_surface": "Pattern 7 — Intersection/Section surface area (confirmed 2-hop, both rel=1)",
+        "8_containment":          "Pattern 8 — Spatial containment (X inside Y) — fallback when no explicit relationship exists",
     }
 
     if examples.examples_by_pattern:

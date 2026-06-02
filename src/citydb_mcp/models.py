@@ -104,6 +104,9 @@ class SpatialContext:
     coordinate_system: str
     supported_spatial_ops: list[str] = field(default_factory=list)
     typical_query_extent: str = ""
+    coord_dim: int = 0          # actual geometry coordinate dimension (2 or 3)
+    srid_is_2d: bool = False    # True when the SRID is a 2D CRS
+    z_reference: str = ""       # vertical reference system description
 
 
 @dataclass
@@ -134,6 +137,7 @@ class LoDConfig:
     default_lod: int = 0
     immutable_base: bool = True
     lod_descriptions: dict[int, str] = field(default_factory=dict)
+    lod_counts: dict = field(default_factory=dict)  # lod → property row count
 
 
 # ============================================================
