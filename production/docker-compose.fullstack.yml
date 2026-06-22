@@ -11,7 +11,7 @@ services:
       SRS_NAME: "urn:ogc:def:crs:EPSG::${SRID:-25832}"
       POSTGIS_SFCGAL: ${POSTGIS_SFCGAL:-true}
     volumes:
-      - citydb-data:/var/lib/postgresql/data
+      - citydb-data:/var/lib/postgresql
     networks:
       - citydb-net
     healthcheck:
