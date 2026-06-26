@@ -106,7 +106,7 @@ def assemble_prompt(
     geom_types = get_geometry_types_per_class(db)
 
     toplevel_ids = {oc.id for oc in catalog.object_classes if oc.is_toplevel}
-    generic_attrs = get_generic_attributes(db, filter_objectclass_ids=toplevel_ids)
+    generic_attrs = get_generic_attributes(db)
 
     epsg_code = db_context.epsg_code
 
@@ -138,8 +138,9 @@ def assemble_prompt(
     # 2. Known values: streets + generic attribute vocabulary.
     #    In compact mode, numeric generic attrs are merged here so everything
     #    is in one place (string attrs come from vocab, numeric from generic_attrs).
-    if vocab.street_names or vocab.generic_attr_values or (compact and generic_attrs):
-        sections.append(_render_vocabulary(vocab, numeric_generic_attrs=generic_attrs if compact else None))
+    if vocab.street_names or (compact and (vocab.generic_attr_values or generic_attrs)):
+        sections.append(_render_vocabulary(vocab, numeric_generic_attrs=generic_attrs if compact else None,
+                                           show_generic=compact))
 
     # 3. Schema
     if compact:
@@ -153,8 +154,8 @@ def assemble_prompt(
     # 5. LoD
     sections.append(_render_lod_config(lod_config))
 
-    # 6. Object classes
-    sections.append(_render_objectclasses(catalog, compact=compact))
+    # 6. Object classes (generic attributes + sets co-located per class in full mode)
+    sections.append(_render_objectclasses(catalog, compact=compact, generic_attrs=generic_attrs))
 
     # 7. Spatial functions
     sections.append(_render_spatial_capabilities(spatial_caps))
@@ -173,10 +174,9 @@ def assemble_prompt(
         sections.append(_render_geometry_type_guide(geom_types))
 
     # 9. Generic attributes
-    #    Compact: already merged into section 2 (Known Values) — not repeated here.
-    #    Full: complete table with all attrs, value columns, and ranges.
-    if not compact and generic_attrs:
-        sections.append(_render_generic_attributes(generic_attrs))
+    #    Compact: merged into section 2 (Known Values).
+    #    Full: co-located per class inside section 6 (_render_objectclasses) — not a
+    #    standalone section anymore, so the LLM sees each class's full attribute set together.
 
     # 10. Synthesized examples (concrete, real values)
     if synth_examples:
@@ -282,12 +282,13 @@ def _render_quickref(db: DatabaseConnection, db_context, catalog, static_cl: dic
     return "\n".join(lines)
 
 
-def _render_vocabulary(vocab, numeric_generic_attrs: dict | None = None) -> str:
-    """Street names and generic attribute values — frequency ordered.
+def _render_vocabulary(vocab, numeric_generic_attrs: dict | None = None, show_generic: bool = True) -> str:
+    """Street names and (in compact mode) generic attribute values — frequency ordered.
 
-    numeric_generic_attrs: optional dict from _collect_numeric_generic_attrs(),
-    merged into the Generic attribute vocabulary list so numeric attrs
-    (val_int / val_double) appear alongside the string ones in compact mode.
+    numeric_generic_attrs: optional dict merged into the Generic attribute vocabulary list
+    so numeric attrs (val_int / val_double) appear alongside string ones in compact mode.
+    show_generic: when False (full mode), skip the generic attr block entirely — attrs are
+    rendered per-class in the object classes section instead.
     """
     _STRING_COLS = {"val_string", "val_uri"}
     lines = ["## Known Values in This Database", ""]
@@ -299,30 +300,48 @@ def _render_vocabulary(vocab, numeric_generic_attrs: dict | None = None) -> str:
         lines.append("")
         lines.append("Use `ILIKE '%street%'` for matching (handles umlauts and partial names).")
 
-    # Merge string attrs (from vocab) and numeric attrs (from full generic_attrs scan).
-    # Build a combined dict keyed by attr name so we can sort them together.
-    combined: dict[str, str] = {}
-    if vocab.generic_attr_values:
-        for attr_name, vals in vocab.generic_attr_values.items():
-            top = ", ".join(f"`{v}`" for v, _ in vals[:10])
-            combined[attr_name] = top
+    if show_generic:
+        # Merge string attrs (from vocab) and numeric attrs (from full generic_attrs scan).
+        # Build a combined dict keyed by attr name so we can sort them together.
+        combined: dict[str, str] = {}
+        if vocab.generic_attr_values:
+            for attr_name, vals in vocab.generic_attr_values.items():
+                top = ", ".join(f"`{v}`" for v, _ in vals[:10])
+                combined[attr_name] = top
 
-    if numeric_generic_attrs:
-        for _oc_id, info in numeric_generic_attrs.items():
-            for attr in info["attrs"]:
-                if attr.value_column in _STRING_COLS or attr.value_column in (None, "various"):
-                    continue
-                if attr.min_value is not None and attr.max_value is not None:
-                    combined[attr.name] = f"{attr.value_column}, {attr.min_value}–{attr.max_value}"
-                else:
-                    combined[attr.name] = attr.value_column
+        has_set_member = False
+        if numeric_generic_attrs:
+            for _oc_id, info in numeric_generic_attrs.items():
+                for attr in info["attrs"]:
+                    if attr.value_column in _STRING_COLS or attr.value_column in (None, "various"):
+                        continue
+                    if attr.min_value is not None and attr.max_value is not None:
+                        combined[attr.name] = f"{attr.value_column}, {attr.min_value}–{attr.max_value}"
+                    else:
+                        combined[attr.name] = attr.value_column
+                # GenericAttributeSet members — label as `Set.attribute` so they aren't lost.
+                for set_name, members in info.get("sets", {}).items():
+                    for attr in members:
+                        if attr.value_column in _STRING_COLS or attr.value_column in (None, "various"):
+                            continue
+                        has_set_member = True
+                        label = f"{set_name}.{attr.name}"
+                        if attr.min_value is not None and attr.max_value is not None:
+                            combined[label] = f"{attr.value_column}, {attr.min_value}–{attr.max_value}"
+                        else:
+                            combined[label] = attr.value_column
 
-    if combined:
-        lines.append("")
-        lines.append("### Generic attribute vocabulary (namespace_id = 3)")
-        lines.append("Query: `JOIN property p ON p.feature_id = f.id AND p.namespace_id = 3 AND p.name = '<attr>'`")
-        for attr_name, detail in sorted(combined.items()):
-            lines.append(f"- **{attr_name}**: {detail}")
+        if combined:
+            lines.append("")
+            lines.append("### Generic attribute vocabulary (namespace_id = 3)")
+            lines.append("Query: `JOIN property p ON p.feature_id = f.id AND p.namespace_id = 3 AND p.name = '<attr>'`")
+            if has_set_member:
+                lines.append(
+                    "Entries shown as `Set.attribute` are members of a GenericAttributeSet — join via "
+                    "the set's parent_id (set row: namespace_id = 3, datatype_id = 200)."
+                )
+            for attr_name, detail in sorted(combined.items()):
+                lines.append(f"- **{attr_name}**: {detail}")
 
     return "\n".join(lines)
 
@@ -425,6 +444,23 @@ def _render_geometry_type_guide(geom_types: dict) -> str:
 
 
 _SCHEMA_NARRATIVE = """\
+3DCityDB v5 is a **relational storage of the full CityGML 3.0 object-oriented data \
+model**. Every CityGML class (Building, Road, WaterBody, …), every attribute \
+(height, function, roofType, …), every association (Building→WallSurface, \
+TrafficSpace→TrafficArea, …), and the mapping of each to the database table structure \
+is fully documented inside the database itself — in the `objectclass` and `datatype` \
+tables. You never need to hard-code class names or attribute names; you can always \
+derive them from those tables.
+
+**Object-oriented model and inheritance.** CityGML is an object-oriented standard. \
+Classes form a deep inheritance hierarchy (e.g. Building → AbstractBuilding → \
+AbstractPhysicalSpace → AbstractOccupiedSpace → AbstractCityObject → AbstractFeature). \
+A class possesses not only the properties that are directly defined on it, but also \
+**all properties of all its transitive superclasses** (inherited attributes and \
+associations). The `objectclass.superclass_id` column encodes this hierarchy. When \
+you resolve properties for a class, you must walk the full superclass chain — this is \
+what the `resolve_properties` tool does.
+
 3DCityDB v5 organises its tables into five logical modules:
 
 **Feature module** — the core of the schema. Every city object (building, road, \
@@ -435,6 +471,14 @@ The `objectclass` table defines the class hierarchy (e.g. Building → AbstractB
 → AbstractCityObject). Relationships between features (e.g. Building → WallSurface) \
 are encoded as `property` rows where `val_feature_id` points to the child feature and \
 `val_relation_type` indicates the relationship kind (0 = space, 1 = boundary).
+
+The `datatype` table registers every primitive and complex type used in CityGML \
+(e.g. Boolean, Integer, Double, String, Code, Measure, AddressProperty, \
+GeometryProperty, FeatureProperty, GenericAttributeSet, …). Each `property` row \
+carries a `datatype_id` that points to this table, which in turn determines which \
+`val_*` column in `property` holds the actual value (e.g. datatype Integer → \
+`val_int`, Code → `val_string`, Measure → `val_double` + `val_uom`, \
+GeometryProperty → `val_geometry_id` referencing `geometry_data`).
 
 **Geometry module** — explicit 3D geometry lives in `geometry_data`, one row per \
 geometry object, linked to its owning feature via `feature_id`. The \
@@ -474,10 +518,17 @@ _TABLE_DESCRIPTIONS = {
         "Nested properties (e.g. height → value) are linked via `parent_id`."
     ),
     "objectclass": (
-        "Class registry for all CityGML object types. "
-        "`superclass_id` encodes the inheritance chain (e.g. Building → AbstractBuilding). "
-        "`is_toplevel=1` marks root-level objects that can exist independently; "
-        "`schema` (JSON) carries the property definitions for that class."
+        "The authoritative registry of the **entire CityGML 3.0 object-oriented data model**. "
+        "Every CityGML class is one row. "
+        "`superclass_id` encodes the full inheritance hierarchy (e.g. Building → AbstractBuilding "
+        "→ AbstractPhysicalSpace → … → AbstractGML); walk this chain to collect all inherited "
+        "properties. "
+        "`is_toplevel=1` marks classes whose instances can exist independently as top-level features. "
+        "`schema` (JSON) documents every attribute and association of that class — its name, type, "
+        "multiplicity, and the `property` column it maps to — making objectclass the single source "
+        "of truth for the DB-to-data-model mapping. "
+        "When a user asks about the CityGML data model, query objectclass and follow superclass_id "
+        "transitively; do not rely solely on the resolved properties shown in this prompt."
     ),
     "geometry_data": (
         "Explicit 3D geometry storage. Each row holds one geometry object (solid, surface, etc.) "
@@ -611,7 +662,8 @@ def _render_lod_config(lod_config) -> str:
     return "\n".join(lines)
 
 
-def _render_objectclasses(catalog: ObjectClassCatalog, compact: bool = False) -> str:
+def _render_objectclasses(catalog: ObjectClassCatalog, compact: bool = False,
+                          generic_attrs: dict | None = None) -> str:
     lines = ["## Available Object Classes and Properties", ""]
 
     toplevel = [oc for oc in catalog.object_classes if oc.is_toplevel]
@@ -633,6 +685,25 @@ def _render_objectclasses(catalog: ObjectClassCatalog, compact: bool = False) ->
         return "\n".join(lines)
 
     # --- Full detail for toplevel classes ---
+    lines.append(
+        "Each class below lists its schema **Properties** plus, where present, its **Generic "
+        "Attributes** (namespace_id = 3) and **Generic Attribute Sets** (from IFC PropertySets). "
+        "Generic attributes are read via "
+        "`JOIN property p ON p.feature_id = f.id AND p.namespace_id = 3 AND p.name = '<attr>'`."
+    )
+    lines.append("")
+    lines.append(
+        "⚠️ **Transitive inheritance:** CityGML is object-oriented. A class owns not only the "
+        "properties listed directly below it, but also **all properties inherited from every "
+        "superclass** in its transitive hierarchy (e.g. Building inherits from AbstractBuilding → "
+        "AbstractPhysicalSpace → AbstractOccupiedSpace → AbstractCityObject → AbstractFeature → "
+        "AbstractGML). The properties shown below were resolved by walking this full superclass "
+        "chain and keeping only those that actually exist in this database. When a user asks "
+        "about the CityGML data model or what attributes a class *can* have, remember that the "
+        "complete set is defined transitively — consult the `objectclass.schema` JSON and follow "
+        "`superclass_id` for the authoritative answer."
+    )
+    lines.append("")
     for oc in toplevel:
         prefix = oc.identifier if oc.identifier else oc.classname
         lines.append(f"### {prefix} (ID: {oc.id}, Namespace ID: {oc.namespace_id})")
@@ -643,6 +714,10 @@ def _render_objectclasses(catalog: ObjectClassCatalog, compact: bool = False) ->
             for prop in oc.resolved_properties:
                 lines.append(_render_property(prop))
             lines.append("")
+
+        gen = generic_attrs.get(oc.id) if generic_attrs else None
+        if gen:
+            lines.extend(_render_class_generic_attrs(gen, oc.id))
 
         if oc.classname in ("Building", "BuildingPart"):
             lines.append("**Geometry:**")
@@ -702,6 +777,18 @@ def _render_objectclasses(catalog: ObjectClassCatalog, compact: bool = False) ->
             lines.append(f"| {oc.id} | {oc.classname} | {identifier} | {oc.namespace_id} | {hint} |")
         lines.append("")
 
+        non_toplevel_with_attrs = [
+            (oc, generic_attrs[oc.id]) for oc in non_toplevel
+            if generic_attrs and oc.id in generic_attrs
+        ]
+        if non_toplevel_with_attrs:
+            lines.append("#### Generic Attributes by Non-Toplevel Class")
+            lines.append("")
+            for oc, gen in non_toplevel_with_attrs:
+                identifier = oc.identifier if oc.identifier else oc.classname
+                lines.append(f"**{identifier}** (ID: {oc.id}, Namespace ID: {oc.namespace_id})")
+                lines.extend(_render_class_generic_attrs(gen, oc.id))
+
     return "\n".join(lines)
 
 
@@ -757,49 +844,90 @@ def _render_property(prop: PropertyDefinition) -> str:
     return "\n".join(parts)
 
 
-def _render_generic_attributes(attrs_by_class: dict) -> str:
-    lines = ["## Generic Attributes", ""]
-    lines.append("Stored in `property` table with `namespace_id = 3`. Always filter by `f.objectclass_id`.")
-    lines.append("")
+def _generic_attr_rows(attrs: list) -> list:
+    """Render the markdown table rows (no header) for a list of GenericAttributes."""
+    rows = []
+    for attr in attrs:
+        if attr.value_column == "various":
+            # Grouped metadata prefix
+            prefix_raw = attr.name.split("*")[0].strip()
+            sub = ", ".join(attr.sample_values) if attr.sample_values else ""
+            detail = f"group — LIKE '{prefix_raw}%'; sub-attrs: {sub}" if sub else f"group — LIKE '{prefix_raw}%'"
+            rows.append(f"| {attr.name} | various | {detail} |")
+            continue
 
-    for oc_id, info in sorted(attrs_by_class.items()):
-        classname = info["classname"]
-        attrs = info["attrs"]
+        if attr.is_categorical and attr.distinct_values:
+            detail = ", ".join(f"`{v}`" for v in attr.distinct_values)
+        elif attr.sample_values:
+            cnt = f" ({attr.distinct_value_count} distinct)" if attr.distinct_value_count else ""
+            detail = ", ".join(f"`{v}`" for v in attr.sample_values) + cnt
+        elif not attr.is_categorical and attr.min_value is not None and attr.max_value is not None:
+            detail = f"{attr.min_value} – {attr.max_value}"
+        else:
+            detail = ""
 
-        lines.append(f"### {classname} (objectclass_id: {oc_id})")
+        # Range on its own line only for non-categorical attrs that also have samples
+        range_str = ""
+        if not attr.is_categorical and attr.min_value is not None and attr.max_value is not None and attr.sample_values:
+            range_str = f" | range {attr.min_value}–{attr.max_value}"
+
+        rows.append(f"| {attr.name} | `{attr.value_column}` | {detail}{range_str} |")
+    return rows
+
+
+def _generic_attr_table(attrs: list, indent: str = "") -> list:
+    """Header + rows for a generic-attribute table, optionally indented (for set members)."""
+    lines = [
+        f"{indent}| attribute | col | values / range |",
+        f"{indent}|-----------|-----|----------------|",
+    ]
+    lines += [f"{indent}{row}" for row in _generic_attr_rows(attrs)]
+    return lines
+
+
+def _render_class_generic_attrs(gen: dict, oc_id: int) -> list:
+    """Inline render of one toplevel class's standalone generic attributes and its
+    GenericAttributeSets (IFC PropertySets)."""
+    lines: list = []
+    standalone = gen.get("attrs", [])
+    sets = gen.get("sets", {})
+
+    if standalone:
+        lines.append("**Generic Attributes** (namespace_id = 3):")
+        lines.extend(_generic_attr_table(standalone))
         lines.append("")
-        lines.append("| attribute | col | values / range |")
-        lines.append("|-----------|-----|----------------|")
 
-        for attr in attrs:
-            if attr.value_column == "various":
-                # Grouped metadata prefix
-                prefix_raw = attr.name.split("*")[0].strip()
-                sub = ", ".join(attr.sample_values) if attr.sample_values else ""
-                detail = f"group — LIKE '{prefix_raw}%'; sub-attrs: {sub}" if sub else f"group — LIKE '{prefix_raw}%'"
-                lines.append(f"| {attr.name} | various | {detail} |")
-                continue
-
-            if attr.is_categorical and attr.distinct_values:
-                detail = ", ".join(f"`{v}`" for v in attr.distinct_values)
-            elif attr.sample_values:
-                cnt = f" ({attr.distinct_value_count} distinct)" if attr.distinct_value_count else ""
-                detail = ", ".join(f"`{v}`" for v in attr.sample_values) + cnt
-            elif not attr.is_categorical and attr.min_value is not None and attr.max_value is not None:
-                detail = f"{attr.min_value} – {attr.max_value}"
-            else:
-                detail = ""
-
-            # Range on its own line only for non-categorical attrs that also have samples
-            range_str = ""
-            if not attr.is_categorical and attr.min_value is not None and attr.max_value is not None and attr.sample_values:
-                range_str = f" | range {attr.min_value}–{attr.max_value}"
-
-            lines.append(f"| {attr.name} | `{attr.value_column}` | {detail}{range_str} |")
-
+    if sets:
+        lines.append(
+            "**Generic Attribute Sets** (from IFC PropertySets — members are nested inside a "
+            "GenericAttributeSet: a property row with datatype_id = 200, linked via parent_id):"
+        )
+        for set_name, members in sorted(sets.items()):
+            lines.append(f"- **{set_name}**:")
+            lines.extend(_generic_attr_table(members, indent="  "))
         lines.append("")
 
-    return "\n".join(lines)
+        example_set = sorted(sets)[0]
+        lines.append(
+            "  Join through the set to read members (and to disambiguate identically-named "
+            "members across different sets):"
+        )
+        lines.append("```sql")
+        lines.append("SELECT f.objectid, m.name AS attribute, m.val_double, m.val_string")
+        lines.append("FROM feature  f")
+        lines.append("JOIN property s ON s.feature_id = f.id AND s.namespace_id = 3")
+        lines.append(f"               AND s.datatype_id = 200 AND s.name = '{example_set}'")
+        lines.append("JOIN property m ON m.parent_id = s.id AND m.namespace_id = 3")
+        lines.append(f"WHERE f.objectclass_id = {oc_id};")
+        lines.append("```")
+        lines.append(
+            "Members also carry `feature_id`, so a flat "
+            "`JOIN property m ON m.feature_id = f.id AND m.name = '<attr>'` works too — prefer the "
+            "set join when the same attribute name appears in more than one set."
+        )
+        lines.append("")
+
+    return lines
 
 
 def _render_generic_attributes_compact(attrs_by_class: dict) -> str:

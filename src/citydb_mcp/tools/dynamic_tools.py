@@ -1,9 +1,12 @@
 """Dynamic tools - called at session initialization, refreshable."""
 
 import json
+import logging
 import os
 from datetime import datetime
 from ..db import DatabaseConnection
+
+logger = logging.getLogger("citydb-mcp")
 from ..models import (
     ObjectClassDefinition, ObjectClassCatalog, PropertyDefinition,
     CodeListDefinition, CodeEntry, GenericAttribute,
@@ -53,6 +56,7 @@ DATATYPE_NAMES = {
     14: "core:Code", 16: "core:ImplicitGeometryProperty",
     17: "core:Measure", 18: "core:MeasureOrNilReasonList",
     22: "core:StringOrRef", 23: "core:TimePosition", 24: "core:Duration",
+    200: "generics:GenericAttributeSet",
 }
 
 
@@ -526,105 +530,186 @@ def _resolve_codelist_for_property(
 # get_generic_attributes
 # ============================================================
 
+def _set_scope(set_name: str | None) -> tuple[str, str, tuple]:
+    """Scope a generic-attribute query to standalone attrs or to one named set.
+
+    Returns (join_sql, where_sql, leading_params):
+    - set_name is None  -> standalone attrs only (parent_id IS NULL)
+    - set_name given    -> members whose parent is the GenericAttributeSet of that name
+      (a property row with namespace_id = 3, datatype_id = 200). The set-name parameter is
+      consumed by the JOIN, so it must lead the params tuple.
+    """
+    if set_name is None:
+        return "", "AND p.parent_id IS NULL", ()
+    join = (
+        "JOIN property gset ON p.parent_id = gset.id "
+        "AND gset.namespace_id = 3 AND gset.datatype_id = 200 AND gset.name = %s"
+    )
+    return join, "", (set_name,)
+
+
+def _build_generic_attr(
+    db: DatabaseConnection,
+    name: str,
+    datatype_id: int,
+    objectclass_id: int,
+    set_name: str | None = None,
+) -> GenericAttribute | None:
+    """Build and enrich one generic attribute, scoped either to standalone attrs or to a
+    named GenericAttributeSet. Returns None when the attribute has no usable values."""
+    value_column = DATATYPE_VALUE_COLUMNS.get(datatype_id, "val_string")
+    if value_column is None:
+        return None
+
+    attr = GenericAttribute(
+        name=name,
+        datatype_id=datatype_id,
+        value_column=value_column,
+        categorical_threshold=CATEGORICAL_THRESHOLD,
+    )
+    # IDs are identifiers, not categories — disable categorical detection
+    if name.lower().endswith("id"):
+        attr.categorical_threshold = -1
+
+    enriched = False
+    if value_column in ("val_string", "val_uri"):
+        attr = _enrich_string_generic(db, attr, objectclass_id, set_name)
+        enriched = True
+    elif value_column in ("val_int", "val_double"):
+        attr = _enrich_numeric_generic(db, attr, objectclass_id, set_name)
+        enriched = True
+    elif value_column == "val_timestamp":
+        attr = _enrich_timestamp_generic(db, attr, objectclass_id, set_name)
+        enriched = True
+
+    if enriched and attr.distinct_value_count == 0 and not attr.min_value and not attr.sample_values:
+        return None
+    return attr
+
+
 def get_generic_attributes(db: DatabaseConnection, filter_objectclass_ids: set | None = None) -> dict:
     """
     Fetches generic attributes (namespace_id = 3) grouped by objectclass_id.
-    Returns: dict[objectclass_id] = {"classname": str, "attrs": list[GenericAttribute]}
+    Returns: dict[objectclass_id] = {
+        "classname": str,
+        "attrs": list[GenericAttribute],                  # standalone attrs (parent_id IS NULL)
+        "sets":  dict[set_name, list[GenericAttribute]],  # members of each GenericAttributeSet
+    }
+
+    Generic attributes derived from IFC PropertySets are nested inside a GenericAttributeSet —
+    a property row with datatype_id = 200 whose members link back via parent_id. Those members
+    are grouped under their set name and enriched scoped to that set, so identically-named
+    members in different sets stay distinct.
 
     filter_objectclass_ids: if provided, only return attrs for those classes (e.g. toplevel only).
-    Each class's attributes are enriched and filtered independently so that
-    categorical values, ranges, and prefix-grouping reflect only that class's data.
     Maps to UML: GenericAttribute
     """
-    # Distinct (objectclass, attr name, datatype) combinations that exist in the DB
     if filter_objectclass_ids:
         placeholders = ",".join(["%s"] * len(filter_objectclass_ids))
-        generics = db.execute(f"""
-            SELECT DISTINCT f.objectclass_id, oc.classname, p.name, p.datatype_id
-            FROM property p
-            JOIN feature f ON p.feature_id = f.id
-            JOIN objectclass oc ON f.objectclass_id = oc.id
-            WHERE p.namespace_id = 3
-              AND f.objectclass_id IN ({placeholders})
-            ORDER BY oc.classname, p.name
-        """, tuple(filter_objectclass_ids))
+        oc_filter = f"AND f.objectclass_id IN ({placeholders})"
+        params = tuple(filter_objectclass_ids)
     else:
-        generics = db.execute("""
-            SELECT DISTINCT f.objectclass_id, oc.classname, p.name, p.datatype_id
-            FROM property p
-            JOIN feature f ON p.feature_id = f.id
-            JOIN objectclass oc ON f.objectclass_id = oc.id
-            WHERE p.namespace_id = 3
-            ORDER BY oc.classname, p.name
-        """)
+        oc_filter = ""
+        params = ()
 
-    if not generics:
-        return {}
+    # Standalone generic attributes: top-level (parent_id IS NULL), excluding set containers.
+    standalone = db.execute(f"""
+        SELECT DISTINCT f.objectclass_id, oc.classname, p.name, p.datatype_id
+        FROM property p
+        JOIN feature f ON p.feature_id = f.id
+        JOIN objectclass oc ON f.objectclass_id = oc.id
+        WHERE p.namespace_id = 3 AND p.parent_id IS NULL AND p.datatype_id <> 200
+          {oc_filter}
+        ORDER BY oc.classname, p.name
+    """, params)
 
-    # Group raw rows by objectclass_id
-    by_class: dict = {}
-    for ga in generics:
+    # Set members: generic attributes nested inside a GenericAttributeSet (datatype_id = 200).
+    members = db.execute(f"""
+        SELECT DISTINCT f.objectclass_id, oc.classname, s.name AS set_name,
+               p.name AS attr_name, p.datatype_id
+        FROM property p
+        JOIN property s ON p.parent_id = s.id AND s.namespace_id = 3 AND s.datatype_id = 200
+        JOIN feature f ON p.feature_id = f.id
+        JOIN objectclass oc ON f.objectclass_id = oc.id
+        WHERE p.namespace_id = 3
+          {oc_filter}
+        ORDER BY oc.classname, s.name, p.name
+    """, params)
+
+    result: dict = {}
+
+    def _slot(oc_id: int, classname: str) -> dict:
+        if oc_id not in result:
+            result[oc_id] = {"classname": classname, "attrs": [], "sets": {}}
+        return result[oc_id]
+
+    # --- Standalone attrs, grouped per class ---
+    standalone_by_class: dict = {}
+    for ga in standalone:
         oc_id = ga["objectclass_id"]
-        if oc_id not in by_class:
-            by_class[oc_id] = {"classname": ga["classname"], "raw": []}
-        by_class[oc_id]["raw"].append({"name": ga["name"], "datatype_id": ga["datatype_id"]})
+        standalone_by_class.setdefault(oc_id, {"classname": ga["classname"], "raw": []})
+        standalone_by_class[oc_id]["raw"].append(
+            {"name": ga["name"], "datatype_id": ga["datatype_id"]}
+        )
 
-    result = {}
-    for oc_id, info in by_class.items():
-        classname = info["classname"]
-        raw_attrs = info["raw"]
-
-        attrs = []
-        for ga in raw_attrs:
-            name = ga["name"]
-            datatype_id = ga["datatype_id"]
-            value_column = DATATYPE_VALUE_COLUMNS.get(datatype_id, "val_string")
-
-            if value_column is None:
-                continue
-
-            attr = GenericAttribute(
-                name=name,
-                datatype_id=datatype_id,
-                value_column=value_column,
-                categorical_threshold=CATEGORICAL_THRESHOLD,
-            )
-
-            # IDs are identifiers, not categories — disable categorical detection
-            if name.lower().endswith("id"):
-                attr.categorical_threshold = -1
-
-            if value_column in ("val_string", "val_uri"):
-                attr = _enrich_string_generic(db, attr, oc_id)
-                if attr.distinct_value_count == 0 and not attr.min_value and not attr.sample_values:
-                    continue
-            elif value_column in ("val_int", "val_double"):
-                attr = _enrich_numeric_generic(db, attr, oc_id)
-                if attr.distinct_value_count == 0 and not attr.min_value and not attr.sample_values:
-                    continue
-            elif value_column == "val_timestamp":
-                attr = _enrich_timestamp_generic(db, attr, oc_id)
-                if attr.distinct_value_count == 0 and not attr.min_value and not attr.sample_values:
-                    continue
-
-            attrs.append(attr)
-
+    for oc_id, info in standalone_by_class.items():
+        attrs = [
+            a for ga in info["raw"]
+            if (a := _build_generic_attr(db, ga["name"], ga["datatype_id"], oc_id)) is not None
+        ]
         attrs = _filter_generic_attrs(attrs)
         if attrs:
-            result[oc_id] = {"classname": classname, "attrs": attrs}
+            _slot(oc_id, info["classname"])["attrs"] = attrs
+
+    # --- Set members, grouped per (class, set name) ---
+    sets_by_class: dict = {}
+    for m in members:
+        oc_id = m["objectclass_id"]
+        if m["datatype_id"] == 200:
+            # A set nested inside a set — one level only; flag, don't recurse.
+            logger.info(
+                "Skipping nested GenericAttributeSet '%s' inside set '%s' (objectclass %s).",
+                m["attr_name"], m["set_name"], oc_id,
+            )
+            continue
+        slot = sets_by_class.setdefault(oc_id, {"classname": m["classname"], "sets": {}})
+        slot["sets"].setdefault(m["set_name"], []).append(
+            {"name": m["attr_name"], "datatype_id": m["datatype_id"]}
+        )
+
+    for oc_id, info in sets_by_class.items():
+        rendered_sets: dict = {}
+        for set_name, raw_members in info["sets"].items():
+            attrs = [
+                a for ga in raw_members
+                if (a := _build_generic_attr(db, ga["name"], ga["datatype_id"], oc_id, set_name)) is not None
+            ]
+            # Skip the constant-value filter for set members: in small datasets every
+            # attribute may have only one distinct value (e.g. one building), but the set
+            # structure itself is still important to expose to the LLM.
+            attrs = _filter_generic_attrs(attrs, skip_constant_filter=True)
+            if attrs:
+                rendered_sets[set_name] = attrs
+        if rendered_sets:
+            _slot(oc_id, info["classname"])["sets"] = rendered_sets
 
     return result
 
 
-def _filter_generic_attrs(attrs: list) -> list:
+def _filter_generic_attrs(attrs: list, skip_constant_filter: bool = False) -> list:
     """
     Removes constant attributes (1 distinct value), deduplicates case-insensitively,
     and collapses large metadata prefix groups into summary entries.
+
+    skip_constant_filter: when True, keep attrs that have exactly 1 distinct value.
+    Use this for GenericAttributeSet members where exposing the schema matters even in
+    small datasets (e.g. a single-building IFC import).
     """
     from collections import Counter
 
-    # Remove constants
-    attrs = [a for a in attrs if a.distinct_value_count != 1]
+    # Remove constants (unless caller opts out — e.g. for set members)
+    if not skip_constant_filter:
+        attrs = [a for a in attrs if a.distinct_value_count != 1]
 
     # Deduplicate (case-insensitive)
     seen: dict = {}
@@ -672,15 +757,19 @@ def _filter_generic_attrs(attrs: list) -> list:
     return individual_attrs
 
 
-def _enrich_string_generic(db: DatabaseConnection, attr: GenericAttribute, objectclass_id: int) -> GenericAttribute:
-    """Enriches a string-type generic attribute with categorical detection, scoped to one objectclass."""
+def _enrich_string_generic(db: DatabaseConnection, attr: GenericAttribute, objectclass_id: int,
+                           set_name: str | None = None) -> GenericAttribute:
+    """Enriches a string-type generic attribute with categorical detection, scoped to one
+    objectclass and (optionally) to one GenericAttributeSet."""
+    join_sql, where_sql, lead = _set_scope(set_name)
     count_result = db.execute_single(f"""
         SELECT COUNT(DISTINCT p.{attr.value_column}) AS cnt
         FROM property p
         JOIN feature f ON p.feature_id = f.id
+        {join_sql}
         WHERE p.namespace_id = 3 AND p.name = %s AND p.{attr.value_column} IS NOT NULL
-          AND f.objectclass_id = %s
-    """, (attr.name, objectclass_id))
+          AND f.objectclass_id = %s {where_sql}
+    """, (*lead, attr.name, objectclass_id))
 
     distinct_count = count_result["cnt"] if count_result else 0
     attr.distinct_value_count = distinct_count
@@ -691,10 +780,11 @@ def _enrich_string_generic(db: DatabaseConnection, attr: GenericAttribute, objec
             SELECT DISTINCT p.{attr.value_column} AS val
             FROM property p
             JOIN feature f ON p.feature_id = f.id
+            {join_sql}
             WHERE p.namespace_id = 3 AND p.name = %s AND p.{attr.value_column} IS NOT NULL
-              AND f.objectclass_id = %s
+              AND f.objectclass_id = %s {where_sql}
             ORDER BY val
-        """, (attr.name, objectclass_id))
+        """, (*lead, attr.name, objectclass_id))
         attr.distinct_values = [v["val"] for v in values]
     elif distinct_count > 0:
         attr.is_categorical = False
@@ -702,17 +792,21 @@ def _enrich_string_generic(db: DatabaseConnection, attr: GenericAttribute, objec
             SELECT DISTINCT p.{attr.value_column} AS val
             FROM property p
             JOIN feature f ON p.feature_id = f.id
+            {join_sql}
             WHERE p.namespace_id = 3 AND p.name = %s AND p.{attr.value_column} IS NOT NULL
-              AND f.objectclass_id = %s
+              AND f.objectclass_id = %s {where_sql}
             LIMIT %s
-        """, (attr.name, objectclass_id, SAMPLE_VALUES_COUNT))
+        """, (*lead, attr.name, objectclass_id, SAMPLE_VALUES_COUNT))
         attr.sample_values = [s["val"] for s in samples]
 
     return attr
 
 
-def _enrich_numeric_generic(db: DatabaseConnection, attr: GenericAttribute, objectclass_id: int) -> GenericAttribute:
-    """Enriches a numeric-type generic attribute with range, scoped to one objectclass."""
+def _enrich_numeric_generic(db: DatabaseConnection, attr: GenericAttribute, objectclass_id: int,
+                            set_name: str | None = None) -> GenericAttribute:
+    """Enriches a numeric-type generic attribute with range, scoped to one objectclass and
+    (optionally) to one GenericAttributeSet."""
+    join_sql, where_sql, lead = _set_scope(set_name)
     stats = db.execute_single(f"""
         SELECT
             COUNT(DISTINCT p.{attr.value_column}) AS cnt,
@@ -720,9 +814,10 @@ def _enrich_numeric_generic(db: DatabaseConnection, attr: GenericAttribute, obje
             MAX(p.{attr.value_column})::text AS max_val
         FROM property p
         JOIN feature f ON p.feature_id = f.id
+        {join_sql}
         WHERE p.namespace_id = 3 AND p.name = %s AND p.{attr.value_column} IS NOT NULL
-          AND f.objectclass_id = %s
-    """, (attr.name, objectclass_id))
+          AND f.objectclass_id = %s {where_sql}
+    """, (*lead, attr.name, objectclass_id))
 
     if not stats:
         return attr
@@ -737,10 +832,11 @@ def _enrich_numeric_generic(db: DatabaseConnection, attr: GenericAttribute, obje
             SELECT DISTINCT p.{attr.value_column}::text AS val
             FROM property p
             JOIN feature f ON p.feature_id = f.id
+            {join_sql}
             WHERE p.namespace_id = 3 AND p.name = %s AND p.{attr.value_column} IS NOT NULL
-              AND f.objectclass_id = %s
+              AND f.objectclass_id = %s {where_sql}
             ORDER BY val
-        """, (attr.name, objectclass_id))
+        """, (*lead, attr.name, objectclass_id))
         attr.distinct_values = [v["val"] for v in values]
     else:
         attr.is_categorical = False
@@ -748,17 +844,21 @@ def _enrich_numeric_generic(db: DatabaseConnection, attr: GenericAttribute, obje
     return attr
 
 
-def _enrich_timestamp_generic(db: DatabaseConnection, attr: GenericAttribute, objectclass_id: int) -> GenericAttribute:
-    """Enriches a timestamp-type generic attribute with range, scoped to one objectclass."""
-    stats = db.execute_single("""
+def _enrich_timestamp_generic(db: DatabaseConnection, attr: GenericAttribute, objectclass_id: int,
+                              set_name: str | None = None) -> GenericAttribute:
+    """Enriches a timestamp-type generic attribute with range, scoped to one objectclass and
+    (optionally) to one GenericAttributeSet."""
+    join_sql, where_sql, lead = _set_scope(set_name)
+    stats = db.execute_single(f"""
         SELECT
             MIN(p.val_timestamp)::text AS min_val,
             MAX(p.val_timestamp)::text AS max_val
         FROM property p
         JOIN feature f ON p.feature_id = f.id
+        {join_sql}
         WHERE p.namespace_id = 3 AND p.name = %s AND p.val_timestamp IS NOT NULL
-          AND f.objectclass_id = %s
-    """, (attr.name, objectclass_id))
+          AND f.objectclass_id = %s {where_sql}
+    """, (*lead, attr.name, objectclass_id))
 
     if stats:
         attr.min_value = stats["min_val"]
