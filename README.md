@@ -330,7 +330,7 @@ Once the UI is open:
 1. Go to the **Import CityGML/CityJSON** tab
 2. Click **Refresh** to see files in `./production/data/`
 3. Select your file and click **Import**
-4. Watch the live log — the import runs via [`ghcr.io/3dcitydb/citydb-tool`](https://github.com/3dcitydb/citydb-tool) (pulled automatically)
+4. Watch the live log — the import runs using the Docker container [`ghcr.io/3dcitydb/citydb-tool`](https://github.com/3dcitydb/citydb-tool). Note, this container is pulled automatically, if it is not available in your Docker environment so far. In this case, please be patient as it might take 30 seconds before the import process really starts.
 
 > The data directory is mounted at `./production/data/` on the host and `/app/data/` inside the container.
 
