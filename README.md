@@ -7,7 +7,7 @@ By including the MCP server in agentic coding environments, it becomes easy to c
 
 Furthermore, a **Chat Assistant** is included offering a simple GUI for interactive query asking, reasoning, and answering. It is an agentic AI tool based on [LangChain](https://github.com/langchain-ai) utilising the [ReAct pattern](https://reference.langchain.com/javascript/langchain-react) for carrying out multi-step reasoning and automated error corrections. The Chat Assistent currently can be configured to work with OpenAI and Anthropic commercial LLMs as well as with locally running [Ollama](https://github.com/ollama/ollama) LLMs. For example, when using the [`qwen3.6:27b`](https://ollama.com/library/qwen3.6:27b) LLM running in Ollama, the Chat Assistant is capable of performing very complex analyses on any kind of stored 3D city model. 
 
-The evaluation of the MCP Server for the paper (link coming soon) was done using 100 queries of 4 different complexity levels. The complete list of the queries can be found here: https://handy-porpoise-645.notion.site/Evaluation-Questions-31b3fb8cb4358084bfcdc6b4023c4c15
+The evaluation of the MCP Server for the paper (link coming soon) was done using 100 queries of 4 different complexity levels. The complete list of the queries can be found [`here`](https://handy-porpoise-645.notion.site/Evaluation-Questions-31b3fb8cb4358084bfcdc6b4023c4c15).
 
 ---
 
