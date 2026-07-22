@@ -4,8 +4,6 @@ import json
 import time as _time
 from typing import Callable, Generator
 
-import litellm
-
 from webui.llm_utils import (
     MAX_ITERATIONS,
     RUN_QUERY_TOOL,
@@ -16,6 +14,7 @@ from webui.llm_utils import (
     _is_stopped,
     _litellm_kwargs,
     _log_context_usage,
+    safe_completion,
     _parse_tool_result,
     _post_process_markdown,
     _set_active_future,
@@ -76,14 +75,16 @@ def native_tool_stream(
 
         if force_text_response:
             _fut = _executor.submit(
-                litellm.completion,
-                **kw,
+                safe_completion,
+                kw,
                 messages=working_messages,
+                tools=[RUN_QUERY_TOOL],
+                tool_choice="none",
             )
         else:
             _fut = _executor.submit(
-                litellm.completion,
-                **kw,
+                safe_completion,
+                kw,
                 messages=working_messages,
                 tools=[RUN_QUERY_TOOL],
                 tool_choice="auto",
@@ -327,7 +328,13 @@ def native_tool_stream(
             f"they try rephrasing or verify the data exists. Do NOT include any SQL."
         ),
     })
-    _fut_fail = _executor.submit(litellm.completion, **kw, messages=working_messages)
+    _fut_fail = _executor.submit(
+        safe_completion,
+        kw,
+        messages=working_messages,
+        tools=[RUN_QUERY_TOOL],
+        tool_choice="none",
+    )
     _set_active_future(_fut_fail)
     try:
         yield ("status", "Composing response…")
