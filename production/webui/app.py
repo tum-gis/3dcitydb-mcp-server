@@ -333,6 +333,99 @@ def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 
+def _build_reasoning_transcript(events: list) -> str:
+    """Reconstruct a compact thought/action/observation transcript from the
+    raw event stream (Ollama only — relies on local.py's thinking_token
+    events). Used to optionally replay reasoning into future turns' context.
+    """
+    parts: list[str] = []
+    buf = ""
+    for event, data in events:
+        if event == "thinking_token":
+            buf += data
+        elif event == "tool_call":
+            if buf.strip():
+                parts.append(buf.strip())
+                buf = ""
+            sql = data.get("args", {}).get("sql", "")
+            parts.append(f"[Action] run_query: {sql}")
+        elif event == "tool_result":
+            if data.get("error"):
+                parts.append(f"[Observation] Error: {data['error']}")
+            else:
+                parts.append(f"[Observation] {data.get('row_count', 0)} row(s) returned")
+    if buf.strip():
+        parts.append(buf.strip())
+    return "\n".join(parts)
+
+
+def _summarize_reasoning_ollama(transcript: str, model: str, num_ctx: int | None) -> tuple[str, str]:
+    """Ask the same Ollama model to distill its own reasoning trace from this
+    turn into a short "lessons learned" note, carried into future turns.
+
+    Runs synchronously — adds one extra (blocking) generation after the turn
+    that just finished. Returns (summary, error) — exactly one is truthy.
+    On failure, or an empty/uninformative response, summary is "" and error
+    explains why, so the caller can surface it instead of failing silently.
+    """
+    if not transcript.strip():
+        return "", "no reasoning transcript to summarize"
+
+    # NOTE: went through two failed attempts via langchain_ollama's ChatOllama
+    # before landing here — the installed version (0.2.0) has no "think" field
+    # at all (confirmed via model_fields), and the /no_think prompt
+    # soft-switch didn't stop this model from spending its whole num_predict
+    # budget on hidden reasoning either (469 chunks, done_reason=length, zero
+    # visible .content both times). Calling Ollama's /api/chat directly with
+    # a top-level "think": false is the one place this is guaranteed to reach
+    # the actual server option, independent of the LangChain wrapper version.
+    import json as _json
+    import urllib.request as _urllib
+
+    base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+    prompt = (
+        "Below is your own reasoning trace from answering a database question, "
+        "including any failed attempts and corrections:\n\n"
+        f"{transcript[:8000]}\n\n"
+        "In at most 3 short bullet points, note anything durable you learned that "
+        "would help you answer similar questions faster next time (correct table/column "
+        "mappings, working SQL patterns, mistakes to avoid). Be concise and factual — "
+        "do not restate the question or the final answer. "
+        "If there is nothing generalizable, reply with exactly: (nothing to note)"
+    )
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "think": False,
+        "options": {
+            "temperature": 0.0,
+            "num_predict": 500,
+            "num_ctx": num_ctx or 32768,
+        },
+    }
+    try:
+        req = _urllib.Request(
+            f"{base_url}/api/chat",
+            data=_json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        timeout = float(os.environ.get("OLLAMA_TIMEOUT", "300"))
+        with _urllib.urlopen(req, timeout=timeout) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        text = (data.get("message", {}).get("content") or "").strip()
+        if not text:
+            done_reason = data.get("done_reason", "unknown")
+            return "", f"model returned an empty response (done_reason={done_reason})"
+        if text.lower().startswith("(nothing"):
+            return "", "model reported nothing generalizable to note"
+        return text, ""
+    except Exception as exc:
+        print(f"[chat] lessons-learned summarization failed: {exc}", flush=True)
+        return "", f"{type(exc).__name__}: {exc}"
+
+
 def chat_stream(
     user_message: str,
     history: list,
@@ -344,9 +437,16 @@ def chat_stream(
     num_ctx_label: str,
     log_history: list | None = None,
     tool_cache: dict | None = None,
+    reasoning_replay: bool = False,
+    add_lessons: bool = False,
+    reasoning_history: list | None = None,
+    lessons_note: str | None = None,
 ) -> Generator[tuple, None, None]:
     if log_history is None:
         log_history = []
+    # Reasoning trace per turn (Ollama only), index-aligned with `history`.
+    # See _build_reasoning_transcript / the two toggles below.
+    reasoning_history = list(reasoning_history) if reasoning_history else []
     # Cache value to emit alongside every yield. Starts as whatever the UI
     # passed in; reassigned after a successful tool result this turn.
     cache_out = tool_cache if _cache_is_fresh(tool_cache) else None
@@ -365,16 +465,19 @@ def chat_stream(
     _NO_CTX = gr.update()
 
     if not user_message.strip():
-        yield history, history, "*Idle.*", "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out
+        yield history, history, "*Idle.*", "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
         return
 
     stop_update = gr.update(visible=True)
 
     history = history + [[user_message, "● ● ●"]]
-    yield history, history, "*Idle.*", "", stop_update, _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out
+    # Enable "prev" immediately if earlier turns already exist, instead of
+    # leaving the log-nav buttons frozen in their last-completed-turn state
+    # for the whole duration of this (possibly slow, local-model) turn.
+    yield history, history, "*Idle.*", "", stop_update, _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(interactive=len(log_history) > 0), gr.update(interactive=False), cache_out, reasoning_history, lessons_note
 
     history[-1][1] = "*Connecting to knowledge base…*"
-    yield history, history, "*Idle.*", "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out
+    yield history, history, "*Idle.*", "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
     sp = _get_system_prompt(compact=effective_compact)
     system_prompt = CHAT_INSTRUCTIONS + "\n\n" + sp
     total_chars = len(system_prompt)
@@ -385,14 +488,24 @@ def chat_stream(
         re.IGNORECASE,
     )
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
-    for user_msg, asst_msg in history[:-1]:
+    _replay_reasoning = reasoning_replay and provider == "ollama"
+    for idx, (user_msg, asst_msg) in enumerate(history[:-1]):
         if user_msg:
             messages.append({"role": "user", "content": user_msg})
         if asst_msg and not asst_msg.startswith("*") and not asst_msg.startswith("●"):
             if _COUNT_PATTERN.match(asst_msg.strip()) and len(asst_msg) < 200:
                 continue
-            messages.append({"role": "assistant", "content": asst_msg})
+            content = asst_msg
+            if _replay_reasoning and idx < len(reasoning_history) and reasoning_history[idx]:
+                content = f"[Reasoning]\n{reasoning_history[idx]}\n\n[Answer]\n{asst_msg}"
+            messages.append({"role": "assistant", "content": content})
     messages.append({"role": "user", "content": user_message})
+
+    # Self-summarized "lessons learned" from previous turns (Ollama only).
+    # Inserted before the tool-result cache note below so both survive
+    # _trim_messages (which keeps all system-role messages).
+    if add_lessons and provider == "ollama" and lessons_note:
+        messages.insert(1, {"role": "system", "content": f"[Lessons learned from previous turns]\n{lessons_note}"})
 
     # If we have a fresh cache from the previous turn, inject it as an extra
     # system message right after the main system prompt. _trim_messages keeps
@@ -421,6 +534,19 @@ def chat_stream(
         trace_lines.append(f"`{_ts()}` {line}")
         return "\n\n".join(trace_lines)
 
+    # Live raw-token streaming into Agent Activity (Ollama only — see local.py's
+    # thinking_token events). Appends into the current block until a tool call
+    # or a new turn starts a fresh one.
+    _thinking_stream_idx: int | None = None
+
+    def _stream_thinking(token: str) -> str:
+        nonlocal _thinking_stream_idx
+        if _thinking_stream_idx is None:
+            trace_lines.append(f"`{_ts()}` 🧠 **Reasoning (live):**\n\n")
+            _thinking_stream_idx = len(trace_lines) - 1
+        trace_lines[_thinking_stream_idx] += token.replace("\n", "  \n")
+        return "\n\n".join(trace_lines)
+
     trace_md = log(f"**User query:** {user_message[:200]}")
     if dropped_turns:
         trace_md = log(f"⚠️ **Context trimmed:** dropped {dropped_turns} oldest turn(s) to fit within the {ctx_limit:,}-token context window.")
@@ -431,7 +557,7 @@ def chat_stream(
             f"Start a **New conversation** if you want a clean slate."
         )
         history = history + [[None, ctx_warning]]
-    yield history, history, trace_md, "", gr.update(), _NO_HL, ctx_bar_html, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out
+    yield history, history, trace_md, "", gr.update(), _NO_HL, ctx_bar_html, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
 
     def _render_tool_call(sql: str, it: int) -> str:
         return log(
@@ -464,11 +590,11 @@ def chat_stream(
                 got_content = True
                 history[-1][1] = "*Stopped.*"
                 trace_md = log("⛔ **Stopped by user.**")
-                yield history, history[:-1], trace_md, "", gr.update(visible=False), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out
+                yield history, history[:-1], trace_md, "", gr.update(visible=False), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
                 return
 
             elif event == "ping":
-                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out
+                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
 
             elif event == "status":
                 history[-1][1] = f"*{data}*"
@@ -478,19 +604,25 @@ def chat_stream(
                     trace_md = log(f"⏳ **Processing query using model {model}:** {_q}")
                 elif data not in ("Thinking…", "Formulating…", "Formulating query…", "Reasoning…"):
                     trace_md = log(f"⏳ **{data}**")
-                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out
+                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
 
             elif event == "context_update":
                 ctx_bar_html = _make_ctx_bar(data["used"], ctx_limit)
-                yield history, history, trace_md, "", gr.update(), _NO_HL, ctx_bar_html, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out
+                yield history, history, trace_md, "", gr.update(), _NO_HL, ctx_bar_html, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
 
             elif event == "thinking":
                 got_content = True
                 trace_md = log(f"🧠 **Model reasoning:**\n\n> {data.strip()}")
-                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out
+                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+
+            elif event == "thinking_token":
+                got_content = True
+                trace_md = _stream_thinking(data)
+                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
 
             elif event == "tool_call":
                 got_content = True
+                _thinking_stream_idx = None
                 sql = data.get("args", {}).get("sql", "")
                 _pending_sql = sql
                 it = data.get("iteration", 0)
@@ -498,7 +630,7 @@ def chat_stream(
                 history[-1][1] = (
                     (accumulated + " *(running query…)*") if accumulated else "*Running query…*"
                 )
-                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out
+                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
 
             elif event == "tool_result":
                 trace_md = _render_tool_result(data)
@@ -510,13 +642,13 @@ def chat_stream(
                     )
                     if new_cache is not None:
                         cache_out = new_cache
-                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out
+                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
 
             else:  # "final"
                 got_content = True
                 accumulated += data
                 history[-1][1] = accumulated + " ▌"
-                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out
+                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
 
     except Exception as exc:
         import traceback
@@ -540,7 +672,11 @@ def chat_stream(
             )
         else:
             history[-1][1] = f"**Error `{_exc_name}`:** {exc}"
-        yield history, history, trace_md, "", gr.update(visible=False), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out
+        # This turn is kept in `history` (as an error message) but produced no
+        # usable reasoning — append a placeholder so reasoning_history stays
+        # index-aligned with history turn-for-turn.
+        reasoning_history = reasoning_history + [None]
+        yield history, history, trace_md, "", gr.update(visible=False), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
         return
 
     # ── Compute highlight payload and deliver final answer ─────────────────────
@@ -557,6 +693,25 @@ def chat_stream(
     else:
         highlight_payload = _NO_HL
 
+    # Track this turn's raw reasoning (Ollama only) so it can optionally be
+    # replayed into context on later turns. Always append something (even
+    # None) so reasoning_history stays index-aligned with history turn-for-turn.
+    turn_transcript = _build_reasoning_transcript(collected_events) if provider == "ollama" else ""
+    reasoning_history = reasoning_history + [turn_transcript or None]
+
+    # Self-summarized "lessons learned" (Ollama only). Runs synchronously —
+    # adds one extra blocking generation on top of this turn. Best-effort:
+    # keeps the previous note if this turn produced nothing new, but always
+    # logs the outcome so the toggle's effect is visible either way.
+    if add_lessons and provider == "ollama" and turn_transcript:
+        summary, summary_error = _summarize_reasoning_ollama(turn_transcript, model, num_ctx)
+        if summary:
+            lessons_note = summary
+            quoted = summary.replace("\n", "\n> ")
+            trace_md = log(f"📝 **Summary of what I learned:**\n\n> {quoted}")
+        else:
+            trace_md = log(f"📝 **Lessons-learned summary skipped:** {summary_error}")
+
     trace_md = log("✅ **Final answer delivered**")
     history[-1][1] = accumulated
     updated_log_history = list(log_history) + [{"query": user_message, "trace": trace_md}]
@@ -571,6 +726,8 @@ def chat_stream(
         gr.update(interactive=_n > 1),
         gr.update(interactive=False),
         cache_out,
+        reasoning_history,
+        lessons_note,
     )
     print(f"[chat] done. final response length={len(accumulated)}", flush=True)
 
@@ -590,6 +747,8 @@ def on_provider_change(provider: str) -> tuple:
         gr.update(visible=is_ollama, value=warn),
         gr.update(),                            # prompt_mode_radio: unchanged (stays "auto")
         gr.update(visible=is_ollama),           # num_ctx_dropdown: only for local
+        gr.update(visible=is_ollama),           # reasoning_replay_checkbox: only for local
+        gr.update(visible=is_ollama),           # lessons_checkbox: only for local
     )
 
 
@@ -601,7 +760,11 @@ def refresh_ollama_models() -> gr.update:
 
 # ── Import tab (fullstack only) ────────────────────────────────────────────────
 
-def build_import_tab(reload_tiles_state: gr.State | None = None) -> None:
+def build_import_tab(
+    reload_tiles_state: gr.State | None = None,
+    msg_input: gr.Textbox | None = None,
+    send_btn: gr.Button | None = None,
+) -> None:
     from webui.importer import import_city_file, list_gml_files, run_tiler
 
     with gr.Tab("Import CityGML / CityJSON"):
@@ -650,8 +813,18 @@ def build_import_tab(reload_tiles_state: gr.State | None = None) -> None:
 
         tiling_done = reload_tiles_state is not None
         extra_outputs = [reload_tiles_state] if tiling_done else []
+        lock_chat = msg_input is not None and send_btn is not None
 
         def run_import_and_tile(filename: str, fmt_override: str, auto_tile: bool, current_reload: int = 0):
+            def _pack(log_val: str, reload_val: int, finished: bool):
+                out = [log_val]
+                if tiling_done:
+                    out.append(reload_val)
+                if lock_chat:
+                    chat_update = gr.update(interactive=finished)
+                    out.extend([chat_update, chat_update])
+                return tuple(out) if len(out) > 1 else out[0]
+
             log = ""
             import_succeeded = False
             no_change = current_reload
@@ -660,42 +833,50 @@ def build_import_tab(reload_tiles_state: gr.State | None = None) -> None:
                 log += line
                 if "Import finished successfully" in line:
                     import_succeeded = True
-                yield (log, no_change) if tiling_done else log
+                yield _pack(log, no_change, False)
 
             if not import_succeeded and ENABLE_VIZ:
                 log += "\nSkipping tile generation because import did not succeed.\n"
-                yield (log, no_change) if tiling_done else log
+                yield _pack(log, no_change, True)
                 return
 
             try:
                 _refresh_system_prompt()
                 log += "\n✓ Agent knowledge base refreshed.\n"
-                yield (log, no_change) if tiling_done else log
+                yield _pack(log, no_change, False)
             except Exception as exc:
                 log += f"\n⚠ Could not refresh agent knowledge base: {exc}\n"
-                yield (log, no_change) if tiling_done else log
+                yield _pack(log, no_change, True)
+                return
 
             if not auto_tile or not ENABLE_VIZ:
-                yield (log, no_change) if tiling_done else log
+                yield _pack(log, no_change, True)
                 return
 
             log += "\n" + "═" * 60 + "\n"
             log += "Starting 3D tile generation...\n"
             log += "═" * 60 + "\n"
-            yield (log, no_change) if tiling_done else log
+            yield _pack(log, no_change, False)
 
             for line in run_tiler():
                 log += line
-                yield (log, no_change) if tiling_done else log
+                yield _pack(log, no_change, False)
 
             log += "\n✓ 3D tiles ready — the 3D viewer is reloading the tileset.\n"
             new_reload = current_reload + 1
-            yield (log, new_reload) if tiling_done else log
+            yield _pack(log, new_reload, True)
 
-        import_btn.click(
+        _import_event = import_btn.click
+        if lock_chat:
+            _import_event = import_btn.click(
+                fn=lambda: (gr.update(interactive=False), gr.update(interactive=False)),
+                outputs=[msg_input, send_btn],
+            ).then
+
+        _import_event(
             fn=run_import_and_tile,
             inputs=[file_dropdown, format_radio, auto_tile_checkbox] + ([reload_tiles_state] if tiling_done else []),
-            outputs=[import_log] + extra_outputs,
+            outputs=[import_log] + extra_outputs + ([msg_input, send_btn] if lock_chat else []),
         )
 
 
@@ -847,6 +1028,20 @@ def build_ui() -> gr.Blocks:
                     visible=initial_is_ollama,
                     info="Tokens available to the model. 128K recommended for complex queries.",
                 )
+                reasoning_replay_checkbox = gr.Checkbox(
+                    label="Include all reasoning steps in context (Ollama)",
+                    value=False,
+                    visible=initial_is_ollama,
+                    info="Feeds each turn's full Thought/Action/Observation trace back into "
+                         "context on later turns. Increases token usage significantly.",
+                )
+                lessons_checkbox = gr.Checkbox(
+                    label="Add self-summarized \"lessons learned\" (Ollama)",
+                    value=False,
+                    visible=initial_is_ollama,
+                    info="After each turn, asks the model to summarize what it learned and "
+                         "carries that note forward. Adds one extra blocking generation per turn.",
+                )
                 reset_btn = gr.Button("New conversation", size="sm")
                 context_bar = gr.HTML(
                     value="",
@@ -877,10 +1072,11 @@ def build_ui() -> gr.Blocks:
                                 )
                                 with gr.Row():
                                     msg_input = gr.Textbox(
-                                        placeholder="Ask about your city model…",
+                                        placeholder="Assembling agent context, please wait…",
                                         label="", scale=8, lines=1,
+                                        interactive=False,
                                     )
-                                    send_btn = gr.Button("➤", variant="primary", scale=0, min_width=48, elem_id="send-btn")
+                                    send_btn = gr.Button("➤", variant="primary", scale=0, min_width=48, elem_id="send-btn", interactive=False)
                                     stop_btn = gr.Button("⏹", variant="stop", scale=0, min_width=48, elem_id="stop-btn", visible=False)
 
                             with gr.Column(scale=1, min_width=360):
@@ -919,10 +1115,11 @@ def build_ui() -> gr.Blocks:
                                 )
                                 with gr.Row():
                                     msg_input = gr.Textbox(
-                                        placeholder="Ask about your city model…",
+                                        placeholder="Assembling agent context, please wait…",
                                         label="", scale=8, lines=1,
+                                        interactive=False,
                                     )
-                                    send_btn = gr.Button("➤", variant="primary", scale=0, min_width=48, elem_id="send-btn")
+                                    send_btn = gr.Button("➤", variant="primary", scale=0, min_width=48, elem_id="send-btn", interactive=False)
                                     stop_btn = gr.Button("⏹", variant="stop", scale=0, min_width=48, elem_id="stop-btn", visible=False)
 
                             with gr.Column(scale=2, min_width=300):
@@ -942,7 +1139,11 @@ def build_ui() -> gr.Blocks:
                                 )
 
                 if VARIANT == "fullstack":
-                    build_import_tab(reload_tiles_state if ENABLE_VIZ else None)
+                    build_import_tab(
+                        reload_tiles_state if ENABLE_VIZ else None,
+                        msg_input=msg_input,
+                        send_btn=send_btn,
+                    )
 
                 with gr.Tab("MCP Inspector"):
                     gr.Markdown("### Active MCP tools")
@@ -967,11 +1168,16 @@ def build_ui() -> gr.Blocks:
                             label="Status", interactive=False, lines=1
                         )
                         refresh_prompt_btn.click(
+                            fn=lambda: (gr.update(interactive=False), gr.update(interactive=False)),
+                            outputs=[msg_input, send_btn],
+                        ).then(
                             fn=lambda: (
                                 _refresh_system_prompt(),
                                 "Done — system prompt refreshed.",
-                            )[-1],
-                            outputs=prompt_status,
+                                gr.update(interactive=True),
+                                gr.update(interactive=True),
+                            )[-3:],
+                            outputs=[prompt_status, msg_input, send_btn],
                         )
 
                 with gr.Tab("System Prompt"):
@@ -1012,6 +1218,11 @@ def build_ui() -> gr.Blocks:
         # Holds the last successful tool result so the agent can answer
         # follow-up questions without re-querying. See _build_tool_cache.
         tool_cache_state = gr.State(None)
+        # Ollama-only: per-turn raw reasoning trace (index-aligned with
+        # history_state) and the rolling self-summarized "lessons learned"
+        # note. See _build_reasoning_transcript / _summarize_reasoning_ollama.
+        reasoning_state = gr.State([])
+        lessons_state = gr.State(None)
 
         if ENABLE_VIZ:
             gr.HTML("""
@@ -1053,8 +1264,9 @@ window._reloadTiles = function() {
             msg_input, history_state, provider_radio, model_dropdown,
             temperature_slider, thinking_toggle, prompt_mode_radio, num_ctx_dropdown,
             log_history_state, tool_cache_state,
+            reasoning_replay_checkbox, lessons_checkbox, reasoning_state, lessons_state,
         ]
-        send_outputs = [chatbot, history_state, agent_trace, msg_input, stop_btn, highlight_state, context_bar, log_history_state, log_page_state, log_page_label, log_prev_btn, log_next_btn, tool_cache_state]
+        send_outputs = [chatbot, history_state, agent_trace, msg_input, stop_btn, highlight_state, context_bar, log_history_state, log_page_state, log_page_label, log_prev_btn, log_next_btn, tool_cache_state, reasoning_state, lessons_state]
 
         submit_event = msg_input.submit(fn=chat_stream, inputs=send_inputs, outputs=send_outputs)
         click_event = send_btn.click(fn=chat_stream, inputs=send_inputs, outputs=send_outputs)
@@ -1069,7 +1281,10 @@ window._reloadTiles = function() {
         provider_radio.change(
             fn=on_provider_change,
             inputs=provider_radio,
-            outputs=[model_dropdown, refresh_ollama_btn, dynamic_warn, prompt_mode_radio, num_ctx_dropdown],
+            outputs=[
+                model_dropdown, refresh_ollama_btn, dynamic_warn, prompt_mode_radio, num_ctx_dropdown,
+                reasoning_replay_checkbox, lessons_checkbox,
+            ],
         )
         refresh_ollama_btn.click(fn=refresh_ollama_models, outputs=model_dropdown)
 
@@ -1149,6 +1364,8 @@ window._reloadTiles = function() {
                 gr.update(interactive=False),
                 gr.update(interactive=False),
                 None,
+                [],
+                None,
             )
 
         reset_btn.click(
@@ -1157,7 +1374,7 @@ window._reloadTiles = function() {
             outputs=[chatbot, history_state, agent_trace, msg_input,
                      highlight_state, context_bar,
                      log_history_state, log_page_state, log_page_label, log_prev_btn, log_next_btn,
-                     tool_cache_state],
+                     tool_cache_state, reasoning_state, lessons_state],
         )
         chatbot.clear(
             fn=clear_chat,
@@ -1165,7 +1382,7 @@ window._reloadTiles = function() {
             outputs=[chatbot, history_state, agent_trace, msg_input,
                      highlight_state, context_bar,
                      log_history_state, log_page_state, log_page_label, log_prev_btn, log_next_btn,
-                     tool_cache_state],
+                     tool_cache_state, reasoning_state, lessons_state],
         )
 
         log_prev_btn.click(
@@ -1179,17 +1396,43 @@ window._reloadTiles = function() {
             outputs=[agent_trace, log_page_label, log_prev_btn, log_next_btn, log_page_state],
         )
 
+        _ASSEMBLING_HTML = (
+            '<div style="display:flex;gap:16px;font-size:0.85rem;padding:6px 0;color:#94a3b8;">'
+            "⏳ The context is being assembled, please wait…</div>"
+        )
+
         def _on_load(provider: str, model: str, prompt_mode: str, num_ctx_label: str):
+            # Yield an immediate placeholder so the user sees our own message
+            # instead of Gradio's generic "Processing" queue indicator while
+            # the (potentially slow) initial context assembly finishes.
+            yield (
+                _ASSEMBLING_HTML,
+                gr.update(),
+                "",
+                gr.update(interactive=False, placeholder="Assembling agent context, please wait…"),
+                gr.update(interactive=False),
+            )
+
             _, label = _resolve_compact(prompt_mode, provider, model)
             db_status = _check_db_status()
+            # clear_chat() calls _get_system_prompt(), which blocks on _sp_lock
+            # until the startup pre-warm thread has finished assembling the
+            # context — so by the time we get here it is safe to unlock input.
+            context_bar_html = clear_chat(provider, model, prompt_mode, num_ctx_label)[5]
             status_html = get_status_html(provider, model, prompt_mode_label=label, db_status=db_status)
             warning_html = _DB_EMPTY_WARNING if db_status == "empty" else ""
-            return status_html, clear_chat(provider, model, prompt_mode, num_ctx_label)[5], warning_html
+            yield (
+                status_html,
+                context_bar_html,
+                warning_html,
+                gr.update(interactive=True, placeholder="Ask about your city model…"),
+                gr.update(interactive=True),
+            )
 
         demo.load(
             fn=_on_load,
             inputs=[provider_radio, model_dropdown, prompt_mode_radio, num_ctx_dropdown],
-            outputs=[status_bar, context_bar, db_warning],
+            outputs=[status_bar, context_bar, db_warning, msg_input, send_btn],
         )
 
     return demo
