@@ -188,6 +188,8 @@ class _EventCallback(BaseCallbackHandler):
         self._stream_buffer = []   # accumulates tokens for the current LLM call
         self._streaming_final = False  # True once "Final Answer:" seen in stream
         self._in_error_retry = False  # True while LangChain replays a parse-error correction
+        self._raw_buffer = ""      # batches raw tokens for live thinking_token events
+        self._last_flush = _time.monotonic()
 
     @staticmethod
     def _parse_tool_output(output: str) -> dict:
@@ -221,21 +223,19 @@ class _EventCallback(BaseCallbackHandler):
         # actions too — suppress them so the error never leaks into the UI.
         if getattr(action, "tool", "") == "_Exception":
             return
-        # Extract the Thought text that precedes Action: in action.log
-        thought = ""
-        if action.log:
-            lines = action.log.split("\n")
-            thought_lines = []
-            for line in lines:
-                if re.match(r"\s*Action\s*:", line, re.IGNORECASE):
-                    break
-                thought_lines.append(line)
-            thought = "\n".join(thought_lines).strip()
-            thought = re.sub(r"^Thought\s*:\s*", "", thought, flags=re.IGNORECASE).strip()
-        if thought:
-            self._q.put(("thinking", thought))
+        # The Thought text was already streamed live token-by-token via
+        # on_llm_new_token / thinking_token — nothing to emit here anymore.
+
+    def _flush_raw(self) -> None:
+        """Push whatever raw text has accumulated since the last flush."""
+        if self._raw_buffer:
+            self._q.put(("thinking_token", self._raw_buffer))
+            self._raw_buffer = ""
 
     def on_tool_start(self, serialized, input_str, **kwargs):
+        # Flush any trailing Thought text before the tool call is announced,
+        # so the live reasoning stream finishes before "Calling run_query" shows.
+        self._flush_raw()
         # LangChain routes parse-error corrections through a synthetic "_Exception"
         # tool. Suppress these — they are not real DB queries and must not appear
         # in the UI or increment the tools-called counter.
@@ -271,12 +271,29 @@ class _EventCallback(BaseCallbackHandler):
         self._q.put(("tool_result", {**result_data, "iteration": self._iteration}))
 
     def on_llm_new_token(self, token: str, **kwargs) -> None:
-        """Buffer tokens and only forward them once 'Final Answer:' is seen.
+        """Forward raw tokens live (thinking_token) so the Agent Activity
+        panel streams the model's reasoning in real time, same as `ollama run`.
 
-        This prevents retry-thinking and tool-call generations from leaking
-        into the chat bubble. Tokens are discarded on every new tool call.
+        Stops forwarding to the raw stream once 'Final Answer:' is seen —
+        from that point on the tokens ARE the reply, already streamed
+        separately into the chat bubble via _stream_token below. Without this
+        cutoff the answer text would appear twice: once raw here, once clean
+        in the chat bubble.
         """
-        if self._tools_called == 0 or not token:
+        if not token:
+            return
+
+        if not self._streaming_final:
+            # Still in the "thinking" phase for this LLM call — stream raw
+            # tokens live into Agent Activity, batched to avoid flooding the
+            # UI with a re-render on every single sub-word token.
+            self._raw_buffer += token
+            now = _time.monotonic()
+            if len(self._raw_buffer) >= 8 or (now - self._last_flush) >= 0.05:
+                self._flush_raw()
+                self._last_flush = now
+
+        if self._tools_called == 0:
             return
 
         if self._streaming_final:
@@ -292,6 +309,7 @@ class _EventCallback(BaseCallbackHandler):
                 self._q.put(("_stream_token", after))
 
     def on_agent_finish(self, finish, **kwargs):
+        self._flush_raw()
         output = finish.return_values.get("output", "")
         self._q.put(("_output", output))
 
@@ -301,6 +319,7 @@ class _EventCallback(BaseCallbackHandler):
         # Treating it as fatal here would kill the generator before the retry happens.
         if isinstance(error, OutputParserException):
             return
+        self._flush_raw()
         self._q.put(("_error", str(error)))
 
 
@@ -320,6 +339,12 @@ class _RobustReActParser(ReActSingleInputOutputParser):
         r"Action\s+Input\s*:\s*(.*?)(?:\nObservation:|\nThought:|\Z)",
         re.DOTALL | re.IGNORECASE,
     )
+
+    # A "final answer" that is just a bare number/token (e.g. "1") after a
+    # multi-row/multi-column tool result almost never a real answer — it's a
+    # sign the model's response got truncated or derailed. Deliberately tight
+    # (short + only digits/punctuation) so real one-word answers aren't caught.
+    _DEGENERATE_FINAL_RE = re.compile(r"^[\d.,\-\s]{1,6}$")
 
     # Patterns that signal a purely conversational message — no DB query expected.
     _CONVERSATIONAL_RE = re.compile(
@@ -459,6 +484,32 @@ class _RobustReActParser(ReActSingleInputOutputParser):
         # (Common after a simple COUNT result.) Treat it as the final answer.
         if stripped and "Action" not in stripped and "Action Input" not in stripped:
             self._require_tool_call(stripped)
+
+            # Guard against a degenerate bare-token "answer" (e.g. "1") once a
+            # tool has already returned real data — same retry-then-give-up
+            # pattern as the empty-response guard above, so it doesn't loop
+            # forever if the model keeps derailing.
+            if self._cb._tools_called > 0 and self._DEGENERATE_FINAL_RE.match(stripped):
+                self._cb._parse_errors += 1
+                if self._cb._parse_errors >= 2:
+                    return AgentFinish(
+                        return_values={
+                            "output": (
+                                f'The model\'s answer was incomplete (just "{stripped}") '
+                                "even after retrying. The query itself succeeded — check "
+                                "the Agent Activity panel for the raw results, or try "
+                                "rephrasing the question."
+                            )
+                        },
+                        log=text,
+                    )
+                raise OutputParserException(
+                    f'Your previous response was incomplete (just "{stripped}"). '
+                    "You already have the query result above in the Observation — "
+                    "write a complete Final Answer describing it, e.g. "
+                    '"Final Answer: <full answer using the data above>".'
+                )
+
             return AgentFinish(return_values={"output": stripped}, log=text)
 
         raise OutputParserException(f"Could not parse LLM output: `{text}`")
@@ -660,6 +711,7 @@ def react_stream(
         except Exception as exc:
             event_q.put(("_error", str(exc)))
         finally:
+            callback._flush_raw()
             event_q.put((_SENTINEL, None))
 
     t = threading.Thread(target=_run_agent, daemon=True)
@@ -700,7 +752,7 @@ def react_stream(
             yield ("final", f"Agent error: {data}")
             return
 
-        elif event_type in ("tool_call", "tool_result", "status", "thinking"):
+        elif event_type in ("tool_call", "tool_result", "status", "thinking", "thinking_token"):
             yield (event_type, data)
 
         # ignore unknown internal events
