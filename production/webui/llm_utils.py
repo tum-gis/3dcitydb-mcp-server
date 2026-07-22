@@ -346,6 +346,13 @@ def _litellm_model_name(provider: str, model: str) -> str:
     return model
 
 
+# Models that have told us (via a prior BadRequestError) that they reject the
+# `temperature` param outright — e.g. some newer Anthropic models respond with
+# "temperature is deprecated for this model". Populated at runtime; not knowable
+# ahead of time since Anthropic adds these restrictions per new model release.
+_NO_TEMPERATURE_MODELS: set[str] = set()
+
+
 def _litellm_kwargs(
     provider: str,
     model: str,
@@ -367,7 +374,24 @@ def _litellm_kwargs(
         kw["api_base"] = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
         ctx = num_ctx if num_ctx is not None else int(os.environ.get("OLLAMA_NUM_CTX", "32768"))
         kw["extra_body"] = {"options": {"num_ctx": ctx}}
+    if kw["model"] in _NO_TEMPERATURE_MODELS:
+        kw.pop("temperature", None)
     return kw
+
+
+def safe_completion(kw: dict, **extra):
+    """litellm.completion wrapper that transparently drops `temperature` for
+    models that reject it, retrying once and remembering the model so later
+    calls in this session skip straight to the no-temperature request."""
+    call_kw = {**kw, **extra}
+    try:
+        return litellm.completion(**call_kw)
+    except litellm.BadRequestError as exc:
+        if "temperature" in call_kw and "temperature" in str(exc).lower():
+            _NO_TEMPERATURE_MODELS.add(call_kw.get("model", ""))
+            call_kw.pop("temperature", None)
+            return litellm.completion(**call_kw)
+        raise
 
 
 # ── Markdown helpers ───────────────────────────────────────────────────────────
