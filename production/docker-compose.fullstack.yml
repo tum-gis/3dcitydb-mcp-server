@@ -3,6 +3,8 @@ services:
   # ── PostgreSQL + 3DCityDB v5 with SFCGAL ───────────────────────────────────
   postgres:
     image: khaoulakanna1/3dcitydb-v5-docker-sfcgal-patched:latest
+    ports:
+      - "5432:5432" 
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-citydb}
       POSTGRES_USER: ${POSTGRES_USER:-citydb}
