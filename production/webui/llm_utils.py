@@ -316,7 +316,7 @@ def _ollama_reachable() -> bool:
 def detect_default_provider() -> str | None:
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "anthropic"
-    if os.environ.get("OPENAI_API_KEY"):
+    if os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE"):
         return "openai"
     if _ollama_reachable():
         return "ollama"
@@ -374,6 +374,14 @@ def _litellm_kwargs(
         kw["api_base"] = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
         ctx = num_ctx if num_ctx is not None else int(os.environ.get("OLLAMA_NUM_CTX", "32768"))
         kw["extra_body"] = {"options": {"num_ctx": ctx}}
+    if provider == "openai":
+        openai_base = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+        if openai_base:
+            kw["api_base"] = openai_base
+            # litellm infers the provider from known model-name patterns (e.g.
+            # "gpt-4o"); a custom local model name like "my-local-model" won't
+            # match anything, so it must be told explicitly.
+            kw["custom_llm_provider"] = "openai"
     if kw["model"] in _NO_TEMPERATURE_MODELS:
         kw.pop("temperature", None)
     return kw
