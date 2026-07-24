@@ -219,7 +219,11 @@ def _check_provider_status(provider: str, model: str) -> bool:
     if provider == "anthropic":
         return bool(os.environ.get("ANTHROPIC_API_KEY"))
     if provider == "openai":
-        return bool(os.environ.get("OPENAI_API_KEY"))
+        return bool(
+            os.environ.get("OPENAI_API_KEY")
+            or os.environ.get("OPENAI_BASE_URL")
+            or os.environ.get("OPENAI_API_BASE")
+        )
     if provider == "ollama":
         return _ollama_reachable()
     return False
@@ -976,7 +980,8 @@ def build_ui() -> gr.Blocks:
                 '<div style="background:#fee2e2;border:1px solid #fca5a5;border-radius:8px;'
                 'padding:12px 16px;margin-bottom:8px;color:#991b1b;font-size:0.9rem;">'
                 "<strong>No LLM provider configured.</strong> "
-                "Set at least one of <code>ANTHROPIC_API_KEY</code>, <code>OPENAI_API_KEY</code>, "
+                "Set at least one of <code>ANTHROPIC_API_KEY</code>, <code>OPENAI_API_KEY</code> "
+                "(or <code>OPENAI_BASE_URL</code> for a local OpenAI-compatible server), "
                 "or <code>OLLAMA_BASE_URL</code> (reachable) "
                 "in your <code>.env</code> file and restart the server."
                 "</div>"
@@ -998,6 +1003,9 @@ def build_ui() -> gr.Blocks:
                     choices=initial_models,
                     value=initial_model,
                     label="Model",
+                    allow_custom_value=True,
+                    info="Type a custom model name when using OPENAI_BASE_URL to point at "
+                         "vLLM, llama.cpp, or another OpenAI-compatible server.",
                 )
                 dynamic_warn = gr.Markdown(
                     visible=initial_is_ollama,
@@ -1052,7 +1060,9 @@ def build_ui() -> gr.Blocks:
                 gr.Markdown(
                     "**API keys** are read from environment variables:  \n"
                     "`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,  \n"
-                    "`OLLAMA_BASE_URL`"
+                    "`OLLAMA_BASE_URL`  \n"
+                    "Set `OPENAI_BASE_URL` to route the OpenAI provider to vLLM, "
+                    "llama.cpp, or another OpenAI-compatible server."
                 )
 
             # ── Main area ─────────────────────────────────────────────────────
