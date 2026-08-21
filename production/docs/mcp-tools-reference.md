@@ -12,7 +12,10 @@ Builds the complete system prompt for the agent. Orchestrates all other tools an
 
 - Database metadata (SRS, bounding box, feature counts)
 - Object class hierarchy with property definitions
-- Codelist values for enumerated attributes
+- **Quick Reference** — one block per qualified codelist key (e.g.
+  `bldg:Building.function`), listing *only* the codes that actually occur in the
+  imported data, with country-specific labels (DE/JP/DEFAULT selected via EPSG).
+  Attributes without codes in the data are omitted entirely.
 - SQL examples tailored to the present object classes
 - Query guidelines and indexed columns
 
@@ -46,6 +49,25 @@ Returns all properties defined for an object class, including:
 - Value column (`val_string`, `val_double`, `val_int`, `val_timestamp`, etc.)
 - Codelist entries (if the property is enumerated)
 - Nested child properties (via `parent_id` chain)
+
+**Codelist resolution** for `core:Code` properties (datatype 14) follows this order:
+
+1. **Country-specific static codelists** — selected by the database EPSG code
+   (`database_srs`, loaded automatically). Looked up via the qualified key
+   `<namespace-alias>:<Classname>.<attribute>` (e.g. `bldg:Building.function`).
+   Country blocks: DE (ALKIS/AdV), JP (J-PLATEAU/MLIT), DEFAULT (SIG3D roofType).
+   A known codelist is always used, regardless of how many codes occur in the data.
+2. **Free-text heuristic** — if no codelist is known and the number of distinct
+   values exceeds `CATEGORICAL_THRESHOLD` (default 20), the property is flagged
+   as free text instead of being listed.
+3. **Database codelists** — name match against the `codelist`/`codelist_entry`
+   tables.
+4. **Raw codes** — codes returned without labels as a last resort.
+
+Only codes actually present in the data for the given object class are returned.
+The qualified-key lookup is exact (case-insensitive) — there is no fallback to
+bare attribute names, so `bldg:Building.function` and `brid:Bridge.function`
+resolve independently.
 
 ---
 

@@ -202,15 +202,52 @@ def assemble_prompt(
 # Render functions for each component
 # ============================================================
 
-def _distinct_property_codes(db: DatabaseConnection, name: str, namespace_id: int) -> list[str]:
-    """Return sorted list of distinct val_string codes present in the DB for a property."""
+def _distinct_property_codes(
+    db: DatabaseConnection,
+    name: str,
+    namespace_alias: str,
+    classname: str | None = None,
+) -> list[str]:
+    """Return sorted list of distinct val_string codes present in the DB for a property.
+
+    Scoped by namespace alias (e.g. 'bldg') and, when given, by the concrete
+    objectclass (e.g. 'Building') via a JOIN on feature — so same-named
+    properties from different modules/classes never mix.
+    """
     try:
-        rows = db.execute(
-            "SELECT DISTINCT val_string FROM property "
-            "WHERE name = %s AND namespace_id = %s AND val_string IS NOT NULL "
-            "ORDER BY val_string",
-            (name, namespace_id),
+        ns_rows = db.execute(
+            "SELECT id FROM namespace WHERE alias = %s", (namespace_alias,)
         )
+        if not ns_rows:
+            return []
+        ns_id = ns_rows[0]["id"]
+
+        if classname:
+            oc_rows = db.execute(
+                "SELECT id FROM objectclass WHERE classname = %s AND namespace_id = %s",
+                (classname, ns_id),
+            )
+            if not oc_rows:
+                return []
+            oc_ids = [r["id"] for r in oc_rows]
+            placeholders = ",".join(["%s"] * len(oc_ids))
+            rows = db.execute(f"""
+                SELECT DISTINCT p.val_string
+                FROM property p
+                JOIN feature f ON p.feature_id = f.id
+                WHERE p.name = %s
+                  AND p.namespace_id = %s
+                  AND f.objectclass_id IN ({placeholders})
+                  AND p.val_string IS NOT NULL
+                ORDER BY p.val_string
+            """, (name, ns_id, *oc_ids))
+        else:
+            rows = db.execute(
+                "SELECT DISTINCT val_string FROM property "
+                "WHERE name = %s AND namespace_id = %s AND val_string IS NOT NULL "
+                "ORDER BY val_string",
+                (name, ns_id),
+            )
         return [r["val_string"] for r in rows]
     except Exception:
         return []
@@ -242,42 +279,43 @@ def _lookup_codelist_entries(db: DatabaseConnection, property_name: str, codes: 
 
 
 def _render_quickref(db: DatabaseConnection, db_context, catalog, static_cl: dict) -> str:
-    """Quick-reference block rendered first — highest attention weight for local models."""
+    """Quick-reference block rendered first — highest attention weight for local models.
+
+    Renders one block per qualified key in the active static codelist block,
+    but ONLY for codes that actually occur in the imported data. No
+    artificial top-N limits: all distinct codes present in the DB are listed.
+    Blocks whose property has no codes in the DB are skipped entirely.
+    """
     lines = ["## Quick Reference", ""]
 
-    # Only show codes that are actually present in the database AND have a known label.
-    all_func_codes = static_cl.get("function", {})
-    db_func_codes = _distinct_property_codes(db, "function", 10)
-    if db_func_codes:
-        # Codes not in the static list: try codelist_entry table
-        missing = [c for c in db_func_codes if c not in all_func_codes]
-        db_func_labels = _lookup_codelist_entries(db, "function", missing) if missing else {}
-        resolved = []
-        for code in db_func_codes:
-            label = all_func_codes.get(code) or db_func_labels.get(code)
-            if label:
-                resolved.append((code, label))
-        if resolved:
-            lines.append("")
-            lines.append("### Building function codes (property.name='function', namespace_id=10, val_string)")
-            for code, label in resolved:
-                lines.append(f"- {code} = {label}")
+    for qual_key, static_map in static_cl.items():
+        # Parse '<alias>:<Classname>.<attribute>' (class part is everything between ':' and the last '.')
+        try:
+            ns_part, attr = qual_key.rsplit(".", 1)
+            ns_alias, classname = ns_part.split(":", 1)
+        except ValueError:
+            continue  # malformed key — skip
 
-    all_roof_codes = static_cl.get("roofType", {})
-    db_roof_codes = _distinct_property_codes(db, "roofType", 8)
-    if db_roof_codes:
-        missing_roof = [c for c in db_roof_codes if c not in all_roof_codes]
-        db_roof_labels = _lookup_codelist_entries(db, "roofType", missing_roof) if missing_roof else {}
-        resolved_roof = []
-        for code in db_roof_codes:
-            label = all_roof_codes.get(code) or db_roof_labels.get(code)
-            if label:
-                resolved_roof.append((code, label))
-        if resolved_roof:
-            lines.append("")
-            lines.append("### Roof type codes (property.name='roofType', namespace_id=8, val_string)")
-            for code, label in resolved_roof:
-                lines.append(f"- {code} = {label}")
+        # Distinct codes actually present in the data (scoped to this namespace + class)
+        db_codes = _distinct_property_codes(db, attr, ns_alias, classname)
+        if not db_codes:
+            continue  # attribute not in this dataset → no block
+
+        # Labels: static codelist first, DB codelist_entry as fallback for the rest
+        missing = [c for c in db_codes if c not in static_map]
+        db_labels = _lookup_codelist_entries(db, attr, missing) if missing else {}
+        resolved = [
+            (code, static_map[code] or db_labels.get(code))
+            for code in db_codes
+            if (static_map.get(code) or db_labels.get(code))
+        ]
+        if not resolved:
+            continue
+
+        lines.append("")
+        lines.append(f"### {qual_key} codes (property.name='{attr}', namespace='{ns_alias}', objectclass='{classname}', val_string)")
+        for code, label in resolved:
+            lines.append(f"- {code} = {label}")
 
     return "\n".join(lines)
 

@@ -302,7 +302,15 @@ def _execute_tool(name: str, arguments: dict) -> str:
 
     if name == "resolve_properties":
         oc_id = arguments["objectclass_id"]
-        result = resolve_properties(db, oc_id)
+        # EPSG from database_srs (cached — static per database) so that
+        # country-specific static codelists are selected correctly.
+        if "epsg_code" not in _cache:
+            try:
+                rows = db.execute("SELECT srid FROM database_srs LIMIT 1")
+                _cache["epsg_code"] = rows[0]["srid"] if rows else 0
+            except Exception:
+                _cache["epsg_code"] = 0
+        result = resolve_properties(db, oc_id, epsg_code=_cache["epsg_code"])
         return _to_json(result)
 
     if name == "get_generic_attributes":

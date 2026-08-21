@@ -48,11 +48,10 @@ Always call run_query — never write SQL in your chat reply.
 - 712 = RoofSurface
 
 ## Building function codes (property.name = 'function', val_string)
-- 1379 = Residential
-- 3065 = School/Daycare
-- 3074 = Garage/Infrastructure
-- 3087 = Residential/Industrial
-- 3090 = Church
+- 31001_1000 = Wohngebäude (residential)
+- 31001_2000 = Gebäude für Wirtschaft oder Gewerbe
+- 31001_3000 = Gebäude für öffentliche Zwecke
+- 31001_3041 = Kirche
 
 ## Key tables (only columns you need)
 
@@ -98,7 +97,7 @@ Residential buildings on a specific street:
   JOIN property p_addr ON p_addr.feature_id = f.id AND p_addr.name = 'address'
   JOIN address a ON a.id = p_addr.val_address_id
   WHERE f.objectclass_id = 901
-    AND p_func.val_string = '1379'
+    AND p_func.val_string = '31001_1000'
     AND a.street ILIKE '%Röblingweg%';
 
 Tallest buildings:
@@ -566,7 +565,7 @@ def react_stream(
                 return (
                     "No results found. Your WHERE conditions are probably wrong. "
                     "Common causes: function values are stored as numeric codes "
-                    "(e.g. '1379' not 'residential'), street names need "
+                    "(e.g. '31001_1000' not 'Wohngebäude'), street names need "
                     "ILIKE '%%Röblingweg%%'. Try a simpler query first."
                 )
 

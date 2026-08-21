@@ -109,10 +109,15 @@ _ROOFTYPE_STANDARD = {
     "1130": "combination of roof forms",
 }
 
-# Country-specific codelist extensions
+# Country-specific codelist extensions.
+# Keys are qualified composite keys: "<namespace-alias>:<Classname>.<attribute>"
+# (namespace alias from the 3DCityDB 'namespace.alias' column; Classname is the
+# concrete feature class, verified against the running database).
+# Note: no BuildingPart keys — those can be added later if needed.
 COUNTRY_CODELISTS = {
     "DE": {
-        "roofType": {
+        # ALKIS roof type codes (AdV)
+        "bldg:Building.roofType": {
             "1000": "Flachdach",
             "2100": "Pultdach",
             "2200": "Versetztes Pultdach",
@@ -129,53 +134,725 @@ COUNTRY_CODELISTS = {
             "5000": "Mischform",
             "9999": "Sonstiges",
         },
-        "function": {
-            # ALKIS building function codes (AdV)
-            "1000": "residential",
-            "1010": "tenement",
-            "1020": "hostel",
-            "1100": "residential (with commercial use)",
-            "1120": "residential/office",
-            "1130": "residential/business",
-            "1379": "residential",
-            "2000": "commercial/industrial",
-            "2100": "industrial",
-            "2200": "commercial",
-            "2400": "transport",
-            "2500": "utility",
-            "2700": "agriculture/forestry",
-            "3000": "public use",
-            "3010": "administration",
-            "3020": "education/research",
-            "3040": "healthcare",
-            "3060": "security/order",
-            "3065": "school/daycare",
-            "3070": "religious",
-            "3074": "garage/infrastructure",
-            "3080": "cultural",
-            "3087": "residential/industrial",
-            "3090": "church",
-            "3100": "recreation",
-            "3211": "sport club",
+        "bldg:Building.function": {
+            # Official AdV BuildingFunctionType codelist (301 entries; ALKIS + ATKIS).
+            # Source: https://repository.gdi-de.org/schemas/adv/citygml/Codelisten/BuildingFunctionTypeAdV.xml
+            # --- ALKIS (31001_*) ---
+            "31001_1000": "Wohngebäude",
+            "31001_1010": "Wohnhaus",
+            "31001_1020": "Wohnheim",
+            "31001_1021": "Kinderheim",
+            "31001_1022": "Seniorenheim",
+            "31001_1023": "Schwesternwohnheim",
+            "31001_1024": "Studenten-, Schülerwohnheim",
+            "31001_1025": "Schullandheim",
+            "31001_1100": "Gemischt genutztes Gebäude mit Wohnen",
+            "31001_1110": "Wohngebäude mit Gemeinbedarf",
+            "31001_1120": "Wohngebäude mit Handel und Dienstleistungen",
+            "31001_1121": "Wohn- und Verwaltungsgebäude",
+            "31001_1122": "Wohn- und Bürogebäude",
+            "31001_1123": "Wohn- und Geschäftsgebäude",
+            "31001_1130": "Wohngebäude mit Gewerbe und Industrie",
+            "31001_1131": "Wohn- und Betriebsgebäude",
+            "31001_1210": "Land- und forstwirtschaftliches Wohngebäude",
+            "31001_1220": "Land- und forstwirtschaftliches Wohn- und Betriebsgebäude",
+            "31001_1221": "Bauernhaus",
+            "31001_1222": "Wohn- und Wirtschaftsgebäude",
+            "31001_1223": "Forsthaus",
+            "31001_1310": "Gebäude zur Freizeitgestaltung",
+            "31001_1311": "Ferienhaus",
+            "31001_1312": "Wochenendhaus",
+            "31001_1313": "Gartenhaus",
+            "31001_2000": "Gebäude für Wirtschaft oder Gewerbe",
+            "31001_2010": "Gebäude für Handel und Dienstleistungen",
+            "31001_2020": "Bürogebäude",
+            "31001_2030": "Kreditinstitut",
+            "31001_2040": "Versicherung",
+            "31001_2050": "Geschäftsgebäude",
+            "31001_2051": "Kaufhaus",
+            "31001_2052": "Einkaufszentrum",
+            "31001_2053": "Markthalle",
+            "31001_2054": "Laden",
+            "31001_2055": "Kiosk",
+            "31001_2056": "Apotheke",
+            "31001_2060": "Messehalle",
+            "31001_2070": "Gebäude für Beherbergung",
+            "31001_2071": "Hotel, Motel, Pension",
+            "31001_2072": "Jugendherberge",
+            "31001_2073": "Hütte (mit Übernachtungsmöglichkeit)",
+            "31001_2074": "Campingplatzgebäude",
+            "31001_2080": "Gebäude für Bewirtung",
+            "31001_2081": "Gaststätte, Restaurant",
+            "31001_2082": "Hütte (ohne Übernachtungsmöglichkeit)",
+            "31001_2083": "Kantine",
+            "31001_2090": "Freizeit- und Vergnügungsstätte",
+            "31001_2091": "Festsaal",
+            "31001_2092": "Kino",
+            "31001_2093": "Kegel-, Bowlinghalle",
+            "31001_2094": "Spielkasino",
+            "31001_2095": "Spielhalle",
+            "31001_2100": "Gebäude für Gewerbe und Industrie",
+            "31001_2110": "Produktionsgebäude",
+            "31001_2111": "Fabrik",
+            "31001_2112": "Betriebsgebäude",
+            "31001_2113": "Brauerei",
+            "31001_2114": "Brennerei",
+            "31001_2120": "Werkstatt",
+            "31001_2121": "Sägewerk",
+            "31001_2130": "Tankstelle",
+            "31001_2131": "Waschstraße, Waschanlage, Waschhalle",
+            "31001_2140": "Gebäude für Vorratshaltung",
+            "31001_2141": "Kühlhaus",
+            "31001_2142": "Speichergebäude",
+            "31001_2143": "Lagerhalle, Lagerschuppen, Lagerhaus",
+            "31001_2150": "Speditionsgebäude",
+            "31001_2160": "Gebäude für Forschungszwecke",
+            "31001_2170": "Gebäude für Grundstoffgewinnung",
+            "31001_2171": "Bergwerk",
+            "31001_2172": "Saline",
+            "31001_2180": "Gebäude für betriebliche Sozialeinrichtung",
+            "31001_2200": "Sonstiges Gebäude für Gewerbe und Industrie",
+            "31001_2210": "Mühle",
+            "31001_2211": "Windmühle",
+            "31001_2212": "Wassermühle",
+            "31001_2213": "Schöpfwerk",
+            "31001_2220": "Wetterstation",
+            "31001_2310": "Gebäude für Handel und Dienstleistung mit Wohnen",
+            "31001_2320": "Gebäude für Gewerbe und Industrie mit Wohnen",
+            "31001_2400": "Betriebsgebäude zu Verkehrsanlagen (allgemein)",
+            "31001_2410": "Betriebsgebäude für Straßenverkehr",
+            "31001_2411": "Straßenmeisterei",
+            "31001_2412": "Wartehalle",
+            "31001_2420": "Betriebsgebäude für Schienenverkehr",
+            "31001_2421": "Bahnwärterhaus",
+            "31001_2422": "Lokschuppen, Wagenhalle",
+            "31001_2423": "Stellwerk, Blockstelle",
+            "31001_2424": "Betriebsgebäude des Güterbahnhofs",
+            "31001_2430": "Betriebsgebäude für Flugverkehr",
+            "31001_2431": "Flugzeughalle",
+            "31001_2440": "Betriebsgebäude für Schiffsverkehr",
+            "31001_2441": "Werft (Halle)",
+            "31001_2442": "Dock (Halle)",
+            "31001_2443": "Betriebsgebäude zur Schleuse",
+            "31001_2444": "Bootshaus",
+            "31001_2450": "Betriebsgebäude zur Seilbahn",
+            "31001_2451": "Spannwerk zur Drahtseilbahn",
+            "31001_2460": "Gebäude zum Parken",
+            "31001_2461": "Parkhaus",
+            "31001_2462": "Parkdeck",
+            "31001_2463": "Garage",
+            "31001_2464": "Fahrzeughalle",
+            "31001_2500": "Gebäude zur Versorgung",
+            "31001_2501": "Gebäude zur Energieversorgung",
+            "31001_2510": "Gebäude zur Wasserversorgung",
+            "31001_2511": "Wasserwerk",
+            "31001_2512": "Pumpstation",
+            "31001_2513": "Wasserbehälter",
+            "31001_2520": "Gebäude zur Elektrizitätsversorgung",
+            "31001_2521": "Elektrizitätswerk",
+            "31001_2522": "Umspannwerk",
+            "31001_2523": "Umformer",
+            "31001_2527": "Reaktorgebäude",
+            "31001_2528": "Turbinenhaus",
+            "31001_2529": "Kesselhaus",
+            "31001_2540": "Gebäude für Fernmeldewesen",
+            "31001_2560": "Gebäude an unterirdischen Leitungen",
+            "31001_2570": "Gebäude zur Gasversorgung",
+            "31001_2571": "Gaswerk",
+            "31001_2580": "Heizwerk",
+            "31001_2590": "Gebäude zur Versorgungsanlage",
+            "31001_2591": "Pumpwerk (nicht für Wasserversorgung)",
+            "31001_2600": "Gebäude zur Entsorgung",
+            "31001_2610": "Gebäude zur Abwasserbeseitigung",
+            "31001_2611": "Gebäude der Kläranlage",
+            "31001_2612": "Toilette",
+            "31001_2620": "Gebäude zur Abfallbehandlung",
+            "31001_2621": "Müllbunker",
+            "31001_2622": "Gebäude zur Müllverbrennung",
+            "31001_2623": "Gebäude der Abfalldeponie",
+            "31001_2700": "Gebäude für Land- und Forstwirtschaft",
+            "31001_2720": "Land- und forstwirtschaftliches Betriebsgebäude",
+            "31001_2721": "Scheune",
+            "31001_2723": "Schuppen",
+            "31001_2724": "Stall",
+            "31001_2726": "Scheune und Stall",
+            "31001_2727": "Stall für Tiergroßhaltung",
+            "31001_2728": "Reithalle",
+            "31001_2729": "Wirtschaftsgebäude",
+            "31001_2732": "Almhütte",
+            "31001_2735": "Jagdhaus, Jagdhütte",
+            "31001_2740": "Treibhaus, Gewächshaus",
+            "31001_2741": "Treibhaus",
+            "31001_2742": "Gewächshaus, verschiebbar",
+            "31001_3000": "Gebäude für öffentliche Zwecke",
+            "31001_3010": "Verwaltungsgebäude",
+            "31001_3011": "Parlament",
+            "31001_3012": "Rathaus",
+            "31001_3013": "Post",
+            "31001_3014": "Zollamt",
+            "31001_3015": "Gericht",
+            "31001_3016": "Botschaft, Konsulat",
+            "31001_3017": "Kreisverwaltung",
+            "31001_3018": "Bezirksregierung",
+            "31001_3019": "Finanzamt",
+            "31001_3020": "Gebäude für Bildung und Forschung",
+            "31001_3021": "Allgemein bildende Schule",
+            "31001_3022": "Berufsbildende Schule",
+            "31001_3023": "Hochschulgebäude (Fachhochschule, Universität)",
+            "31001_3024": "Forschungsinstitut",
+            "31001_3030": "Gebäude für kulturelle Zwecke",
+            "31001_3031": "Schloss",
+            "31001_3032": "Theater, Oper",
+            "31001_3033": "Konzertgebäude",
+            "31001_3034": "Museum",
+            "31001_3035": "Rundfunk, Fernsehen",
+            "31001_3036": "Veranstaltungsgebäude",
+            "31001_3037": "Bibliothek, Bücherei",
+            "31001_3038": "Burg, Festung",
+            "31001_3040": "Gebäude für religiöse Zwecke",
+            "31001_3041": "Kirche",
+            "31001_3042": "Synagoge",
+            "31001_3043": "Kapelle",
+            "31001_3044": "Gemeindehaus",
+            "31001_3045": "Gotteshaus",
+            "31001_3046": "Moschee",
+            "31001_3047": "Tempel",
+            "31001_3048": "Kloster",
+            "31001_3050": "Gebäude für Gesundheitswesen",
+            "31001_3051": "Krankenhaus",
+            "31001_3052": "Heilanstalt, Pflegeanstalt, Pflegestation",
+            "31001_3053": "Ärztehaus, Poliklinik",
+            "31001_3054": "Rettungswache",
+            "31001_3060": "Gebäude für soziale Zwecke",
+            "31001_3061": "Jugendfreizeitheim",
+            "31001_3062": "Freizeit-, Vereinsheim, Dorfgemeinschafts-, Bürgerhaus",
+            "31001_3063": "Seniorenfreizeitstätte",
+            "31001_3064": "Obdachlosenheim",
+            "31001_3065": "Kinderkrippe, Kindergarten, Kindertagesstätte",
+            "31001_3066": "Asylbewerberheim",
+            "31001_3070": "Gebäude für Sicherheit und Ordnung",
+            "31001_3071": "Polizei",
+            "31001_3072": "Feuerwehr",
+            "31001_3073": "Kaserne",
+            "31001_3074": "Schutzbunker",
+            "31001_3075": "Justizvollzugsanstalt",
+            "31001_3080": "Friedhofsgebäude",
+            "31001_3081": "Trauerhalle",
+            "31001_3082": "Krematorium",
+            "31001_3090": "Empfangsgebäude",
+            "31001_3091": "Bahnhofsgebäude",
+            "31001_3092": "Flughafengebäude",
+            "31001_3094": "Gebäude zum U-Bahnhof",
+            "31001_3095": "Gebäude zum S-Bahnhof",
+            "31001_3097": "Gebäude zum Busbahnhof",
+            "31001_3098": "Empfangsgebäude Schifffahrt",
+            "31001_3100": "Gebäude für öffentliche Zwecke mit Wohnen",
+            "31001_3200": "Gebäude für Erholungszwecke",
+            "31001_3210": "Gebäude für Sportzwecke",
+            "31001_3211": "Sport-, Turnhalle",
+            "31001_3212": "Gebäude zum Sportplatz",
+            "31001_3220": "Badegebäude",
+            "31001_3221": "Hallenbad",
+            "31001_3222": "Gebäude im Freibad",
+            "31001_3230": "Gebäude im Stadion",
+            "31001_3240": "Gebäude für Kurbetrieb",
+            "31001_3241": "Badegebäude für medizinische Zwecke",
+            "31001_3242": "Sanatorium",
+            "31001_3260": "Gebäude im Zoo",
+            "31001_3261": "Empfangsgebäude des Zoos",
+            "31001_3262": "Aquarium, Terrarium, Voliere",
+            "31001_3263": "Tierschauhaus",
+            "31001_3264": "Stall im Zoo",
+            "31001_3270": "Gebäude im botanischen Garten",
+            "31001_3271": "Empfangsgebäude des botanischen Gartens",
+            "31001_3272": "Gewächshaus (Botanik)",
+            "31001_3273": "Pflanzenschauhaus",
+            "31001_3280": "Gebäude für andere Erholungseinrichtung",
+            "31001_3281": "Schutzhütte",
+            "31001_3290": "Touristisches Informationszentrum",
+            "31001_9998": "Nach Quellenlage nicht zu spezifizieren",
+            # --- ALKIS-ATKIS (51001_*) ---
+            "51001_1001": "Wasserturm",
+            "51001_1002": "Kirchturm",
+            "51001_1003": "Aussichtsturm",
+            "51001_1004": "Kontrollturm",
+            "51001_1005": "Kühlturm",
+            "51001_1006": "Leuchtturm",
+            "51001_1007": "Feuerwachturm",
+            "51001_1008": "Sende-,Funkturm",
+            "51001_1009": "Stadt-,Torturm",
+            "51001_1010": "Förderturm",
+            "51001_1011": "Bohrturm",
+            "51001_1012": "Schloss-, Burgturm",
+            "51001_9998": "Nach Quellenlage nicht zu spezifizieren",
+            "51001_9999": "Sonstiges",
+            # --- ATKIS (5100x / 5200x / 5300x) ---
+            "51002_1215": "Biogasanlage",
+            "51002_1220": "Windrad",
+            "51002_1230": "Solarzellen",
+            "51002_1250": "Mast",
+            "51002_1251": "Freileitungsmast",
+            "51002_1260": "Funkmast",
+            "51002_1280": "Radioteleskop",
+            "51002_1290": "Schornstein",
+            "51002_1330": "Kran",
+            "51002_1331": "Drehkran",
+            "51002_1332": "Portalkran",
+            "51002_1333": "Laufkran",
+            "51002_1350": "Hochofen",
+            "51002_1400": "Umformer",
+            "51002_9999": "Sonstiges",
+            "51003_1201": "Silo",
+            "51003_1205": "Tank",
+            "51003_1206": "Gasometer",
+            "51003_9999": "Sonstiges",
+            "51006_1430": "Zuschauertribüne",
+            "51006_1431": "Zuschauertribüne, überdacht",
+            "51006_1432": "Zuschauertribüne, nicht überdacht",
+            "51006_1440": "Stadion",
+            "51006_1441": "Stadion, überdacht",
+            "51006_1442": "Stadion, nicht überdacht",
+            "51006_1470": "Sprungschanze (Anlauf)",
+            "51006_1490": "Gradierwerk",
+            "51006_9999": "Sonstiges",
+            "51007_1110": "Aquädukt",
+            "51007_1210": "Wachturm",
+            "51007_1400": "Befestigung (Burgruine)",
+            "51007_1500": "Historische Mauer",
+            "51007_1510": "Stadtmauer",
+            "51007_1520": "Sonstige historische Mauer",
+            "51007_9999": "Sonstiges",
+            "51009_1610": "Überdachung",
+            "51009_1611": "Carport",
+            "51009_1700": "Mauer",
+            "51009_1750": "Denkmal",
+            "51009_9999": "Sonstiges",
+            "52003_1010": "Schiffshebewerk",
+            "52003_1020": "Kammerschleuse",
+            "53001_1800": "Brücke",
+            "53001_1806": "Drehbrücke",
+            "53001_1807": "Hebebrücke",
+            "53001_1808": "Zugbrücke",
+            "53001_1830": "Hochbahn, Hochstraße",
+            "53001_1890": "Schleusenkammer",
+            "53009_2030": "Staumauer",
+            "53009_2050": "Wehr",
+            "53009_2060": "Sicherheitstor",
+            "53009_2070": "Siel",
+            "53009_2080": "Sperrwerk",
+            "53009_2090": "Schöpfwerk",
         },
-        "usage": {
-            "1000": "residential",
-            "1010": "tenement",
-            "1020": "hostel",
-            "2000": "commercial/industrial",
-            "3000": "public use",
+        "bldg:Building.usage": {
+            # Official AdV BuildingFunctionType codelist (301 entries; ALKIS + ATKIS).
+            # Source: https://repository.gdi-de.org/schemas/adv/citygml/Codelisten/BuildingFunctionTypeAdV.xml
+            # --- ALKIS (31001_*) ---
+            "31001_1000": "Wohngebäude",
+            "31001_1010": "Wohnhaus",
+            "31001_1020": "Wohnheim",
+            "31001_1021": "Kinderheim",
+            "31001_1022": "Seniorenheim",
+            "31001_1023": "Schwesternwohnheim",
+            "31001_1024": "Studenten-, Schülerwohnheim",
+            "31001_1025": "Schullandheim",
+            "31001_1100": "Gemischt genutztes Gebäude mit Wohnen",
+            "31001_1110": "Wohngebäude mit Gemeinbedarf",
+            "31001_1120": "Wohngebäude mit Handel und Dienstleistungen",
+            "31001_1121": "Wohn- und Verwaltungsgebäude",
+            "31001_1122": "Wohn- und Bürogebäude",
+            "31001_1123": "Wohn- und Geschäftsgebäude",
+            "31001_1130": "Wohngebäude mit Gewerbe und Industrie",
+            "31001_1131": "Wohn- und Betriebsgebäude",
+            "31001_1210": "Land- und forstwirtschaftliches Wohngebäude",
+            "31001_1220": "Land- und forstwirtschaftliches Wohn- und Betriebsgebäude",
+            "31001_1221": "Bauernhaus",
+            "31001_1222": "Wohn- und Wirtschaftsgebäude",
+            "31001_1223": "Forsthaus",
+            "31001_1310": "Gebäude zur Freizeitgestaltung",
+            "31001_1311": "Ferienhaus",
+            "31001_1312": "Wochenendhaus",
+            "31001_1313": "Gartenhaus",
+            "31001_2000": "Gebäude für Wirtschaft oder Gewerbe",
+            "31001_2010": "Gebäude für Handel und Dienstleistungen",
+            "31001_2020": "Bürogebäude",
+            "31001_2030": "Kreditinstitut",
+            "31001_2040": "Versicherung",
+            "31001_2050": "Geschäftsgebäude",
+            "31001_2051": "Kaufhaus",
+            "31001_2052": "Einkaufszentrum",
+            "31001_2053": "Markthalle",
+            "31001_2054": "Laden",
+            "31001_2055": "Kiosk",
+            "31001_2056": "Apotheke",
+            "31001_2060": "Messehalle",
+            "31001_2070": "Gebäude für Beherbergung",
+            "31001_2071": "Hotel, Motel, Pension",
+            "31001_2072": "Jugendherberge",
+            "31001_2073": "Hütte (mit Übernachtungsmöglichkeit)",
+            "31001_2074": "Campingplatzgebäude",
+            "31001_2080": "Gebäude für Bewirtung",
+            "31001_2081": "Gaststätte, Restaurant",
+            "31001_2082": "Hütte (ohne Übernachtungsmöglichkeit)",
+            "31001_2083": "Kantine",
+            "31001_2090": "Freizeit- und Vergnügungsstätte",
+            "31001_2091": "Festsaal",
+            "31001_2092": "Kino",
+            "31001_2093": "Kegel-, Bowlinghalle",
+            "31001_2094": "Spielkasino",
+            "31001_2095": "Spielhalle",
+            "31001_2100": "Gebäude für Gewerbe und Industrie",
+            "31001_2110": "Produktionsgebäude",
+            "31001_2111": "Fabrik",
+            "31001_2112": "Betriebsgebäude",
+            "31001_2113": "Brauerei",
+            "31001_2114": "Brennerei",
+            "31001_2120": "Werkstatt",
+            "31001_2121": "Sägewerk",
+            "31001_2130": "Tankstelle",
+            "31001_2131": "Waschstraße, Waschanlage, Waschhalle",
+            "31001_2140": "Gebäude für Vorratshaltung",
+            "31001_2141": "Kühlhaus",
+            "31001_2142": "Speichergebäude",
+            "31001_2143": "Lagerhalle, Lagerschuppen, Lagerhaus",
+            "31001_2150": "Speditionsgebäude",
+            "31001_2160": "Gebäude für Forschungszwecke",
+            "31001_2170": "Gebäude für Grundstoffgewinnung",
+            "31001_2171": "Bergwerk",
+            "31001_2172": "Saline",
+            "31001_2180": "Gebäude für betriebliche Sozialeinrichtung",
+            "31001_2200": "Sonstiges Gebäude für Gewerbe und Industrie",
+            "31001_2210": "Mühle",
+            "31001_2211": "Windmühle",
+            "31001_2212": "Wassermühle",
+            "31001_2213": "Schöpfwerk",
+            "31001_2220": "Wetterstation",
+            "31001_2310": "Gebäude für Handel und Dienstleistung mit Wohnen",
+            "31001_2320": "Gebäude für Gewerbe und Industrie mit Wohnen",
+            "31001_2400": "Betriebsgebäude zu Verkehrsanlagen (allgemein)",
+            "31001_2410": "Betriebsgebäude für Straßenverkehr",
+            "31001_2411": "Straßenmeisterei",
+            "31001_2412": "Wartehalle",
+            "31001_2420": "Betriebsgebäude für Schienenverkehr",
+            "31001_2421": "Bahnwärterhaus",
+            "31001_2422": "Lokschuppen, Wagenhalle",
+            "31001_2423": "Stellwerk, Blockstelle",
+            "31001_2424": "Betriebsgebäude des Güterbahnhofs",
+            "31001_2430": "Betriebsgebäude für Flugverkehr",
+            "31001_2431": "Flugzeughalle",
+            "31001_2440": "Betriebsgebäude für Schiffsverkehr",
+            "31001_2441": "Werft (Halle)",
+            "31001_2442": "Dock (Halle)",
+            "31001_2443": "Betriebsgebäude zur Schleuse",
+            "31001_2444": "Bootshaus",
+            "31001_2450": "Betriebsgebäude zur Seilbahn",
+            "31001_2451": "Spannwerk zur Drahtseilbahn",
+            "31001_2460": "Gebäude zum Parken",
+            "31001_2461": "Parkhaus",
+            "31001_2462": "Parkdeck",
+            "31001_2463": "Garage",
+            "31001_2464": "Fahrzeughalle",
+            "31001_2500": "Gebäude zur Versorgung",
+            "31001_2501": "Gebäude zur Energieversorgung",
+            "31001_2510": "Gebäude zur Wasserversorgung",
+            "31001_2511": "Wasserwerk",
+            "31001_2512": "Pumpstation",
+            "31001_2513": "Wasserbehälter",
+            "31001_2520": "Gebäude zur Elektrizitätsversorgung",
+            "31001_2521": "Elektrizitätswerk",
+            "31001_2522": "Umspannwerk",
+            "31001_2523": "Umformer",
+            "31001_2527": "Reaktorgebäude",
+            "31001_2528": "Turbinenhaus",
+            "31001_2529": "Kesselhaus",
+            "31001_2540": "Gebäude für Fernmeldewesen",
+            "31001_2560": "Gebäude an unterirdischen Leitungen",
+            "31001_2570": "Gebäude zur Gasversorgung",
+            "31001_2571": "Gaswerk",
+            "31001_2580": "Heizwerk",
+            "31001_2590": "Gebäude zur Versorgungsanlage",
+            "31001_2591": "Pumpwerk (nicht für Wasserversorgung)",
+            "31001_2600": "Gebäude zur Entsorgung",
+            "31001_2610": "Gebäude zur Abwasserbeseitigung",
+            "31001_2611": "Gebäude der Kläranlage",
+            "31001_2612": "Toilette",
+            "31001_2620": "Gebäude zur Abfallbehandlung",
+            "31001_2621": "Müllbunker",
+            "31001_2622": "Gebäude zur Müllverbrennung",
+            "31001_2623": "Gebäude der Abfalldeponie",
+            "31001_2700": "Gebäude für Land- und Forstwirtschaft",
+            "31001_2720": "Land- und forstwirtschaftliches Betriebsgebäude",
+            "31001_2721": "Scheune",
+            "31001_2723": "Schuppen",
+            "31001_2724": "Stall",
+            "31001_2726": "Scheune und Stall",
+            "31001_2727": "Stall für Tiergroßhaltung",
+            "31001_2728": "Reithalle",
+            "31001_2729": "Wirtschaftsgebäude",
+            "31001_2732": "Almhütte",
+            "31001_2735": "Jagdhaus, Jagdhütte",
+            "31001_2740": "Treibhaus, Gewächshaus",
+            "31001_2741": "Treibhaus",
+            "31001_2742": "Gewächshaus, verschiebbar",
+            "31001_3000": "Gebäude für öffentliche Zwecke",
+            "31001_3010": "Verwaltungsgebäude",
+            "31001_3011": "Parlament",
+            "31001_3012": "Rathaus",
+            "31001_3013": "Post",
+            "31001_3014": "Zollamt",
+            "31001_3015": "Gericht",
+            "31001_3016": "Botschaft, Konsulat",
+            "31001_3017": "Kreisverwaltung",
+            "31001_3018": "Bezirksregierung",
+            "31001_3019": "Finanzamt",
+            "31001_3020": "Gebäude für Bildung und Forschung",
+            "31001_3021": "Allgemein bildende Schule",
+            "31001_3022": "Berufsbildende Schule",
+            "31001_3023": "Hochschulgebäude (Fachhochschule, Universität)",
+            "31001_3024": "Forschungsinstitut",
+            "31001_3030": "Gebäude für kulturelle Zwecke",
+            "31001_3031": "Schloss",
+            "31001_3032": "Theater, Oper",
+            "31001_3033": "Konzertgebäude",
+            "31001_3034": "Museum",
+            "31001_3035": "Rundfunk, Fernsehen",
+            "31001_3036": "Veranstaltungsgebäude",
+            "31001_3037": "Bibliothek, Bücherei",
+            "31001_3038": "Burg, Festung",
+            "31001_3040": "Gebäude für religiöse Zwecke",
+            "31001_3041": "Kirche",
+            "31001_3042": "Synagoge",
+            "31001_3043": "Kapelle",
+            "31001_3044": "Gemeindehaus",
+            "31001_3045": "Gotteshaus",
+            "31001_3046": "Moschee",
+            "31001_3047": "Tempel",
+            "31001_3048": "Kloster",
+            "31001_3050": "Gebäude für Gesundheitswesen",
+            "31001_3051": "Krankenhaus",
+            "31001_3052": "Heilanstalt, Pflegeanstalt, Pflegestation",
+            "31001_3053": "Ärztehaus, Poliklinik",
+            "31001_3054": "Rettungswache",
+            "31001_3060": "Gebäude für soziale Zwecke",
+            "31001_3061": "Jugendfreizeitheim",
+            "31001_3062": "Freizeit-, Vereinsheim, Dorfgemeinschafts-, Bürgerhaus",
+            "31001_3063": "Seniorenfreizeitstätte",
+            "31001_3064": "Obdachlosenheim",
+            "31001_3065": "Kinderkrippe, Kindergarten, Kindertagesstätte",
+            "31001_3066": "Asylbewerberheim",
+            "31001_3070": "Gebäude für Sicherheit und Ordnung",
+            "31001_3071": "Polizei",
+            "31001_3072": "Feuerwehr",
+            "31001_3073": "Kaserne",
+            "31001_3074": "Schutzbunker",
+            "31001_3075": "Justizvollzugsanstalt",
+            "31001_3080": "Friedhofsgebäude",
+            "31001_3081": "Trauerhalle",
+            "31001_3082": "Krematorium",
+            "31001_3090": "Empfangsgebäude",
+            "31001_3091": "Bahnhofsgebäude",
+            "31001_3092": "Flughafengebäude",
+            "31001_3094": "Gebäude zum U-Bahnhof",
+            "31001_3095": "Gebäude zum S-Bahnhof",
+            "31001_3097": "Gebäude zum Busbahnhof",
+            "31001_3098": "Empfangsgebäude Schifffahrt",
+            "31001_3100": "Gebäude für öffentliche Zwecke mit Wohnen",
+            "31001_3200": "Gebäude für Erholungszwecke",
+            "31001_3210": "Gebäude für Sportzwecke",
+            "31001_3211": "Sport-, Turnhalle",
+            "31001_3212": "Gebäude zum Sportplatz",
+            "31001_3220": "Badegebäude",
+            "31001_3221": "Hallenbad",
+            "31001_3222": "Gebäude im Freibad",
+            "31001_3230": "Gebäude im Stadion",
+            "31001_3240": "Gebäude für Kurbetrieb",
+            "31001_3241": "Badegebäude für medizinische Zwecke",
+            "31001_3242": "Sanatorium",
+            "31001_3260": "Gebäude im Zoo",
+            "31001_3261": "Empfangsgebäude des Zoos",
+            "31001_3262": "Aquarium, Terrarium, Voliere",
+            "31001_3263": "Tierschauhaus",
+            "31001_3264": "Stall im Zoo",
+            "31001_3270": "Gebäude im botanischen Garten",
+            "31001_3271": "Empfangsgebäude des botanischen Gartens",
+            "31001_3272": "Gewächshaus (Botanik)",
+            "31001_3273": "Pflanzenschauhaus",
+            "31001_3280": "Gebäude für andere Erholungseinrichtung",
+            "31001_3281": "Schutzhütte",
+            "31001_3290": "Touristisches Informationszentrum",
+            "31001_9998": "Nach Quellenlage nicht zu spezifizieren",
+            # --- ALKIS-ATKIS (51001_*) ---
+            "51001_1001": "Wasserturm",
+            "51001_1002": "Kirchturm",
+            "51001_1003": "Aussichtsturm",
+            "51001_1004": "Kontrollturm",
+            "51001_1005": "Kühlturm",
+            "51001_1006": "Leuchtturm",
+            "51001_1007": "Feuerwachturm",
+            "51001_1008": "Sende-,Funkturm",
+            "51001_1009": "Stadt-,Torturm",
+            "51001_1010": "Förderturm",
+            "51001_1011": "Bohrturm",
+            "51001_1012": "Schloss-, Burgturm",
+            "51001_9998": "Nach Quellenlage nicht zu spezifizieren",
+            "51001_9999": "Sonstiges",
+            # --- ATKIS (5100x / 5200x / 5300x) ---
+            "51002_1215": "Biogasanlage",
+            "51002_1220": "Windrad",
+            "51002_1230": "Solarzellen",
+            "51002_1250": "Mast",
+            "51002_1251": "Freileitungsmast",
+            "51002_1260": "Funkmast",
+            "51002_1280": "Radioteleskop",
+            "51002_1290": "Schornstein",
+            "51002_1330": "Kran",
+            "51002_1331": "Drehkran",
+            "51002_1332": "Portalkran",
+            "51002_1333": "Laufkran",
+            "51002_1350": "Hochofen",
+            "51002_1400": "Umformer",
+            "51002_9999": "Sonstiges",
+            "51003_1201": "Silo",
+            "51003_1205": "Tank",
+            "51003_1206": "Gasometer",
+            "51003_9999": "Sonstiges",
+            "51006_1430": "Zuschauertribüne",
+            "51006_1431": "Zuschauertribüne, überdacht",
+            "51006_1432": "Zuschauertribüne, nicht überdacht",
+            "51006_1440": "Stadion",
+            "51006_1441": "Stadion, überdacht",
+            "51006_1442": "Stadion, nicht überdacht",
+            "51006_1470": "Sprungschanze (Anlauf)",
+            "51006_1490": "Gradierwerk",
+            "51006_9999": "Sonstiges",
+            "51007_1110": "Aquädukt",
+            "51007_1210": "Wachturm",
+            "51007_1400": "Befestigung (Burgruine)",
+            "51007_1500": "Historische Mauer",
+            "51007_1510": "Stadtmauer",
+            "51007_1520": "Sonstige historische Mauer",
+            "51007_9999": "Sonstiges",
+            "51009_1610": "Überdachung",
+            "51009_1611": "Carport",
+            "51009_1700": "Mauer",
+            "51009_1750": "Denkmal",
+            "51009_9999": "Sonstiges",
+            "52003_1010": "Schiffshebewerk",
+            "52003_1020": "Kammerschleuse",
+            "53001_1800": "Brücke",
+            "53001_1806": "Drehbrücke",
+            "53001_1807": "Hebebrücke",
+            "53001_1808": "Zugbrücke",
+            "53001_1830": "Hochbahn, Hochstraße",
+            "53001_1890": "Schleusenkammer",
+            "53009_2030": "Staumauer",
+            "53009_2050": "Wehr",
+            "53009_2060": "Sicherheitstor",
+            "53009_2070": "Siel",
+            "53009_2080": "Sperrwerk",
+            "53009_2090": "Schöpfwerk",
+        },
+    },
+    "JP": {
+        # PLATEAU / J-PLATEAU building codelists (MLIT 3D都市モデル標準製品仕様書)
+        # class source:    https://www.geospatial.jp/iur/codelists/3.2/Building_class.xml
+        # roofType source: https://www.geospatial.jp/iur/codelists/3.2/Building_roofType.xml
+        # usage source:    https://www.geospatial.jp/iur/codelists/3.2/Building_usage.xml
+        "bldg:Building.class": {
+            "3000": "分類しない建物 (building, unclassified)",
+            "3001": "普通建物 (ordinary building)",
+            "3002": "堅ろう建物 (sturdy building)",
+            "3003": "普通無壁舎 (ordinary shelter without walls)",
+            "3004": "堅ろう無壁舎 (sturdy shelter without walls)",
+        },
+        "bldg:Building.roofType": {
+            "1": "切妻屋根 (gabled roof)",
+            "2": "寄棟屋根 (hipped roof)",
+            "3": "方形屋根 (pyramidal roof)",
+            "4": "陸屋根 (flat roof)",
+            "5": "片流れ屋根 (monopitch roof)",
+            "6": "袴腰屋根/半切妻屋根 (half-hipped roof)",
+            "7": "入母屋屋根 (hipped-and-gabled roof)",
+            "8": "錣（しころ）屋根 (shikoro roof)",
+            "9": "マンサード屋根 (mansard roof)",
+            "10": "越屋根 (dormer/roof house)",
+            "11": "招き屋根 (canopy roof)",
+            "12": "差し掛け屋根 (awning roof)",
+            "13": "バタフライ屋根 (butterfly roof)",
+            "14": "鋸屋根 (sawtooth roof)",
+            "15": "六柱屋根 (hexagonal roof)",
+            "16": "八柱屋根 (octagonal roof)",
+            "17": "M型屋根 (M-shaped roof)",
+            "18": "下屋付招き屋根 (canopy roof with lower roof)",
+            "19": "棟違い屋根 (offset-ridge roof)",
+            "20": "乗り越し屋根 (overhanging roof)",
+            "21": "腰折れ屋根 (bent-ridge roof)",
+            "22": "隅切屋根 (corner-cut roof)",
+            "23": "アーチ屋根 (arch roof)",
+            "24": "ドーム屋根 (dome roof)",
+            "25": "シェル屋根 (shell roof)",
+            "26": "カテナリー屋根 (catenary roof)",
+            "27": "膜構造 (membrane structure)",
+            "28": "その他 (other)",
+            "9020": "不明 (unknown)",
+        },
+        "bldg:Building.usage": {
+            "401": "業務施設 (office/business facility)",
+            "402": "商業施設 (commercial facility)",
+            "403": "宿泊施設 (accommodation facility)",
+            "404": "商業系複合施設 (commercial complex)",
+            "411": "住宅 (residential house)",
+            "412": "共同住宅 (multi-unit residential/apartment)",
+            "413": "店舗等併用住宅 (residential with shop)",
+            "414": "店舗等併用共同住宅 (multi-unit residential with shop)",
+            "415": "作業所併用住宅 (residential with workshop)",
+            "421": "官公庁施設 (government facility)",
+            "422": "文教厚生施設 (education/culture/health facility)",
+            "431": "運輸倉庫施設 (transport/warehouse facility)",
+            "441": "工場 (factory)",
+            "451": "農林漁業用施設 (agriculture/forestry/fishery facility)",
+            "452": "供給処理施設 (supply/treatment facility)",
+            "453": "防衛施設 (defense facility)",
+            "454": "その他 (other)",
+            "461": "不明 (unknown)",
         },
     },
     "DEFAULT": {
-        "roofType": _ROOFTYPE_STANDARD,
+        "bldg:Building.roofType": _ROOFTYPE_STANDARD,
     },
 }
 
 
 def get_static_codelists(epsg_code: int) -> dict:
-    """Returns the appropriate static codelists based on EPSG code."""
+    """Returns the appropriate static codelists based on EPSG code.
+
+    Keys are qualified composite keys: "<namespace-alias>:<Classname>.<attribute>"
+    (e.g. "bldg:Building.function"). See _qual_key for the key convention.
+    """
     country = _get_country_from_epsg(epsg_code)
     return COUNTRY_CODELISTS.get(country, COUNTRY_CODELISTS["DEFAULT"])
+
+
+def _qual_key(namespace_alias: str, classname: str, attribute: str) -> str:
+    """Build a qualified codelist key: '<alias>:<Classname>.<attribute>'.
+
+    All parts are trimmed and lower-cased so lookups are robust against
+    case/whitespace variations in the DB. Keys in COUNTRY_CODELISTS are
+    stored in canonical form (e.g. 'bldg:Building.function') but always
+    compared in normalized form (e.g. 'bldg:building.function').
+    """
+    return f"{namespace_alias.strip().lower()}:{classname.strip().lower()}.{attribute.strip().lower()}"
+
+
+def _find_static_codelist(static_codelists: dict, namespace_alias: str, classname: str, attribute: str) -> tuple[str, dict] | None:
+    """Look up a qualified key in a static codelist block (normalised compare).
+
+    Returns (canonical_key, code_map) or None if no exact match.
+    No fallback to bare attribute names — namespace + class must always match.
+    """
+    target = _qual_key(namespace_alias, classname, attribute)
+    for key, code_map in static_codelists.items():
+        if key.strip().lower() == target:
+            return key, code_map
+    return None
 
 
 # ============================================================
@@ -354,6 +1031,10 @@ def resolve_properties(db: DatabaseConnection, objectclass_id: int, epsg_code: i
         key = (s["name"], s["namespace_id"])
         surviving_lookup[key] = (s["datatype_id"], s["namespace_id"])
 
+    # Namespace alias map (needed for qualified codelist keys, e.g. 'bldg:Building.function')
+    ns_aliases = {r["id"]: r["alias"] for r in db.execute("SELECT id, alias FROM namespace")}
+    concrete_classname = class_map[objectclass_id]["classname"]
+
     # Step 4: Match schema properties to surviving properties
     resolved = []
     for sp in schema_properties:
@@ -393,7 +1074,9 @@ def resolve_properties(db: DatabaseConnection, objectclass_id: int, epsg_code: i
         # Step 5: For Code-type properties (datatype_id = 14), resolve codelist
         if datatype_id == 14:
             prop_def.codelist = _resolve_codelist_for_property(
-                db, objectclass_id, sp["name"], sp["namespace_id"], epsg_code
+                db, objectclass_id, sp["name"], actual_namespace_id, epsg_code,
+                namespace_alias=ns_aliases.get(actual_namespace_id, ""),
+                classname=concrete_classname,
             )
 
         resolved.append(prop_def)
@@ -406,12 +1089,15 @@ def _resolve_codelist_for_property(
     objectclass_id: int,
     property_name: str,
     namespace_id: int,
-    epsg_code: int = 0
+    epsg_code: int = 0,
+    namespace_alias: str = "",
+    classname: str = "",
 ) -> CodeListDefinition | None:
     """
     For a Code-type property, resolves code meanings.
     Strategy:
-    1. Check country-specific static codelists (selected by EPSG)
+    1. Check country-specific static codelists (selected by EPSG), looked up
+       via the qualified key '<namespace-alias>:<Classname>.<attribute>'
     2. Fall back to codelist_entry table in DB
     3. If neither found, return raw codes
     """
@@ -431,7 +1117,30 @@ def _resolve_codelist_for_property(
 
     code_values = [row["code"] for row in distinct_codes]
 
-    # If too many distinct values, this isn't a true classification codelist
+    # Step 2: Check country-specific static codelists FIRST (qualified key lookup:
+    # '<namespace-alias>:<Classname>.<attribute>' — no bare-name fallback).
+    # This must run BEFORE the categorical threshold: a known codelist can
+    # legitimately have many codes (e.g. 31 ALKIS function codes), so value
+    # count alone must not disqualify it.
+    static_codelists = get_static_codelists(epsg_code)
+    match = _find_static_codelist(static_codelists, namespace_alias, classname, property_name)
+    if match:
+        qual_key, static_map = match
+        code_entries = [
+            CodeEntry(code=c, value=static_map.get(c, c))
+            for c in code_values
+        ]
+        return CodeListDefinition(
+            codelist_id=-1,
+            codelist_name=f"static:{qual_key}",
+            source_url="",
+            mime_type="",
+            property_name=property_name,
+            object_class_name="",
+            entries=code_entries
+        )
+
+    # Step 3: No known codelist — if too many distinct values, treat as free text
     if len(code_values) > CATEGORICAL_THRESHOLD:
         return CodeListDefinition(
             codelist_id=-1,
@@ -446,25 +1155,7 @@ def _resolve_codelist_for_property(
             )]
         )
 
-    # Step 2: Check country-specific static codelists first
-    static_codelists = get_static_codelists(epsg_code)
-    if property_name in static_codelists:
-        static_map = static_codelists[property_name]
-        code_entries = [
-            CodeEntry(code=c, value=static_map.get(c, c))
-            for c in code_values
-        ]
-        return CodeListDefinition(
-            codelist_id=-1,
-            codelist_name=f"static:{property_name}",
-            source_url="",
-            mime_type="",
-            property_name=property_name,
-            object_class_name="",
-            entries=code_entries
-        )
-
-    # Step 3: Try matching in codelist_entry table
+    # Step 4: Try matching in codelist_entry table
     import re
     codelists = db.execute("""
         SELECT id, codelist_type, url, mime_type
@@ -515,7 +1206,7 @@ def _resolve_codelist_for_property(
             entries=code_entries
         )
 
-    # Step 4: No codelist found — return raw codes
+    # Step 5: No codelist found — return raw codes
     return CodeListDefinition(
         codelist_id=-1,
         codelist_name="",
@@ -1636,11 +2327,20 @@ def synthesize_examples(db: DatabaseConnection, catalog, codelists: dict, vocab)
             ORDER BY n DESC
             LIMIT 1
         """, (oc_id,))
-        func_code = func_rows[0]["code"] if func_rows else "1379"
+        func_code = func_rows[0]["code"] if func_rows else "31001_1000"
     except Exception:
-        func_code = "1379"
+        func_code = "31001_1000"
 
-    func_label = codelists.get("function", {}).get(func_code, func_code)
+    # Qualified codelist reference for the dominant class, e.g. 'bldg:Building.function'
+    try:
+        ns_alias_rows = db.execute(
+            "SELECT alias FROM namespace WHERE id = %s", (dominant.namespace_id,)
+        )
+        ns_alias = ns_alias_rows[0]["alias"] if ns_alias_rows else ""
+    except Exception:
+        ns_alias = ""
+    match = _find_static_codelist(codelists, ns_alias, classname, "function")
+    func_label = match[1].get(func_code, func_code) if match else func_code
 
     # Most common street name
     top_street = vocab.street_names[0][0] if vocab.street_names else "Röblingweg"

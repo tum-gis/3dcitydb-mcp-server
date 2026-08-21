@@ -15,7 +15,7 @@ The evaluation of the MCP Server for the paper (link coming soon) was done using
 
 - **Dynamic schema resolution** — walks the CityGML class hierarchy to discover available object classes and their properties
 - **Property filtering** — only includes properties that actually exist in the database
-- **Codelist resolution** — fetches code meanings only for codes present in the DB
+- **Country-aware codelist resolution** — qualified `<namespace>:<Class>.<attribute>` keys, country selected via the database EPSG code; only codes actually present in the data are exposed
 - **Generic attribute enrichment** — automatic categorical detection for generic attributes
 - **Read-only query execution** — `run_query` enforces SELECT-only; writes are blocked
 - **Prompt assembly** — `assemble_prompt` orchestrates all tools into a complete system prompt in one call
@@ -402,8 +402,30 @@ At least one must be configured for the Docker variants. The Gradio UI auto-sele
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CATEGORICAL_THRESHOLD` | `20` | Max distinct values before a column is treated as categorical |
+| `CATEGORICAL_THRESHOLD` | `20` | Max distinct values before a column is treated as free text (only applied when no known codelist exists) |
 | `SAMPLE_VALUES_COUNT` | `5` | Number of sample values shown per non-categorical column |
+
+### Country-specific codelists
+
+Code-type properties (`core:Code`) are resolved against country-specific codelist
+definitions. The country is selected from the database EPSG code
+(`database_srs`), falling back to a generic `DEFAULT` block for unknown countries:
+
+- **DE** (EPSG 25831–25833, 31466–31469, 5650) — ALKIS/AdV: `function` (31 codes), `usage`, `roofType` (roof form)
+- **JP** (EPSG 6668–6692, 2443–2461) — J-PLATEAU/MLIT: `class`, `roofType` (29 codes), `usage`
+- **DEFAULT** — SIG3D-standard `roofType`
+
+Each codelist is keyed by a **qualified composite key** of the form
+`<namespace-alias>:<Classname>.<attribute>` — e.g. `bldg:Building.function`.
+The alias comes from the 3DCityDB `namespace.alias` column and the class name is the
+concrete feature class. Lookup is exact (case-insensitive); there is no fallback to
+bare attribute names, so same-named attributes in different classes (e.g.
+`bldg:Building.function` vs. `brid:Bridge.function`) never collide. Only codes that
+actually occur in the imported data are exposed to the LLM, with no artificial cap.
+
+Codelists are defined in `src/citydb_mcp/tools/dynamic_tools.py`
+(`COUNTRY_CODELISTS`). Adding a class or country later (e.g. `bldg:BuildingPart.*`)
+is a pure data change — no code changes required.
 
 ### Ollama tuning (optional)
 
