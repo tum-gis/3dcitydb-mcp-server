@@ -708,6 +708,7 @@ def chat_stream(
     # keeps the previous note if this turn produced nothing new, but always
     # logs the outcome so the toggle's effect is visible either way.
     if add_lessons and provider == "ollama" and turn_transcript:
+        trace_md = log(f"Begin of summarizing function!\n\n")
         summary, summary_error = _summarize_reasoning_ollama(turn_transcript, model, num_ctx)
         if summary:
             lessons_note = summary
