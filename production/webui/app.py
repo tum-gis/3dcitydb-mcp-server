@@ -887,6 +887,146 @@ def build_import_tab(
 
 # ── Main UI ────────────────────────────────────────────────────────────────────
 
+# Client-side drag-to-resize for the column rows marked `resizable-row`.
+# Injected via gr.Blocks(js=...) because gr.HTML sanitizes its content and
+# would strip <script> tags. Gradio expects a function expression of the form
+# "async (_win, _event_data) => { ... }" — wrapping this as plain statements
+# crashes the Svelte mount and breaks the whole UI. Do NOT name a parameter
+# `window`: it would shadow the global `window` and arrive undefined.
+# Runs once per page load;
+# polls briefly because tab contents may render a tick after initial page load.
+_RESIZE_JS = """
+async (_win, _event_data) => {
+  if (window.__citydbSplitsInit) return;
+  window.__citydbSplitsInit = true;
+
+  var SPECS = [
+    { id: "top-row",  storage: "citydb.split.top",  minLeft: 200, minRight: 320 },
+    { id: "chat-row", storage: "citydb.split.chat", minLeft: 320, minRight: 260 }
+  ];
+
+  function isCol(el) {
+    return el.classList.contains("column") ||
+      el.classList.contains("col") ||
+      el.classList.contains("gr-column");
+  }
+
+  function setupRow(spec) {
+    var row = document.getElementById(spec.id);
+    if (!row || row.__splitterSet) return;
+
+    // Resolve the columns live on every call: Svelte replaces the column
+    // elements on re-renders (tab switches, streaming updates), so a one-time
+    // closure capture would point at a detached node and style changes would
+    // have no visible effect.
+    function getCols() {
+      var cs = [];
+      for (var i = 0; i < row.children.length; i++) {
+        var el = row.children[i];
+        if (el !== row.querySelector(".splitter") && isCol(el)) cs.push(el);
+      }
+      return { left: cs[0], right: cs[1] };
+    }
+    function hasCols() {
+      var n = 0;
+      for (var i = 0; i < row.children.length; i++) {
+        if (isCol(row.children[i])) n++;
+      }
+      return n >= 2;
+    }
+    if (!hasCols()) return;  // columns not rendered yet — poll() retries
+
+    row.__splitterSet = true;
+    var handle = document.createElement("div");
+    handle.className = "splitter";
+    row.appendChild(handle);
+
+    // Factory inline style captured from the fresh columns (Gradio:
+    // "flex-grow: 1; min-width: min(220px, 100%)") — used by the dblclick
+    // reset.
+    var factoryStyle = getCols().left.getAttribute("style");
+
+    function position() {
+      var c = getCols();
+      if (c.left) handle.style.left = c.left.getBoundingClientRect().width + "px";
+    }
+    function clamp(w) {
+      var maxW = row.getBoundingClientRect().width - spec.minRight - 12;
+      return Math.max(spec.minLeft, Math.min(w, maxW));
+    }
+    function apply(w) {
+      // gr.Row is a flexbox (not grid): pin the left column to a fixed width,
+      // let the right column absorb the remaining space.
+      var c = getCols();
+      if (!c.left || !c.right) return;
+      c.left.style.flex = "0 0 " + w + "px";
+      c.left.style.width = w + "px";
+      c.left.style.maxWidth = w + "px";
+      c.right.style.flex = "1 1 0px";
+      c.right.style.width = "auto";
+      c.right.style.maxWidth = "none";
+      position();
+    }
+
+    // Restore previous split (survives reloads)
+    var saved = null;
+    try { saved = JSON.parse(localStorage.getItem(spec.storage) || "null"); } catch (e) {}
+    if (saved && typeof saved.w === "number") apply(clamp(saved.w));
+    else position();
+
+    handle.addEventListener("mousedown", function (e) {
+      e.preventDefault();
+      var c0 = getCols();
+      if (!c0.left) return;
+      var startX = e.clientX, startW = c0.left.getBoundingClientRect().width, lastW = startW;
+      handle.classList.add("active");
+      document.body.classList.add("splitting");
+      function onMove(ev) {
+        lastW = clamp(startW + (ev.clientX - startX));
+        apply(lastW);
+      }
+      function onUp() {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        handle.classList.remove("active");
+        document.body.classList.remove("splitting");
+        try { localStorage.setItem(spec.storage, JSON.stringify({ w: lastW })); } catch (e) {}
+      }
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+
+    // Double-click resets to the default ratio
+    handle.addEventListener("dblclick", function () {
+      var c = getCols();
+      if (!c.left || !c.right) return;
+      c.left.style.cssText = factoryStyle || "";
+      c.right.style.cssText = factoryStyle || "";
+      try { localStorage.removeItem(spec.storage); } catch (e) {}
+      position();
+    });
+
+    var rt = null;
+    window.addEventListener("resize", function () {
+      clearTimeout(rt);
+      rt = setTimeout(function () {
+        var c = getCols();
+        if (c.left) apply(clamp(c.left.getBoundingClientRect().width));
+      }, 120);
+    });
+  }
+
+  // Rows may render a tick later (tab lazy rendering) — retry briefly.
+  var tries = 0;
+  (function poll() {
+    var pending = SPECS.some(function (s) { return !document.getElementById(s.id); });
+    SPECS.forEach(setupRow);
+    if (pending && ++tries < 100) setTimeout(poll, 200);
+  })();
+}
+"""
+
+
 def build_ui() -> gr.Blocks:
     detected_provider = detect_default_provider()
     initial_provider = detected_provider or "anthropic"
@@ -906,6 +1046,7 @@ def build_ui() -> gr.Blocks:
             font=[gr.themes.GoogleFont("Open Sans"), "ui-sans-serif", "sans-serif"],
             font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "ui-monospace", "monospace"],
         ),
+        js=_RESIZE_JS,
         css="""
         .header-bar { background: #1e293b; padding: 16px 24px; border-radius: 8px; margin-bottom: 8px; }
         .header-bar h1 { color: #f8fafc; margin: 0; font-size: 1.4rem; }
@@ -966,6 +1107,23 @@ def build_ui() -> gr.Blocks:
         .log-nav-header .trace-panel-label { margin:0; }
         .log-nav-controls { display:flex; align-items:center; gap:4px; }
         .log-nav-btn { min-width:32px !important; max-width:32px !important; padding:0 !important; height:28px !important; font-size:0.9rem !important; }
+
+        /* ── Resizable column sections ─────────────────────────── */
+        .resizable-row { position: relative; }
+        .resizable-row > div { min-width: 0 !important; }
+        .splitter {
+            position: absolute; top: 0; width: 8px; height: 100%;
+            transform: translateX(-50%);
+            cursor: col-resize; z-index: 30;
+        }
+        .splitter::after {
+            content: ""; display: block; width: 2px; height: 100%;
+            margin: 0 auto; background: transparent;
+            transition: background 0.15s ease;
+        }
+        .splitter:hover::after, .splitter.active::after { background: #3b82f6; }
+        body.splitting, body.splitting * { cursor: col-resize !important; user-select: none !important; }
+        body.splitting iframe { pointer-events: none; }
         """,
     ) as demo:
 
@@ -990,7 +1148,7 @@ def build_ui() -> gr.Blocks:
 
         reload_tiles_state = gr.State(0) if ENABLE_VIZ else None
 
-        with gr.Row():
+        with gr.Row(elem_classes="resizable-row", elem_id="top-row"):
 
             # ── Sidebar ───────────────────────────────────────────────────────
             with gr.Column(scale=1, min_width=220):
@@ -1071,7 +1229,7 @@ def build_ui() -> gr.Blocks:
 
                 with gr.Tab("Chat"):
                     if ENABLE_VIZ:
-                        with gr.Row(equal_height=True):
+                        with gr.Row(equal_height=True, elem_classes="resizable-row", elem_id="chat-row"):
                             with gr.Column(scale=1, min_width=360):
                                 db_warning = gr.HTML(value="")
                                 chatbot = gr.Chatbot(
@@ -1114,7 +1272,7 @@ def build_ui() -> gr.Blocks:
                                 )
 
                     else:
-                        with gr.Row(equal_height=False):
+                        with gr.Row(equal_height=False, elem_classes="resizable-row", elem_id="chat-row"):
                             with gr.Column(scale=3, min_width=380):
                                 db_warning = gr.HTML(value="")
                                 chatbot = gr.Chatbot(
@@ -1222,6 +1380,8 @@ def build_ui() -> gr.Blocks:
                     )
 
         # ── State ─────────────────────────────────────────────────────────────
+        # (Resizable section dividers: script is injected via gr.Blocks(js=_RESIZE_JS)
+        # above, targeting the rows marked `resizable-row`.)
         history_state = gr.State([])
         highlight_state = gr.JSON(visible=False, value={"buildings": [], "centroid": None})
         log_history_state = gr.State([])
