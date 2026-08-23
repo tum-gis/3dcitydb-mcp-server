@@ -926,6 +926,9 @@ _PRINT_CSS = """
   .message-buttons,
   .message-buttons-left,
   .message-buttons-right,
+  /* chatbot block corner UI: floating "Chatbot" label + icon buttons (trash) */
+  .wrapper:has([aria-label="chatbot conversation"]) > label,
+  .wrapper:has([aria-label="chatbot conversation"]) > .icon-button-wrapper,
   footer,
   iframe {
     display: none !important;
@@ -951,6 +954,20 @@ _PRINT_CSS = """
   :has([aria-label="chatbot conversation"]) {
     height: auto !important;
     max-height: none !important;
+  }
+  /* Gradio lays the whole app out with nested flex (body > gradio-app >
+     .gradio-container > main > .wrap > ...). Chrome paginates through flex
+     containers fine, but Firefox keeps the first page almost empty because
+     the flex chain is treated as one unsplittable flow. Force plain block
+     flow everywhere in print so text starts directly under the title. */
+  body,
+  .gradio-container,
+  main,
+  main > .gradio-container,
+  .contain,
+  .wrap,
+  :has([aria-label="chatbot conversation"]) {
+    display: block !important;
   }
   [aria-label="chatbot conversation"],
   .wrapper:has([aria-label="chatbot conversation"]),
@@ -1078,6 +1095,7 @@ _PRINT_CSS = """
     color: #0f172a;
     border-bottom: 2px solid #334155;
     padding-bottom: 6px;
+    margin-top: 8px;
     margin-bottom: 14px;
   }
 }
