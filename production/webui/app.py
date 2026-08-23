@@ -941,6 +941,23 @@ _PRINT_CSS = """
     flex: none !important;
   }
 
+  /* Kill every viewport/fixed-height constraint so content flows across pages.
+     Gradio pins fixed heights all the way down the chain (gradio-container,
+     main.fillable, the chatbot .block with overflow:auto, the 500px log
+     "wrapper" div) — if any of them keeps its viewport height, print output
+     is clipped to the first screenful and shows a scrollbar. */
+  body, main, .gradio-container, .contain, .wrap,
+  [aria-label="chatbot conversation"],
+  :has([aria-label="chatbot conversation"]) {
+    height: auto !important;
+    max-height: none !important;
+  }
+  [aria-label="chatbot conversation"],
+  .wrapper:has([aria-label="chatbot conversation"]),
+  .block:has([aria-label="chatbot conversation"]) {
+    overflow: visible !important;
+  }
+
   /* Chatbot area: no scroll, no fixed height, no border */
   .bubble-wrap, .message-wrap {
     height: auto !important;
