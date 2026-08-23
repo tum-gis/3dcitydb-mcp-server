@@ -1272,6 +1272,66 @@ async (_win, _event_data) => {
     document.head.appendChild(st);
   }
 
+  // ── No math rendering in the "Agent activity" trace panel ────────────
+  // Gradio's markdown renderer applies KaTeX page-wide, which would mangle
+  // TeX snippets inside SQL / agent output. Keep formulas there as raw
+  // text: whenever a rendered .katex / .katex-display node appears in
+  // #agent-trace, replace it with its TeX source (the annotation element
+  // inside the (visually hidden) MathML carries it verbatim). The observer
+  // is recursive — Svelte swaps the #agent-trace element itself on
+  // re-renders (tab switches, streaming updates), so each fresh element
+  // gets its own observer.
+  var traceObservers = new WeakSet();
+  function rawTex(katexEl) {
+    var ann = katexEl.querySelector("annotation[encoding='application/x-tex']");
+    if (ann && ann.textContent) return ann.textContent;
+    var text = (katexEl.textContent || "").replace(/\\s+/g, " ").trim();
+    return (text ? "\\(" + text + "\\)" : "(formula)");
+  }
+  function demoteMathInTrace(root) {
+    var done = [];
+    for (var i = 0; i < root.childNodes.length; i++) {
+      var n = root.childNodes[i];
+      if (n.nodeType !== 1) continue;
+      var k = n.classList && (n.classList.contains("katex") ||
+        n.classList.contains("katex-display")) ? n
+        : n.querySelector ? n.querySelector(".katex, .katex-display") : null;
+      if (!k) continue;
+      var code = document.createElement("code");
+      code.textContent = (k.classList.contains("katex-display") ? "$$" : "$") +
+        rawTex(k) + (k.classList.contains("katex-display") ? "$$" : "$");
+      k.replaceWith(code);
+      done.push(code);
+    }
+    return done;
+  }
+  function watchTraceMath(el) {
+    if (!el || traceObservers.has(el)) return;
+    traceObservers.add(el);
+    var ob = new MutationObserver(function (muts) {
+      muts.forEach(function (m) {
+        m.addedNodes.forEach(function (n) {
+          if (n.nodeType !== 1 || !n.querySelector) return;
+          if (n.classList && (n.classList.contains("katex") ||
+              n.classList.contains("katex-display"))) {
+            if (n.parentNode) demoteMathInTrace(n.parentNode);
+          } else if (n.querySelector(".katex, .katex-display")) {
+            demoteMathInTrace(n);  // katex node(s) nested in the added subtree
+          }
+        });
+      });
+    });
+    ob.observe(el, { childList: true, subtree: true });
+  }
+  (function watchTracePoll() {
+    var t = document.getElementById("agent-trace");
+    if (t) {
+      watchTraceMath(t);
+      return; // element exists — observer now handles all streaming updates
+    }
+    setTimeout(watchTracePoll, 200);
+  })();
+
   // window.print() renders whatever is already in the DOM — Gradio's
   // markdown renderer (KaTeX for $$…$$, mermaid for ```mermaid``` blocks)
   // has produced the final HTML/SVG, so the print CSS (see _PRINT_CSS above)
