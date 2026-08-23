@@ -889,9 +889,10 @@ def build_import_tab(
 # ── Main UI ────────────────────────────────────────────────────────────────────
 
 # Print / PDF export (🖨 button → window.print).
-# Verified against the Gradio 5.50 DOM: bubbles are .message-wrap .user /
-# .message-wrap .bot; math renders via KaTeX (span.katex / span.katex-display);
-# mermaid renders to <svg> inside .prose.
+# Verified against the Gradio 5.50 DOM: a single .message-wrap wraps the whole
+# conversation; each bubble is a .message-row.user-row / .message-row.bot-row
+# (role classes .user / .bot live on inner divs); math renders via KaTeX
+# (span.katex / span.katex-display); mermaid renders to <svg> inside .prose.
 # IMPORTANT: this must NOT go into gr.Blocks(css=...) — Gradio rewrites every
 # selector to be scoped under .gradio-container .contain and drops @page rules,
 # which breaks printing for elements outside that scope (footer, body::before).
@@ -986,9 +987,14 @@ _PRINT_CSS = """
     padding: 0 !important;
   }
 
-  /* Bubbles: full width, question vs. answer clearly separated */
-  .message-wrap .message-row { display: block !important; }
-  /* Gradio puts the role class on the .message-wrap element itself */
+  /* Bubbles: full width, question vs. answer clearly separated.
+     Verified real Gradio 5.50 DOM: ONE .message-wrap wraps the whole
+     conversation; the role lives on each .message-row.user-row /
+     .message-row.bot-row (with .user / .bot divs inside). */
+  .message-wrap .message-row,
+  .message-row { display: block !important; }
+  .message-row.user-row,
+  .message-row.bot-row,
   .message-wrap.user,
   .message-wrap.bot {
     width: 100% !important;
@@ -999,29 +1005,42 @@ _PRINT_CSS = """
     text-align: left !important;
     box-shadow: none !important;
   }
+  /* Neutralize Gradio's inner bubble styling so the row IS the bubble */
+  .message-row > .flex-wrap,
+  .message-row .message {
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    border-radius: 0 !important;
+  }
+  .message-row.user-row,
   .message-wrap.user {
     background: #eef2f7 !important;
     border: 1px solid #cbd5e1 !important;
   }
+  .message-row.user-row::before,
   .message-wrap.user::before {
-    content: "❓ User";
-    display: block;
-    font-size: 0.75rem;
-    font-weight: 700;
+    content: "❓ User" !important;
+    display: block !important;
+    font-size: 0.75rem !important;
+    font-weight: 700 !important;
     letter-spacing: 0.05em;
     text-transform: uppercase;
     color: #0f766e;
     margin-bottom: 6px;
   }
+  .message-row.bot-row,
   .message-wrap.bot {
     background: #ffffff !important;
     border: 1px solid #e2e8f0 !important;
   }
+  .message-row.bot-row::before,
   .message-wrap.bot::before {
-    content: "🤖 Assistant";
-    display: block;
-    font-size: 0.75rem;
-    font-weight: 700;
+    content: "🤖 Assistant" !important;
+    display: block !important;
+    font-size: 0.75rem !important;
+    font-weight: 700 !important;
     letter-spacing: 0.05em;
     text-transform: uppercase;
     color: #0369a1;
@@ -1491,6 +1510,10 @@ def build_ui() -> gr.Blocks:
                                     render_markdown=True,
                                     sanitize_html=True,
                                     allow_tags=False,
+                                    latex_delimiters=[
+                                        {"left": "$$", "right": "$$", "display": True},
+                                        {"left": "$", "right": "$", "display": False},
+                                    ],
                                 )
                                 with gr.Row():
                                     msg_input = gr.Textbox(
@@ -1535,6 +1558,10 @@ def build_ui() -> gr.Blocks:
                                     render_markdown=True,
                                     sanitize_html=True,
                                     allow_tags=False,
+                                    latex_delimiters=[
+                                        {"left": "$$", "right": "$$", "display": True},
+                                        {"left": "$", "right": "$", "display": False},
+                                    ],
                                 )
                                 with gr.Row():
                                     msg_input = gr.Textbox(
