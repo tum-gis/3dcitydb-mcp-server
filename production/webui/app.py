@@ -1,5 +1,6 @@
 """Gradio chat UI for citydb-mcp."""
 
+import json
 import os
 import re
 import threading
@@ -887,6 +888,185 @@ def build_import_tab(
 
 # ── Main UI ────────────────────────────────────────────────────────────────────
 
+# Print / PDF export (🖨 button → window.print).
+# Verified against the Gradio 5.50 DOM: bubbles are .message-wrap .user /
+# .message-wrap .bot; math renders via KaTeX (span.katex / span.katex-display);
+# mermaid renders to <svg> inside .prose.
+# IMPORTANT: this must NOT go into gr.Blocks(css=...) — Gradio rewrites every
+# selector to be scoped under .gradio-container .contain and drops @page rules,
+# which breaks printing for elements outside that scope (footer, body::before).
+# It is injected at runtime as an unscoped <style> element by _RESIZE_JS.
+_PRINT_CSS = """
+@media print {
+  @page { size: A4; margin: 15mm 12mm; }
+
+  html, body {
+    background: #ffffff !important;
+    color: #1e293b !important;
+  }
+  .gradio-container {
+    background: #ffffff !important;
+    color: #1e293b !important;
+    max-width: 100% !important;
+  }
+
+  /* Hide all UI chrome: header, settings sidebar, tabs, trace,
+     Cesium viewer, input row, per-message buttons, footer. */
+  .header-bar,
+  #top-row > .column:first-child,
+  #top-row > .splitter,
+  #chat-row > .column:nth-of-type(2),
+  #chat-row > .splitter,
+  #chat-row > .column:first-child > .row:last-child,
+  .tab-container,
+  .tab-wrapper,
+  #agent-trace,
+  .log-nav-header,
+  .log-nav-row,
+  .message-buttons,
+  .message-buttons-left,
+  .message-buttons-right,
+  footer,
+  iframe {
+    display: none !important;
+  }
+
+  /* Chat column expands to full page width */
+  #top-row, #chat-row { display: block !important; }
+  #top-row > .column:last-of-type,
+  #chat-row > .column:first-child {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    flex: none !important;
+  }
+
+  /* Chatbot area: no scroll, no fixed height, no border */
+  .bubble-wrap, .message-wrap {
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    overflow: visible !important;
+    border: none !important;
+    border-radius: 0 !important;
+    padding: 0 !important;
+  }
+
+  /* Bubbles: full width, question vs. answer clearly separated */
+  .message-wrap .message-row { display: block !important; }
+  /* Gradio puts the role class on the .message-wrap element itself */
+  .message-wrap.user,
+  .message-wrap.bot {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 0 12px 0 !important;
+    padding: 10px 14px !important;
+    border-radius: 6px !important;
+    text-align: left !important;
+    box-shadow: none !important;
+  }
+  .message-wrap.user {
+    background: #eef2f7 !important;
+    border: 1px solid #cbd5e1 !important;
+  }
+  .message-wrap.user::before {
+    content: "❓ User";
+    display: block;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: #0f766e;
+    margin-bottom: 6px;
+  }
+  .message-wrap.bot {
+    background: #ffffff !important;
+    border: 1px solid #e2e8f0 !important;
+  }
+  .message-wrap.bot::before {
+    content: "🤖 Assistant";
+    display: block;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: #0369a1;
+    margin-bottom: 6px;
+  }
+
+  /* Markdown content: print-safe light colors (also for dark mode) */
+  .message-wrap .prose,
+  .message-wrap .prose p,
+  .message-wrap .prose li,
+  .message-wrap .prose td { color: #1e293b !important; }
+  .message-wrap .prose h1, .message-wrap .prose h2,
+  .message-wrap .prose h3, .message-wrap .prose h4,
+  .message-wrap .prose h5 { color: #0f172a !important; }
+  .message-wrap .prose a { color: #0369a1 !important; }
+  .message-wrap .prose code {
+    background: #e2e8f0 !important; color: #374151 !important;
+    border-radius: 3px; padding: 1px 4px; font-size: 0.85em;
+  }
+  .message-wrap .prose pre {
+    background: #f1f5f9 !important;
+    border: 1px solid #cbd5e1 !important;
+    border-radius: 4px;
+    padding: 10px 12px;
+    overflow: visible !important;
+    white-space: pre-wrap !important;
+    word-break: break-word !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  .message-wrap .prose pre code {
+    background: transparent !important; padding: 0; color: #1e293b !important;
+  }
+  .message-wrap .prose table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+  .message-wrap .prose th, .message-wrap .prose td {
+    border: 1px solid #cbd5e1; padding: 4px 8px;
+  }
+  .message-wrap .prose th { background: #e2e8f0 !important; font-weight: 600; }
+  .message-wrap .prose blockquote {
+    border-left: 3px solid #93c5fd; color: #64748b !important;
+  }
+  .message-wrap .prose img { max-width: 100%; }
+  .message-wrap .prose hr { border: none; border-top: 1px solid #cbd5e1; }
+
+  /* Math (KaTeX): never split across pages */
+  .katex { break-inside: avoid; page-break-inside: avoid; }
+  .katex-display {
+    break-inside: avoid;
+    page-break-inside: avoid;
+    margin: 12px 0 !important;
+    overflow: hidden !important;
+  }
+
+  /* Mermaid diagrams (rendered to <svg> by the markdown renderer) */
+  .message-wrap .prose svg {
+    max-width: 100% !important;
+    height: auto !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+    display: block;
+    margin: 10px auto;
+  }
+
+  /* Static export header */
+  body::before {
+    content: "3DCityDB-MCP — Chat-Export";
+    display: block;
+    width: 100%;
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: #0f172a;
+    border-bottom: 2px solid #334155;
+    padding-bottom: 6px;
+    margin-bottom: 14px;
+  }
+}
+"""
+
+
 # Client-side drag-to-resize for the column rows marked `resizable-row`.
 # Injected via gr.Blocks(js=...) because gr.HTML sanitizes its content and
 # would strip <script> tags. Gradio expects a function expression of the form
@@ -1023,8 +1203,41 @@ async (_win, _event_data) => {
     SPECS.forEach(setupRow);
     if (pending && ++tries < 100) setTimeout(poll, 200);
   })();
+
+  // ── PDF export via the native browser print dialog ─────────────────────
+  // Inject the print CSS as an UNSCOPED <style> element at runtime.
+  // Gradio rewrites every gr.Blocks(css=...) selector to be scoped under
+  // ".gradio-container .contain" and drops @page rules — that breaks printing
+  // for elements outside that scope (the footer, the body::before header).
+  // The _RESIZE_JS string is passed through gr.Blocks(js=...) untouched, so a
+  // style tag added here keeps @page and matches document-level elements.
+  if (!document.getElementById("citydb-print-css")) {
+    var st = document.createElement("style");
+    st.id = "citydb-print-css";
+    st.textContent = __PRINT_CSS__;
+    document.head.appendChild(st);
+  }
+
+  // window.print() renders whatever is already in the DOM — Gradio's
+  // markdown renderer (KaTeX for $$…$$, mermaid for ```mermaid``` blocks)
+  // has produced the final HTML/SVG, so the print CSS (see _PRINT_CSS above)
+  // is all that is needed. A short delay lets a still-streaming answer settle
+  // before the print dialog opens.
+  window._exportPdf = function () {
+    var prev = document.title;
+    document.title = "3DCityDB-Chat-" + new Date().toISOString().slice(0, 10);
+    setTimeout(function () {
+      window.print();
+      // Restore after the print dialog closed (some browsers fire
+      // afterprint; do it both ways to be safe).
+      document.title = prev;
+    }, 300);
+  };
+  window.addEventListener("afterprint", function () {
+    document.title = "3DCityDB-MCP";
+  });
 }
-"""
+""".replace("__PRINT_CSS__", json.dumps(_PRINT_CSS))
 
 
 def build_ui() -> gr.Blocks:
@@ -1124,6 +1337,11 @@ def build_ui() -> gr.Blocks:
         .splitter:hover::after, .splitter.active::after { background: #3b82f6; }
         body.splitting, body.splitting * { cursor: col-resize !important; user-select: none !important; }
         body.splitting iframe { pointer-events: none; }
+        /* NOTE: the @media print / PDF-export styles are injected at runtime
+           as an unscoped <style> element via _RESIZE_JS (see _PRINT_CSS above).
+           Gradio's gr.Blocks(css=...) rewrites every selector to be scoped
+           under .gradio-container .contain and drops @page rules, which would
+           break printing of elements outside that scope (footer, body::before). */
         """,
     ) as demo:
 
@@ -1247,6 +1465,7 @@ def build_ui() -> gr.Blocks:
                                     )
                                     send_btn = gr.Button("➤", variant="primary", scale=0, min_width=48, elem_id="send-btn", interactive=False)
                                     stop_btn = gr.Button("⏹", variant="stop", scale=0, min_width=48, elem_id="stop-btn", visible=False)
+                                    export_pdf_btn = gr.Button("🖨", variant="secondary", scale=0, min_width=48, elem_id="export-pdf-btn")
 
                             with gr.Column(scale=1, min_width=360):
                                 gr.HTML(
@@ -1290,6 +1509,7 @@ def build_ui() -> gr.Blocks:
                                     )
                                     send_btn = gr.Button("➤", variant="primary", scale=0, min_width=48, elem_id="send-btn", interactive=False)
                                     stop_btn = gr.Button("⏹", variant="stop", scale=0, min_width=48, elem_id="stop-btn", visible=False)
+                                    export_pdf_btn = gr.Button("🖨", variant="secondary", scale=0, min_width=48, elem_id="export-pdf-btn")
 
                             with gr.Column(scale=2, min_width=300):
                                 gr.HTML(
@@ -1448,6 +1668,14 @@ window._reloadTiles = function() {
             return gr.update(visible=False)
 
         stop_btn.click(fn=_on_stop_click, outputs=[stop_btn], queue=False)
+
+        # PDF export: pure client-side (window.print + @media print CSS).
+        # fn=None + js= means no Python round-trip is needed — same pattern
+        # as the highlight_state.change(js=...) wiring below.
+        export_pdf_btn.click(
+            fn=None, inputs=[], outputs=[], queue=False,
+            js="() => { if (window._exportPdf) window._exportPdf(); }",
+        )
 
         provider_radio.change(
             fn=on_provider_change,
