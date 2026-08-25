@@ -1332,6 +1332,95 @@ async (_win, _event_data) => {
     setTimeout(watchTracePoll, 200);
   })();
 
+  // ── Mermaid error boxes: show raw source + error message ─────────────
+  // Gradio's markdown renderer calls mermaid.run() without error handling:
+  // on invalid syntax Mermaid replaces the .mermaid node's content with an
+  // error SVG (aria-roledescription="error", "Syntax error in text" +
+  // "mermaid version X.Y.Z"). The generated source survives only in the
+  // error SVG, and the on-screen message is generic.
+  // Strategy: (1) remember each .mermaid node's raw text as soon as it is
+  // added (before mermaid.run mutates it), (2) when the error SVG appears,
+  // replace the node with a descriptive message and the raw source in
+  // <pre><code> so the user can read and copy the generated text.
+  function mermaidFallback(mermaidNode, errSvg) {
+    var source = (mermaidNode && mermaidNode.__mermaidSource != null)
+      ? mermaidNode.__mermaidSource
+      : "";
+    var wrap = document.createElement("div");
+    wrap.className = "mermaid-error-fallback";
+    var msg = document.createElement("p");
+    msg.className = "mermaid-fallback-msg";
+    // The error SVG's <text> nodes: "Syntax error in text", an optional
+    // "Parse error on line …" snippet, and "mermaid version X.Y.Z".
+    var details = "";
+    if (errSvg) {
+      var ts = errSvg.querySelectorAll ? errSvg.querySelectorAll("text") : [];
+      for (var t = 0; t < ts.length; t++) {
+        var s = (ts[t].textContent || "").trim();
+        if (!s) continue;
+        if (/^syntax error in text$/i.test(s)) continue;
+        if (/^mermaid version /i.test(s)) continue;
+        details += (details ? " — " : "") + s;
+      }
+    }
+    details = (details || "").replace(/\\s+/g, " ").trim();
+    msg.textContent = details
+      ? "⚠️ Mermaid-Syntaxfehler: " + details
+      : "⚠️ Mermaid-Syntaxfehler — das Diagramm konnte nicht gerendert werden. " +
+        "Die generierte Quelle ist unten; sie kann kopiert und korrigiert werden.";
+    var pre = document.createElement("pre");
+    var code = document.createElement("code");
+    code.textContent = source || "(Quelle nicht verfügbar)";
+    pre.appendChild(code);
+    wrap.appendChild(msg);
+    wrap.appendChild(pre);
+    if (mermaidNode && mermaidNode.parentNode) mermaidNode.replaceWith(wrap);
+  }
+  (function watchMermaidErrors() {
+    var ob = new MutationObserver(function (muts) {
+      muts.forEach(function (m) {
+        m.addedNodes.forEach(function (n) {
+          if (n.nodeType !== 1) return;
+          // mermaid.run() mutates the .mermaid node's children in place,
+          // so on later mutations the .mermaid node is an ANCESTOR of the
+          // added node — check itself, ancestors, and descendants.
+          var found = [];
+          var anc = n;
+          while (anc && anc.nodeType === 1) {
+            if (anc.classList && anc.classList.contains("mermaid")) found.push(anc);
+            anc = anc.parentElement;
+          }
+          if (n.querySelectorAll) {
+            var desc = n.querySelectorAll(".mermaid");
+            for (var j = 0; j < desc.length; j++) found.push(desc[j]);
+          }
+          for (var i = 0; i < found.length; i++) {
+            var node = found[i];
+            if (node.__mermaidFallbackDone) continue;
+            if (node.__mermaidSource == null && !node.querySelector("svg")) {
+              node.__mermaidSource = (node.textContent || "").trim();
+            }
+            // Mermaid 11 marks the error svg via aria-roledescription, but it
+            // sets that attribute AFTER the childList mutations — so detect the
+            // error through its childList-visible children instead. The
+            // message is in the .error-text <text> elements; wait for those
+            // before replacing (an .error-icon alone only arms the detection,
+            // the texts arrive in a later mutation batch).
+            var errText = node.querySelector(".error-text");
+            var errAttr = node.querySelector('svg[aria-roledescription="error"]');
+            if (errText || errAttr) {
+              node.__mermaidFallbackDone = true;
+              var mark = errText || errAttr;
+              var errSvg = mark.closest ? mark.closest("svg") : (mark.ownerSVGElement || mark);
+              mermaidFallback(node, errSvg);
+            }
+          }
+        });
+      });
+    });
+    ob.observe(document.body, { childList: true, subtree: true });
+  })();
+
   // window.print() renders whatever is already in the DOM — Gradio's
   // markdown renderer (KaTeX for $$…$$, mermaid for ```mermaid``` blocks)
   // has produced the final HTML/SVG, so the print CSS (see _PRINT_CSS above)
@@ -1451,6 +1540,14 @@ def build_ui() -> gr.Blocks:
         .splitter:hover::after, .splitter.active::after { background: #3b82f6; }
         body.splitting, body.splitting * { cursor: col-resize !important; user-select: none !important; }
         body.splitting iframe { pointer-events: none; }
+        /* ── Mermaid error fallback (injected by _RESIZE_JS) ────────── */
+        .mermaid-error-fallback { border: 1px solid #fca5a5; background: #fef2f2; border-radius: 6px; padding: 10px 12px; margin: 10px 0; }
+        .mermaid-error-fallback .mermaid-fallback-msg { margin: 0 0 8px 0; font-size: 0.85rem; font-weight: 600; color: #b91c1c; }
+        .mermaid-error-fallback pre { margin: 0; white-space: pre-wrap; word-break: break-word; background: #fff; border: 1px solid #fecaca; border-radius: 4px; padding: 8px; font-size: 0.8rem; }
+        .dark .mermaid-error-fallback { background: #450a0a; border-color: #7f1d1d; }
+        .dark .mermaid-error-fallback .mermaid-fallback-msg { color: #fca5a5; }
+        .dark .mermaid-error-fallback pre { background: #1e293b; border-color: #7f1d1d; color: #e2e8f0; }
+
         /* NOTE: the @media print / PDF-export styles are injected at runtime
            as an unscoped <style> element via _RESIZE_JS (see _PRINT_CSS above).
            Gradio's gr.Blocks(css=...) rewrites every selector to be scoped
