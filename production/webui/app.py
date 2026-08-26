@@ -1338,10 +1338,41 @@ async (_win, _event_data) => {
   // error SVG (aria-roledescription="error", "Syntax error in text" +
   // "mermaid version X.Y.Z"). The generated source survives only in the
   // error SVG, and the on-screen message is generic.
-  // Strategy: (1) remember each .mermaid node's raw text as soon as it is
-  // added (before mermaid.run mutates it), (2) when the error SVG appears,
-  // replace the node with a descriptive message and the raw source in
-  // <pre><code> so the user can read and copy the generated text.
+  // Strategy: (1) as soon as a .mermaid node is added, recover its COMPLETE
+  // source — the HTML parser corrupts stereotypes like "<<abstract>>" before
+  // mermaid sees them — and remember it (before mermaid.run mutates the node),
+  // (2) when the error SVG appears, replace the node with a descriptive
+  // message and the raw source in <pre><code> so the user can read and copy it.
+  //
+  // Recover the exact mermaid source for a .mermaid node from the message
+  // bubble's aria-label. Gradio's markdown renderer injects the fenced source
+  // UNESCAPED into <div class="mermaid">, so a classDiagram stereotype such as
+  // "<<abstract>>" is parsed by the HTML parser as a bogus <abstract> element
+  // and the COMPLETE source never reaches the DOM node — mermaid then renders
+  // (or errors on) the corrupted fragment. But the bubble element carries the
+  // RAW message markdown in its aria-label ("bot's message: ```mermaid …```"),
+  // uncorrupted. We extract the matching fenced block, keyed by the node's
+  // position among the bubble's .mermaid nodes, and return it (or null if the
+  // node has no labelled bubble, e.g. inside the agent-trace panel).
+  function mermaidSourceFromLabel(node) {
+    var el = node;
+    while (el && el !== document.body) {
+      var label = el.getAttribute ? el.getAttribute("aria-label") : null;
+      if (label && /'s message:/.test(label)) {
+        var fences = [];
+        var re = /```mermaid\\s*\\n([\\s\\S]*?)```/g;
+        var m;
+        while ((m = re.exec(label)) !== null) fences.push(m[1].trim());
+        if (!fences.length) return null;
+        var all = el.querySelectorAll ? el.querySelectorAll(".mermaid") : [];
+        var idx = 0;
+        for (var k = 0; k < all.length; k++) { if (all[k] === node) { idx = k; break; } }
+        return fences[idx] != null ? fences[idx] : fences[0];
+      }
+      el = el.parentElement;
+    }
+    return null;
+  }
   function mermaidFallback(mermaidNode, errSvg) {
     var source = (mermaidNode && mermaidNode.__mermaidSource != null)
       ? mermaidNode.__mermaidSource
@@ -1397,8 +1428,40 @@ async (_win, _event_data) => {
           for (var i = 0; i < found.length; i++) {
             var node = found[i];
             if (node.__mermaidFallbackDone) continue;
-            if (node.__mermaidSource == null && !node.querySelector("svg")) {
-              node.__mermaidSource = (node.textContent || "").trim();
+            // Capture the raw source on the node's first appearance, before
+            // mermaid.run() mutates it. The canonical source comes from the
+            // message bubble's aria-label (see mermaidSourceFromLabel); the
+            // DOM text is only a fallback because the HTML parser corrupts
+            // any "<<stereotype>>" before mermaid ever sees the node.
+            if (!node.__mermaidSource &&
+                !node.querySelector("svg, [id^='dmermaid'], .error-text")) {
+              var full = mermaidSourceFromLabel(node);
+              if (full != null) {
+                // Overwrite the corrupted text synchronously so that the
+                // upcoming mermaid.run() (a later microtask/rAF) reads the
+                // complete source and renders the real diagram.
+                node.textContent = full;
+                node.__mermaidSource = full.trim();
+              } else {
+                // No labelled bubble (agent-trace): best effort — unwrap the
+                // bogus "<<stereotype>>" tags the parser created. Each bogus
+                // element stands in for a literal "<name>" token; replace it
+                // with that text and hoist its (text) children back into
+                // place. Uppercase in the stereotype is unrecoverable (the
+                // parser lowercases it).
+                var bogus = node.querySelectorAll ? node.querySelectorAll("*") : [];
+                for (var b = bogus.length - 1; b >= 0; b--) {
+                  var el = bogus[b];
+                  var p = el.parentNode;
+                  p.insertBefore(
+                    document.createTextNode("<" + el.tagName.toLowerCase() + ">"),
+                    el
+                  );
+                  while (el.firstChild) p.insertBefore(el.firstChild, el);
+                  el.remove();
+                }
+                node.__mermaidSource = (node.textContent || "").trim();
+              }
             }
             // Keep mermaid as plain text in the "Agent activity" trace panel
             // (same rationale as the KaTeX demotion above): once mermaid has
