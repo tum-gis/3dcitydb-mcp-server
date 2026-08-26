@@ -1400,6 +1400,22 @@ async (_win, _event_data) => {
             if (node.__mermaidSource == null && !node.querySelector("svg")) {
               node.__mermaidSource = (node.textContent || "").trim();
             }
+            // Keep mermaid as plain text in the "Agent activity" trace panel
+            // (same rationale as the KaTeX demotion above): once mermaid has
+            // started rendering (an svg, dmermaid wrapper, or error marker is
+            // present), swap the whole node for its captured source in a
+            // <pre>. The chatbot messages keep the rendered diagram.
+            if (node.closest && node.closest("#agent-trace") &&
+                node.querySelector("svg, [id^='dmermaid'], .error-text")) {
+              node.__mermaidFallbackDone = true;
+              var pre = document.createElement("pre");
+              var code = document.createElement("code");
+              code.textContent = (node.__mermaidSource != null)
+                ? node.__mermaidSource : "(source not available)";
+              pre.appendChild(code);
+              if (node.parentNode) node.replaceWith(pre);
+              continue;
+            }
             // Mermaid 11 marks the error svg via aria-roledescription, but it
             // sets that attribute AFTER the childList mutations — so detect the
             // error through its childList-visible children instead. The
