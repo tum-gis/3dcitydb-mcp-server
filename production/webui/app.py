@@ -1373,6 +1373,23 @@ async (_win, _event_data) => {
     }
     return null;
   }
+  // mermaid 11.x's run() pipeline (the path Gradio uses to render ```mermaid```
+  // blocks) reads the node's innerHTML, entity-decodes it, then runs it through
+  // ts-dedent, which strips the MINIMUM common leading indent. For a
+  // classDiagram whose body lines are all indented >= 4 (the usual case), that
+  // strips 4 spaces from every line, pushing a struct's closing brace to column
+  // 0. mermaid 11's class lexer rejects an EMPTY struct whose closing } sits at
+  // column 0 ("Expecting 'MEMBER', got 'STRUCT_STOP'"), so an otherwise-valid
+  // diagram — one that parses fine via parse()/render() and renders on external
+  // mermaid sites — fails ONLY through run(). Prepending a column-0 "%%" line
+  // forces ts-dedent's min-indent to 0 (the %% line itself sits at column 0),
+  // making the transform a no-op so run() sees the original indentation. "%%" is
+  // a valid, inert comment in class diagrams only, so gate on that type.
+  function neutralizeDedent(src) {
+    var t = (src == null) ? "" : String(src);
+    if (/^\\s*classDiagram\\b/i.test(t)) return "%%\\n" + t;
+    return t;
+  }
   function mermaidFallback(mermaidNode, errSvg) {
     var source = (mermaidNode && mermaidNode.__mermaidSource != null)
       ? mermaidNode.__mermaidSource
@@ -1440,7 +1457,10 @@ async (_win, _event_data) => {
                 // Overwrite the corrupted text synchronously so that the
                 // upcoming mermaid.run() (a later microtask/rAF) reads the
                 // complete source and renders the real diagram.
-                node.textContent = full;
+                // neutralizeDedent() prepends a column-0 "%%" anchor to
+                // classDiagram sources so run()'s ts-dedent step becomes a
+                // no-op (see that helper for the full rationale).
+                node.textContent = neutralizeDedent(full);
                 node.__mermaidSource = full.trim();
               } else {
                 // No labelled bubble (agent-trace): best effort — unwrap the
@@ -1461,6 +1481,8 @@ async (_win, _event_data) => {
                   el.remove();
                 }
                 node.__mermaidSource = (node.textContent || "").trim();
+                // Same classDiagram dedent guard as the labelled path above.
+                node.textContent = neutralizeDedent(node.__mermaidSource);
               }
             }
             // Keep mermaid as plain text in the "Agent activity" trace panel
