@@ -927,6 +927,7 @@ _PRINT_CSS = """
   .message-buttons,
   .message-buttons-left,
   .message-buttons-right,
+  .mermaid-toolbar,
   /* chatbot block corner UI: floating "Chatbot" label + icon buttons (trash) */
   .wrapper:has([aria-label="chatbot conversation"]) > label,
   .wrapper:has([aria-label="chatbot conversation"]) > .icon-button-wrapper,
@@ -1424,6 +1425,171 @@ async (_win, _event_data) => {
     wrap.appendChild(pre);
     if (mermaidNode && mermaidNode.parentNode) mermaidNode.replaceWith(wrap);
   }
+  // ── Mermaid copy toolbar: [⧉ SVG] [🖼 PNG] [</> Code] above every diagram ──
+  // [⧉ SVG]  → serializes the rendered <svg> (with xmlns) and writes it to the
+  //            clipboard as image/svg+xml + text/plain, so it can be pasted
+  //            into PowerPoint / other programs as a vector graphic.
+  //            Hidden on browsers without SVG clipboard support (Firefox).
+  // [🖼 PNG]  → rasterizes the SVG to a 2x PNG (white bg) + text/plain; works
+  //            everywhere, including Firefox.
+  // [</> Code] → copies the raw mermaid text (node.__mermaidSource, captured
+  //            before mermaid mutated the node — without the dedent "%%" prefix)
+  //            for pasting into an editor or an external mermaid renderer.
+  // [🖼 PNG] → rasterized PNG copy (2x), works on ALL browsers incl. Firefox.
+  // On browsers without image/svg+xml clipboard support (Firefox, all
+  // versions) the SVG button is hidden entirely — the PNG button covers it.
+  function svgClipboardSupported() {
+    return !!(window.ClipboardItem && ClipboardItem.supports &&
+              ClipboardItem.supports("image/svg+xml"));
+  }
+  function mermaidCopyButtons(node) {
+    var svg = node.querySelector("svg:not([aria-roledescription='error'])");
+    if (!svg || node.querySelector(".mermaid-toolbar")) return;
+    var bar = document.createElement("div");
+    bar.className = "mermaid-toolbar";
+    function mkBtn(label, title, kind) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "mermaid-tool-btn";
+      b.textContent = label;
+      b.title = title;
+      b.setAttribute("data-mermaid-copy", kind);
+      bar.appendChild(b);
+      return b;
+    }
+    var svgBtn = mkBtn("⧉ SVG",
+      "Copy the rendered diagram as an SVG vector graphic to the clipboard. " +
+      "Paste it into PowerPoint, Word, draw.io, Inkscape, Figma, etc. — it stays " +
+      "sharp at any zoom level and text remains editable where supported.",
+      "svg");
+    mkBtn("🖼 PNG",
+      "Copy the rendered diagram as a rasterized PNG image (2× resolution, white " +
+      "background) to the clipboard. Paste it anywhere an image can be pasted — " +
+      "email, chat, slides, documents. Works in every browser, including Firefox.",
+      "png");
+    mkBtn("</> Code",
+      "Copy the original Mermaid source text (unrendered) to the clipboard. " +
+      "Paste it into an editor, share it, or render it with any Mermaid tool " +
+      "(mermaid.live, GitHub, Obsidian, ...).",
+      "code");
+    if (!svgClipboardSupported()) svgBtn.style.display = "none";
+    svg.parentNode.insertBefore(bar, svg);
+  }
+  // Click handling is done via ONE delegated listener on document, not per
+  // button: Gradio re-renders the chat message on each streaming chunk and
+  // Svelte can swap the button's inner DOM nodes, which drops any listener
+  // attached directly to a button. A document-level listener survives all of
+  // that and resolves the LIVE .mermaid node / SVG at click time.
+  (function mermaidCopyDelegate() {
+    if (document.__mermaidCopyDelegate) return;
+    document.__mermaidCopyDelegate = true;
+    function flash(btn, ok) {
+      if (!btn) return;
+      var old = btn.textContent;
+      btn.textContent = ok ? "✓" : "✗";
+      setTimeout(function () { btn.textContent = old; }, 1200);
+    }
+    // Rasterize the SVG to a 2x PNG blob and write it to the clipboard.
+    // Needed because Firefox (all versions) does NOT support image/svg+xml
+    // clipboard items — the whole clipboard.write() promise rejects and the
+    // clipboard is left unchanged. Chrome/Edge/Opera accept SVG natively.
+    function writePngToClipboard(svg, text) {
+      var vb = (svg.getAttribute("viewBox") || "").trim().split(/\s+/).map(Number);
+      var vw = (vb.length === 4 && vb[2] > 0) ? vb[2] : svg.clientWidth;
+      var vh = (vb.length === 4 && vb[3] > 0) ? vb[3] : svg.clientHeight;
+      if (!vw || !vh) return Promise.reject(new Error("Cannot determine SVG size"));
+      var scale = 2;
+      var c = document.createElement("canvas");
+      c.width = Math.round(vw * scale);
+      c.height = Math.round(vh * scale);
+      var ctx = c.getContext("2d");
+      var img = new Image();
+      return new Promise(function (resolve, reject) {
+        img.onload = function () {
+          ctx.fillStyle = "#ffffff";
+          ctx.fillRect(0, 0, c.width, c.height);
+          ctx.drawImage(img, 0, 0, c.width, c.height);
+          c.toBlob(function (blob) {
+            if (!blob) return reject(new Error("PNG rasterization failed"));
+            navigator.clipboard.write([
+              new ClipboardItem({
+                "image/png":    blob,
+                "text/plain":   new Blob([text], { type: "text/plain" })
+              })
+            ]).then(resolve, reject);
+          }, "image/png");
+        };
+        img.onerror = function () { reject(new Error("SVG rasterization failed")); };
+        img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(text);
+      });
+    }
+    function copySvg(mNode) {
+      var svg = mNode.querySelector("svg:not([aria-roledescription='error'])");
+      if (!svg) return null;
+      var clone = svg.cloneNode(true);
+      clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+      var text = new XMLSerializer().serializeToString(clone);
+      // Very old browsers without async clipboard.write(): best-effort text.
+      if (!navigator.clipboard || !navigator.clipboard.write) {
+        return navigator.clipboard
+          ? navigator.clipboard.writeText(text)
+          : null;
+      }
+      var svgWrite = navigator.clipboard.write([
+        new ClipboardItem({
+          "image/svg+xml": new Blob([text], { type: "image/svg+xml" }),
+          "text/plain":    new Blob([text], { type: "text/plain" })
+        })
+      ]);
+      if (!window.ClipboardItem || !ClipboardItem.supports) {
+        // No supports() probe (older Chrome): try SVG, fall back to PNG if
+        // the write is rejected.
+        return svgWrite.catch(function (err) {
+          try { return writePngToClipboard(svg, text); } catch (e) { throw err; }
+        });
+      }
+      if (!ClipboardItem.supports("image/svg+xml")) {
+        return writePngToClipboard(svg, text); // safety net; button is hidden
+      }
+      return svgWrite;
+    }
+    function copyPng(mNode) {
+      var svg = mNode.querySelector("svg:not([aria-roledescription='error'])");
+      if (!svg) return null;
+      var clone = svg.cloneNode(true);
+      clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+      var text = new XMLSerializer().serializeToString(clone);
+      return writePngToClipboard(svg, text);
+    }
+    document.addEventListener("click", function (e) {
+      var btn = e.target && e.target.closest ? e.target.closest(".mermaid-tool-btn") : null;
+      if (!btn) return;
+      var bar = btn.closest(".mermaid-toolbar");
+      if (!bar) return;
+      // The toolbar div is always a direct child of the .mermaid node, but
+      // resolve defensively in case Gradio ever wraps it.
+      var mNode = bar.closest(".mermaid") || bar.parentElement;
+      if (!mNode) return;
+      e.preventDefault();
+      e.stopPropagation();
+      var kind = btn.getAttribute("data-mermaid-copy");
+      var p;
+      try {
+        p = kind === "code"
+          ? navigator.clipboard.writeText(
+              mNode.__mermaidSource != null ? mNode.__mermaidSource : "")
+          : kind === "png"
+            ? copyPng(mNode)
+            : copySvg(mNode);
+      } catch (err) { flash(btn, false); return; }
+      if (p && p.then) {
+        p.then(function () { flash(btn, true); },
+               function () { flash(btn, false); });
+      } else {
+        flash(btn, true);
+      }
+    }, false);
+  })();
   (function watchMermaidErrors() {
     var ob = new MutationObserver(function (muts) {
       muts.forEach(function (m) {
@@ -1514,6 +1680,18 @@ async (_win, _event_data) => {
               var mark = errText || errAttr;
               var errSvg = mark.closest ? mark.closest("svg") : (mark.ownerSVGElement || mark);
               mermaidFallback(node, errSvg);
+            }
+            // Success path: rendering finished with a real <svg> → attach the
+            // copy toolbar right above it. Skip error nodes (detected through
+            // their childList-visible markers, see above), the agent-trace
+            // panel (kept as raw text), and double-insertion.
+            if (!node.__mermaidButtonsDone &&
+                !node.querySelector(".error-text, .error-icon, svg[aria-roledescription='error']") &&
+                node.querySelector("svg") &&
+                !node.querySelector(".mermaid-toolbar") &&
+                !(node.closest && node.closest("#agent-trace"))) {
+              node.__mermaidButtonsDone = true;
+              mermaidCopyButtons(node);
             }
           }
         });
@@ -1648,6 +1826,17 @@ def build_ui() -> gr.Blocks:
         .dark .mermaid-error-fallback { background: #450a0a; border-color: #7f1d1d; }
         .dark .mermaid-error-fallback .mermaid-fallback-msg { color: #fca5a5; }
         .dark .mermaid-error-fallback pre { background: #1e293b; border-color: #7f1d1d; color: #e2e8f0; }
+
+        /* ── Mermaid copy toolbar (inserted by _RESIZE_JS) ─────────── */
+        .mermaid-toolbar { display: flex; justify-content: flex-end; gap: 4px; margin: 0 0 4px 0; }
+        .mermaid-tool-btn {
+            border: 1px solid #cbd5e1; background: #f8fafc; color: #475569;
+            border-radius: 4px; font-size: 0.72rem; line-height: 1;
+            padding: 3px 8px; cursor: pointer;
+        }
+        .mermaid-tool-btn:hover { background: #e2e8f0; border-color: #94a3b8; }
+        .dark .mermaid-tool-btn { background: #1e293b; color: #cbd5e1; border-color: #334155; }
+        .dark .mermaid-tool-btn:hover { background: #334155; }
 
         /* NOTE: the @media print / PDF-export styles are injected at runtime
            as an unscoped <style> element via _RESIZE_JS (see _PRINT_CSS above).
