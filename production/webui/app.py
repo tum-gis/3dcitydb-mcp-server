@@ -338,6 +338,13 @@ def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 
+def _esc_angle(text: str) -> str:
+    """Escape < and > so raw HTML from the model's reasoning (e.g. mermaid
+    <<abstract>> stereotypes, --|> arrows) is rendered as literal text by
+    gr.Markdown instead of being parsed as (malformed) HTML tags."""
+    return text.replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _build_reasoning_transcript(events: list) -> str:
     """Reconstruct a compact thought/action/observation transcript from the
     raw event stream (Ollama only — relies on local.py's thinking_token
@@ -549,7 +556,9 @@ def chat_stream(
         if _thinking_stream_idx is None:
             trace_lines.append(f"`{_ts()}` 🧠 **Reasoning (live):**\n\n")
             _thinking_stream_idx = len(trace_lines) - 1
-        trace_lines[_thinking_stream_idx] += token.replace("\n", "  \n")
+        # Escape < / > so raw mermaid (<<abstract>>, --|>) in the streamed
+        # reasoning is shown as literal text, not parsed as bogus HTML.
+        trace_lines[_thinking_stream_idx] += _esc_angle(token).replace("\n", "  \n")
         return "\n\n".join(trace_lines)
 
     trace_md = log(f"**User query:** {user_message[:200]}")
@@ -617,7 +626,9 @@ def chat_stream(
 
             elif event == "thinking":
                 got_content = True
-                trace_md = log(f"🧠 **Model reasoning:**\n\n> {data.strip()}")
+                # Escape < / > (mermaid <<stereotypes>>, --|> arrows) so the
+                # raw reasoning is displayed as literal text.
+                trace_md = log(f"🧠 **Model reasoning:**\n\n> {_esc_angle(data.strip())}")
                 yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
 
             elif event == "thinking_token":
