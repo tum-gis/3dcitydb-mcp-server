@@ -1500,10 +1500,49 @@ async (_win, _event_data) => {
       btn.textContent = ok ? "✓" : "✗";
       setTimeout(function () { btn.textContent = old; }, 1200);
     }
+    // Serialize the diagram as a SELF-CONTAINED standalone SVG.
+    // Critical: mermaid keeps ALL diagram styling (fonts, node/edge classes,
+    // marker colors) in a separate <style> tag in the document — selectors are
+    // prefixed with the svg's id — NOT inside the <svg> element itself. A
+    // plain cloneNode() export therefore loses every style: text falls back
+    // to serif, edges/misdrawn splines, illegible labels. So we:
+    //   1. clone the svg,
+    //   2. pin explicit pixel width/height from the viewBox (the live svg
+    //      uses width="100%"),
+    //   3. embed the matching document <style> block inside the clone.
+    function serializeStandaloneSvg(svg) {
+      var vb = (svg.getAttribute("viewBox") || "").trim().split(/\s+/).map(Number);
+      var clone = svg.cloneNode(true);
+      clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+      if (vb.length === 4 && vb[2] > 0 && vb[3] > 0) {
+        clone.setAttribute("width", String(vb[2]));
+        clone.setAttribute("height", String(vb[3]));
+      }
+      var id = svg.id;
+      if (id) {
+        var styleEl = null;
+        var allStyles = document.querySelectorAll("style");
+        for (var i = 0; i < allStyles.length; i++) {
+          if (allStyles[i].textContent.indexOf("#" + id) !== -1) {
+            styleEl = allStyles[i];
+            break;
+          }
+        }
+        if (styleEl) {
+          var st = document.createElementNS("http://www.w3.org/2000/svg", "style");
+          st.textContent = styleEl.textContent;
+          clone.insertBefore(st, clone.firstChild);
+        }
+      }
+      return new XMLSerializer().serializeToString(clone);
+    }
     // Rasterize the SVG to a 2x PNG blob and write it to the clipboard.
     // Needed because Firefox (all versions) does NOT support image/svg+xml
     // clipboard items — the whole clipboard.write() promise rejects and the
     // clipboard is left unchanged. Chrome/Edge/Opera accept SVG natively.
+    // `text` must be the SELF-CONTAINED serialization from
+    // serializeStandaloneSvg() (styles embedded) or the image loses all
+    // mermaid styling.
     function writePngToClipboard(svg, text) {
       var vb = (svg.getAttribute("viewBox") || "").trim().split(/\s+/).map(Number);
       var vw = (vb.length === 4 && vb[2] > 0) ? vb[2] : svg.clientWidth;
@@ -1537,9 +1576,7 @@ async (_win, _event_data) => {
     function copySvg(mNode) {
       var svg = mNode.querySelector("svg:not([aria-roledescription='error'])");
       if (!svg) return null;
-      var clone = svg.cloneNode(true);
-      clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
-      var text = new XMLSerializer().serializeToString(clone);
+      var text = serializeStandaloneSvg(svg);
       // Very old browsers without async clipboard.write(): best-effort text.
       if (!navigator.clipboard || !navigator.clipboard.write) {
         return navigator.clipboard
@@ -1567,9 +1604,7 @@ async (_win, _event_data) => {
     function copyPng(mNode) {
       var svg = mNode.querySelector("svg:not([aria-roledescription='error'])");
       if (!svg) return null;
-      var clone = svg.cloneNode(true);
-      clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
-      var text = new XMLSerializer().serializeToString(clone);
+      var text = serializeStandaloneSvg(svg);
       return writePngToClipboard(svg, text);
     }
     document.addEventListener("click", function (e) {
