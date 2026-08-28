@@ -1402,6 +1402,52 @@ async (_win, _event_data) => {
     if (/^\\s*classDiagram\\b/i.test(t)) return "%%\\n" + t;
     return t;
   }
+  // Concrete parse error for a source string: import the SAME mermaid module
+  // Gradio's Vite build serves (assets/mermaid.core-<hash>.js, already cached
+  // in the browser's module registry) and call mermaid.parse() — it rejects
+  // with the Jison message, e.g.
+  //   "Parse error on line 4: … Expecting 'STRUCT_STOP', 'MEMBER', …"
+  // (Gradio's renderer calls mermaid.run() WITHOUT a catch, so that rejection
+  // message is lost; the rendered error SVG only says "Syntax error in text").
+  // The hashed module URL is read from the Performance Resource Timing API —
+  // Gradio loads mermaid as an ESM import, so no <script> tag exposes it.
+  function mermaidParseError(source) {
+    return new Promise(function (resolve) {
+      var done = false;
+      function finish(d) { if (!done) { done = true; resolve(d); } }
+      try {
+        var s = String(source || "");
+        if (!s.trim()) return finish("");
+        // Drop the column-0 "%%" line neutralizeDedent() may have prepended —
+        // it is an inert comment and not part of the generated source.
+        s = s.replace(/^%%[^\\n]*\\n/, "");
+        var src = null;
+        var entries = performance.getEntriesByType("resource");
+        for (var i = 0; i < entries.length; i++) {
+          if (entries[i].name.indexOf("mermaid.core") !== -1) {
+            src = entries[i].name;
+            break;
+          }
+        }
+        if (!src) return finish("");
+        import(src).then(function (mod) {
+          for (var k in mod) {
+            var v = mod[k];
+            if (v && v.default && typeof v.default.parse === "function") {
+              var api = v.default;
+              api.parse(s)
+                .then(function () { finish(""); })
+                .catch(function (e) {
+                  finish(String((e && e.message) || e || "").trim());
+                });
+              return;
+            }
+          }
+          finish("");
+        }).catch(function () { finish(""); });
+      } catch (e) { finish(""); }
+    });
+  }
   function mermaidFallback(mermaidNode, errSvg) {
     var source = (mermaidNode && mermaidNode.__mermaidSource != null)
       ? mermaidNode.__mermaidSource
@@ -1410,31 +1456,42 @@ async (_win, _event_data) => {
     wrap.className = "mermaid-error-fallback";
     var msg = document.createElement("p");
     msg.className = "mermaid-fallback-msg";
-    // The error SVG's <text> nodes: "Syntax error in text", an optional
-    // "Parse error on line …" snippet, and "mermaid version X.Y.Z".
-    var details = "";
-    if (errSvg) {
-      var ts = errSvg.querySelectorAll ? errSvg.querySelectorAll("text") : [];
-      for (var t = 0; t < ts.length; t++) {
-        var s = (ts[t].textContent || "").trim();
+    // Backup: read the error SVG's <text> nodes ("Syntax error in text"
+    // header and "mermaid version X.Y.Z" are skipped — mermaid 11 does not
+    // embed the parse error in the SVG, but keep this for other versions).
+    function readErrDetails(svg) {
+      var d = "";
+      if (!svg || !svg.querySelectorAll) return d;
+      var ts = svg.querySelectorAll("text");
+      for (var i = 0; i < ts.length; i++) {
+        var s = (ts[i].textContent || "").trim();
         if (!s) continue;
         if (/^syntax error in text$/i.test(s)) continue;
         if (/^mermaid version /i.test(s)) continue;
-        details += (details ? " — " : "") + s;
+        d += (d ? " — " : "") + s;
       }
+      return d.replace(/\\s+/g, " ").trim();
     }
-    details = (details || "").replace(/\\s+/g, " ").trim();
-    msg.textContent = details
-      ? "⚠️ Mermaid-Syntaxfehler: " + details
-      : "⚠️ Mermaid-Syntaxfehler — das Diagramm konnte nicht gerendert werden. " +
-        "Die generierte Quelle ist unten; sie kann kopiert und korrigiert werden.";
+    var GENERIC = "⚠️ Mermaid syntax error — the diagram could not be rendered. " +
+      "The generated source is shown below; copy and fix it.";
+    msg.textContent = GENERIC;
     var pre = document.createElement("pre");
     var code = document.createElement("code");
-    code.textContent = source || "(Quelle nicht verfügbar)";
+    code.textContent = source || "(source not available)";
     pre.appendChild(code);
     wrap.appendChild(msg);
     wrap.appendChild(pre);
     if (mermaidNode && mermaidNode.parentNode) mermaidNode.replaceWith(wrap);
+    // Upgrade the generic message with the concrete parse error (async — the
+    // mermaid module is fetched by the browser, parse() rejects with the
+    // Jison message). Falls back to the generic message if anything fails.
+    var d = readErrDetails(errSvg);
+    if (d) msg.textContent = "⚠️ Mermaid syntax error: " + d;
+    mermaidParseError(source).then(function (detail) {
+      if (detail && wrap.isConnected) {
+        msg.textContent = "⚠️ Mermaid syntax error: " + detail;
+      }
+    });
   }
   // ── Mermaid copy toolbar: [⧉ SVG] [🖼 PNG] [</> Code] above every diagram ──
   // [⧉ SVG]  → serializes the rendered <svg> (with xmlns) and writes it to the
