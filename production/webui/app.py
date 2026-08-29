@@ -52,7 +52,7 @@ _LOCAL_PROVIDERS = ("ollama",)
 
 _CTX_OPTIONS = ["8K (8,192)", "32K (32,768)",  "64K (65,536)","128K (131,072)", "256K (262,144)"]
 _CTX_VALUES = {"8K (8,192)": 8192, "32K (32,768)": 32768, "64K (65,536)": 65536, "128K (131,072)": 131072, "256K (262,144)": 262144}
-_CTX_DEFAULT = "32K (32,768)"
+_CTX_DEFAULT = "64K (65,536)"
 
 VARIANT = os.environ.get("CITYDB_MCP_VARIANT", "byod")
 ENABLE_VIZ = os.environ.get("ENABLE_VIZ", "false").lower() == "true"
@@ -2019,7 +2019,7 @@ def build_ui() -> gr.Blocks:
                 )
                 reasoning_replay_checkbox = gr.Checkbox(
                     label="Include all reasoning steps in context (Ollama)",
-                    value=False,
+                    value=True,
                     visible=initial_is_ollama,
                     info="Feeds each turn's full Thought/Action/Observation trace back into "
                          "context on later turns. Increases token usage significantly.",
