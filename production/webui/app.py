@@ -383,18 +383,11 @@ def _summarize_reasoning_ollama(transcript: str, model: str, num_ctx: int | None
     if not transcript.strip():
         return "", "no reasoning transcript to summarize"
 
-    # NOTE: went through two failed attempts via langchain_ollama's ChatOllama
-    # before landing here — the installed version (0.2.0) has no "think" field
-    # at all (confirmed via model_fields), and the /no_think prompt
-    # soft-switch didn't stop this model from spending its whole num_predict
-    # budget on hidden reasoning either (469 chunks, done_reason=length, zero
-    # visible .content both times). Calling Ollama's /api/chat directly with
-    # a top-level "think": false is the one place this is guaranteed to reach
-    # the actual server option, independent of the LangChain wrapper version.
-    import json as _json
-    import urllib.request as _urllib
+    # langchain-ollama >= 0.3 maps `reasoning=False` to Ollama's top-level
+    # "think": false, so the previous raw-urllib workaround (added because
+    # 0.2.0 had no think/reasoning field at all) is no longer needed.
+    from langchain_ollama import ChatOllama
 
-    base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
     prompt = (
         "Below is your own reasoning trace from answering a database question, "
         "including any failed attempts and corrections:\n\n"
@@ -405,31 +398,20 @@ def _summarize_reasoning_ollama(transcript: str, model: str, num_ctx: int | None
         "do not restate the question or the final answer. "
         "If there is nothing generalizable, reply with exactly: (nothing to note)"
     )
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-        "think": False,
-        "options": {
-            "temperature": 0.0,
-            "num_predict": 500,
-            "num_ctx": num_ctx or 32768,
-        },
-    }
     try:
-        req = _urllib.Request(
-            f"{base_url}/api/chat",
-            data=_json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        llm = ChatOllama(
+            model=model,
+            base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
+            temperature=0.0,
+            timeout=float(os.environ.get("OLLAMA_TIMEOUT", "300")),
+            num_predict=500,
+            reasoning=False,
+            model_kwargs={"num_ctx": num_ctx or 32768},
         )
-        timeout = float(os.environ.get("OLLAMA_TIMEOUT", "300"))
-        with _urllib.urlopen(req, timeout=timeout) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-        text = (data.get("message", {}).get("content") or "").strip()
+        result = llm.invoke([{"role": "user", "content": prompt}])
+        text = (result.content or "").strip()
         if not text:
-            done_reason = data.get("done_reason", "unknown")
-            return "", f"model returned an empty response (done_reason={done_reason})"
+            return "", "model returned an empty response"
         if text.lower().startswith("(nothing"):
             return "", "model reported nothing generalizable to note"
         return text, ""
@@ -444,7 +426,7 @@ def chat_stream(
     provider: str,
     model: str,
     temperature: float,
-    enable_thinking: bool,
+    enable_thinking: bool | str,
     prompt_mode: str,
     num_ctx_label: str,
     log_history: list | None = None,
@@ -470,6 +452,11 @@ def chat_stream(
 
     # Resolve num_ctx (only meaningful for local providers)
     num_ctx = _CTX_VALUES.get(num_ctx_label, 32768) if provider in _LOCAL_PROVIDERS else None
+
+    # UI sends "off"|"low"|"medium"|"high"|"max" from the thinking dropdown;
+    # backends expect False (disabled) or the level string (enabled).
+    if enable_thinking in ("off", ""):
+        enable_thinking = False
 
     _clear_stop()
 
@@ -1999,10 +1986,13 @@ def build_ui() -> gr.Blocks:
                     minimum=0.0, maximum=1.0, step=0.05,
                     value=0.1, label="Temperature",
                 )
-                thinking_toggle = gr.Checkbox(
-                    label="Enable thinking",
-                    value=False,
-                    info="Enable for thinking-capable Ollama models (e.g. Qwen3). Slower but more thorough. Has no effect on OpenAI models.",
+                thinking_dropdown = gr.Dropdown(
+                    choices=["off", "low", "medium", "high", "max"],
+                    value="off",
+                    label="Thinking",
+                    info="Thinking level for thinking-capable Ollama models (e.g. Qwen3): "
+                         "off / low / medium / high / max. Slower but more thorough. "
+                         "Has no effect on OpenAI models.",
                 )
                 prompt_mode_radio = gr.Radio(
                     choices=["auto", "compact", "full"],
@@ -2265,7 +2255,7 @@ window._reloadTiles = function() {
 
         send_inputs = [
             msg_input, history_state, provider_radio, model_dropdown,
-            temperature_slider, thinking_toggle, prompt_mode_radio, num_ctx_dropdown,
+            temperature_slider, thinking_dropdown, prompt_mode_radio, num_ctx_dropdown,
             log_history_state, tool_cache_state,
             reasoning_replay_checkbox, lessons_checkbox, reasoning_state, lessons_state,
         ]

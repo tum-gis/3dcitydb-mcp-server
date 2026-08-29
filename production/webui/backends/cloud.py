@@ -31,7 +31,7 @@ def native_tool_stream(
     messages: list[dict],
     tool_executor: Callable[[str], str],
     *,
-    enable_thinking: bool = True,  # unused for cloud, kept for API parity
+    enable_thinking: bool | str = True,  # unused for cloud, kept for API parity
 ) -> Generator[tuple, None, None]:
     """Agentic loop using native tool calling (Anthropic, OpenAI).
 

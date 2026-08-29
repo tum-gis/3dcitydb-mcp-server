@@ -278,7 +278,24 @@ class _EventCallback(BaseCallbackHandler):
         separately into the chat bubble via _stream_token below. Without this
         cutoff the answer text would appear twice: once raw here, once clean
         in the chat bubble.
+
+        With langchain-ollama >= 0.3 and reasoning enabled, Ollama's thinking
+        is surfaced per-chunk in chunk.message.additional_kwargs[
+        "reasoning_content"] (not in the token) — stream that live as well.
         """
+        if not self._streaming_final:
+            chunk = kwargs.get("chunk")
+            if chunk is not None:
+                msg = getattr(chunk, "message", None)
+                if msg is not None:
+                    r = (msg.additional_kwargs or {}).get("reasoning_content", "")
+                    if r:
+                        self._raw_buffer += r
+                        now = _time.monotonic()
+                        if len(self._raw_buffer) >= 8 or (now - self._last_flush) >= 0.05:
+                            self._flush_raw()
+                            self._last_flush = now
+
         if not token:
             return
 
@@ -523,15 +540,21 @@ def react_stream(
     messages: list[dict],
     tool_executor: Callable[[str], str],
     *,
-    enable_thinking: bool = False,
+    enable_thinking: bool | str = False,
     num_ctx: int | None = None,
 ) -> Generator[tuple, None, None]:
-    """LangChain ReAct agent for Ollama."""
+    """LangChain ReAct agent for Ollama.
+
+    enable_thinking: False disables reasoning; True enables it at the model's
+    default depth; a string ("low"/"medium"/"high"/"max") sets an explicit
+    thinking level. All of these are forwarded to Ollama's top-level "think"
+    field via ChatOllama's `reasoning` kwarg (langchain-ollama >= 0.3).
+    """
 
     # ── Build the LangChain LLM ────────────────────────────────────────────────
     from langchain_ollama import ChatOllama
     # num_ctx goes in model_kwargs (→ Ollama options field)
-    # think goes as a top-level ChatOllama kwarg (→ Ollama request body, not options)
+    # reasoning goes as a top-level ChatOllama kwarg (→ Ollama "think" field, not options)
     _ctx = num_ctx if num_ctx is not None else int(os.environ.get("OLLAMA_NUM_CTX", "32768"))
     ollama_init: dict = dict(
         model=model,
@@ -541,9 +564,8 @@ def react_stream(
         num_predict=int(os.environ.get("LOCAL_MAX_TOKENS", "16000")),
         streaming=True,
         model_kwargs={"num_ctx": _ctx},
+        reasoning=enable_thinking,
     )
-    if not enable_thinking:
-        ollama_init["think"] = False
     llm = ChatOllama(**ollama_init)
 
     # ── Build the run_query tool ───────────────────────────────────────────────

@@ -10,7 +10,7 @@ def stream(
     messages: list[dict],
     tool_executor: Callable[[str], str],
     *,
-    enable_thinking: bool = False,
+    enable_thinking: bool | str = False,
     num_ctx: int | None = None,
 ) -> Generator[tuple, None, None]:
     if provider == "ollama":
