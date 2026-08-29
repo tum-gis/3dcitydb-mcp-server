@@ -226,7 +226,7 @@ OPENAI_MODELS = [
     "gpt-4-turbo",
 ]
 
-MAX_ITERATIONS = int(os.environ.get("AGENT_MAX_ITERATIONS", "6"))
+MAX_ITERATIONS = int(os.environ.get("AGENT_MAX_ITERATIONS", "10"))
 
 
 # ── Compact-mode auto-routing ──────────────────────────────────────────────────
