@@ -546,9 +546,12 @@ def react_stream(
     """LangChain ReAct agent for Ollama.
 
     enable_thinking: False disables reasoning; True enables it at the model's
-    default depth; a string ("low"/"medium"/"high"/"max") sets an explicit
-    thinking level. All of these are forwarded to Ollama's top-level "think"
-    field via ChatOllama's `reasoning` kwarg (langchain-ollama >= 0.3).
+    default depth; a string ("low"/"medium"/"high") sets an explicit thinking
+    level. All of these are forwarded to Ollama's top-level "think" field via
+    ChatOllama's `reasoning` kwarg (langchain-ollama >= 0.3). The ollama
+    client that langchain-ollama 0.3.x pins only accepts bool/low/medium/high
+    (its think field is Literal['low','medium','high']), so "max" is not a
+    valid level and must not be passed here.
     """
 
     # ── Build the LangChain LLM ────────────────────────────────────────────────

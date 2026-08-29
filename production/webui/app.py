@@ -453,10 +453,15 @@ def chat_stream(
     # Resolve num_ctx (only meaningful for local providers)
     num_ctx = _CTX_VALUES.get(num_ctx_label, 32768) if provider in _LOCAL_PROVIDERS else None
 
-    # UI sends "off"|"low"|"medium"|"high"|"max" from the thinking dropdown;
+    # UI sends "off"|"low"|"medium"|"high" from the thinking dropdown;
     # backends expect False (disabled) or the level string (enabled).
+    # "max" was never forwarded by the ollama client that langchain-ollama
+    # pins (its think field is Literal['low','medium','high']) — map it to
+    # "high" rather than surfacing a pydantic ValidationError.
     if enable_thinking in ("off", ""):
         enable_thinking = False
+    elif enable_thinking == "max":
+        enable_thinking = "high"
 
     _clear_stop()
 
@@ -1987,11 +1992,11 @@ def build_ui() -> gr.Blocks:
                     value=0.1, label="Temperature",
                 )
                 thinking_dropdown = gr.Dropdown(
-                    choices=["off", "low", "medium", "high", "max"],
+                    choices=["off", "low", "medium", "high"],
                     value="off",
                     label="Thinking",
                     info="Thinking level for thinking-capable Ollama models (e.g. Qwen3): "
-                         "off / low / medium / high / max. Slower but more thorough. "
+                         "off / low / medium / high. Slower but more thorough. "
                          "Has no effect on OpenAI models.",
                 )
                 prompt_mode_radio = gr.Radio(
