@@ -146,6 +146,19 @@ Total roof area on a street:
 _USE_STATIC_PROMPT = False
 
 
+def _escape_template_braces(text: str) -> str:
+    """Double every literal brace in ``text`` so that a
+    ``ChatPromptTemplate`` does not interpret them as template variables.
+
+    The ReAct prompt embeds the (dynamic) MCP system content verbatim into a
+    ``ChatPromptTemplate``. Any stray ``{...}`` in that content — e.g. a JSON
+    example such as ``{"sql": "..."}`` — would otherwise be parsed as a
+    missing template variable and break agent construction. The format block
+    that is appended separately already escapes its own braces, so only the
+    dynamic content needs doubling here.
+    """
+    return text.replace("{", "{{").replace("}", "}}")
+
 
 def _clean_sql_input(raw: str) -> str:
     raw = raw.strip()
@@ -184,11 +197,27 @@ class _EventCallback(BaseCallbackHandler):
         self._iteration = 0
         self._tools_called = 0
         self._parse_errors = 0  # counts _require_tool_call failures to break the retry loop
+        # Consecutive unparseable LLM responses WITHOUT a successful tool
+        # execution in between (see _RobustReActParser._record_parse_failure).
+        # A model that keeps emitting an unparseable action (e.g. granite4.2's
+        # `Action: {"sql": ...}` without the `Action Input:` line) would
+        # otherwise loop for hours until the scratchpad bloats past the context
+        # limit. Reset in on_tool_start so the budget is per-format-loop.
+        self._consecutive_parse_failures = 0
         self._stream_buffer = []   # accumulates tokens for the current LLM call
         self._streaming_final = False  # True once "Final Answer:" seen in stream
         self._in_error_retry = False  # True while LangChain replays a parse-error correction
         self._raw_buffer = ""      # batches raw tokens for live thinking_token events
         self._last_flush = _time.monotonic()
+        # Repetition guard (see _RobustReActParser._check_repetition): track the
+        # last executed (tool, sql) key and how many times it has run in a row.
+        # A model that re-issues the exact same query forever (observed with
+        # granite4.2 at temp 0.1) is degenerate -- every response parses and
+        # executes, so the parse-loop breaker never trips. Capped by
+        # max_iterations, but 10x identical queries waste minutes of inference.
+        self._last_action_key = None
+        self._consecutive_repeats = 0
+        self._llm_calls = 0
 
     @staticmethod
     def _parse_tool_output(output: str) -> dict:
@@ -248,6 +277,15 @@ class _EventCallback(BaseCallbackHandler):
         self._streaming_final = False
         raw = input_str if isinstance(input_str, str) else json.dumps(input_str)
         sql = _clean_sql_input(raw)
+        self._consecutive_parse_failures = 0
+        # Repetition guard: update the consecutive-identical-query counter so
+        # _RobustReActParser._check_repetition can abort a degenerate loop.
+        key = ("run_query", sql)
+        if key == self._last_action_key:
+            self._consecutive_repeats += 1
+        else:
+            self._last_action_key = key
+            self._consecutive_repeats = 1
         self._q.put(("tool_call", {"tool": "run_query", "args": {"sql": sql}, "iteration": self._iteration}))
         self._q.put(("status", "Running query…"))
 
@@ -338,6 +376,35 @@ class _EventCallback(BaseCallbackHandler):
         self._flush_raw()
         self._q.put(("_error", str(error)))
 
+    def on_chat_model_start(self, serialized, messages, **kwargs):
+        """Diagnostic: log how much context reaches the model each call.
+
+        In a healthy ReAct loop the prompt grows every call because the
+        agent_scratchpad (all prior Thought/Action/Observation steps) is
+        appended. A constant character count across calls would prove the
+        scratchpad is NOT being fed back to the model -- the suspected cause
+        of granite4.2 re-emitting the same block forever. Pure logging; never
+        raises so it cannot affect agent behaviour.
+        """
+        try:
+            chars = 0
+            roles = []
+            for msg_list in (messages or []):
+                for m in msg_list:
+                    c = m.content
+                    n = len(c) if isinstance(c, str) else len(str(c))
+                    chars += n
+                    role = getattr(m, "type", None) or type(m).__name__
+                    roles.append(f"{role}:{n}")
+        except Exception:
+            chars, roles = -1, ["?"]
+        self._llm_calls += 1
+        print(
+            f"[local] llm_start call={self._llm_calls} msgs={len(roles)} "
+            f"prompt_chars={chars} breakdown=[{', '.join(roles)}]",
+            flush=True,
+        )
+
 
 # ── Robust output parser ───────────────────────────────────────────────────────
 
@@ -356,6 +423,11 @@ class _RobustReActParser(ReActSingleInputOutputParser):
         re.DOTALL | re.IGNORECASE,
     )
 
+    # Markers used only by _keep_last_turn to locate echoed turns.
+    # "Action Input" (not "Action:") so the two are never confused.
+    _ACTION_INPUT_START_RE = re.compile(r"Action\s+Input", re.IGNORECASE)
+    _ACTION_LINE_START_RE = re.compile(r"Action\s*:", re.IGNORECASE)
+
     # A "final answer" that is just a bare number/token (e.g. "1") after a
     # multi-row/multi-column tool result almost never a real answer — it's a
     # sign the model's response got truncated or derailed. Deliberately tight
@@ -370,10 +442,273 @@ class _RobustReActParser(ReActSingleInputOutputParser):
         re.IGNORECASE,
     )
 
-    def __init__(self, callback: "_EventCallback", user_question: str = "") -> None:
+    # Consecutive unparseable LLM responses (no successful tool execution in
+    # between) before the loop breaker aborts the agent. AgentExecutor with
+    # handle_parsing_errors=True swallows every OutputParserException and
+    # retries — a model stuck in a format loop (observed with
+    # granite4.2: `Action: {"sql": ...}` without the `Action Input:` line,
+    # ~570 retries in 7 h until context overflow) would otherwise run for
+    # hours; AGENT_MAX_ITERATIONS only counts tool executions.
+    _MAX_CONSECUTIVE_PARSE_FAILURES = 5
+
+    # Abort when the model is about to run the same query a 3rd time in a row
+    # (see _check_repetition). N=2 -> allow two identical executions, stop the
+    # third. A genuine transient retry (e.g. a DB blip) stays well under this.
+    _MAX_CONSECUTIVE_IDENTICAL = 2
+
+    def __init__(
+        self,
+        callback: "_EventCallback",
+        user_question: str = "",
+        tool_names: set[str] | frozenset[str] | None = None,
+    ) -> None:
         super().__init__()
         self._cb = callback
         self._user_question = user_question
+        self._tool_names = tool_names or {"run_query"}
+
+
+    def parse_result(
+        self, result: list, *, partial: bool = False
+    ) -> AgentAction | AgentFinish:
+        """Recover native Ollama tool_calls (and inline SQL) before text parse.
+
+        ``gpt-oss:20b`` answers in two ways that the stock ReAct parser drops:
+
+        * empty ``content`` + an Ollama-native ``tool_calls`` array carrying the
+          query (langchain-core's ``parse_result`` only forwards the empty
+          ``generation.text`` to ``parse()``), and
+        * a non-empty ``content`` that is a plain-text reasoning dump — often
+          with the full SQL written inline in prose — sometimes accompanied by
+          a native ``tool_calls`` entry, sometimes not.
+
+        This override synthesizes the AgentAction in both cases when a valid
+        SQL payload can be extracted.  Anything else falls through to the
+        stock text path (with its two-strike guard) unchanged.
+        """
+        if not partial and len(result) == 1 and getattr(result[0], "message", None) is not None:
+            msg = result[0].message
+            content = msg.content if isinstance(msg.content, str) else ""
+            # Recovery only applies while no tool has run yet AND the content
+            # is not genuine ReAct text (a model that wrote "Action:" or
+            # "Final Answer:" is following the format — let parse() handle it).
+            react_markers = re.search(r"(?m)^\s*(Action|Final Answer)\s*:", content)
+            if self._cb._tools_called == 0 and not react_markers:
+                action = self._action_from_tool_calls(msg)
+                if action is None and content.strip():
+                    action = self._action_from_embedded_sql(content)
+            else:
+                action = None
+            if action is not None:
+                print(
+                    "[local] parser: recovered run_query from Ollama message "
+                    f"(content_chars={len(content)} tool_calls={len(getattr(msg, 'tool_calls', None) or [])})",
+                    flush=True,
+                )
+                return action
+        # Do NOT delegate to super().parse_result: it funnels into parse()
+        # and we need parse()'s RuntimeError (parse-loop breaker, raised
+        # when parse() gives up) to propagate as-is to the agent executor.
+        if partial:
+            raise ValueError(
+                "Partial parsing is not supported by this parser."
+            )
+        return self.parse(result[0].text)
+
+    def _record_parse_failure(self, error: OutputParserException) -> None:
+        """Count consecutive unparseable LLM responses; abort the agent after
+        ``_MAX_CONSECUTIVE_PARSE_FAILURES`` in a row.
+
+        Only ``OutputParserException`` counts: other errors are genuine
+        failures (DB down, LLM unreachable) and must keep their normal
+        error path. The counter is reset in ``on_tool_start`` when a tool
+        actually executes, so the budget is per-format-loop, not per-run.
+        The RuntimeError escapes AgentExecutor (which only swallows
+        OutputParserException) and is surfaced by the run-thread handler.
+        """
+        if not isinstance(error, OutputParserException):
+            return
+        self._cb._consecutive_parse_failures += 1
+        if self._cb._consecutive_parse_failures >= self._MAX_CONSECUTIVE_PARSE_FAILURES:
+            print(
+                f"[local] parser: giving up after "
+                f"{self._cb._consecutive_parse_failures} consecutive unparseable "
+                "responses (format loop)",
+                flush=True,
+            )
+            raise RuntimeError(
+                "The model repeatedly produced a response I could not interpret "
+                f"as a valid tool call, even after {self._cb._consecutive_parse_failures} "
+                "correction attempts. Please rephrase your question or try a "
+                "different model."
+            ) from error
+
+    def _action_key(self, action: AgentAction) -> tuple:
+        """Normalised (tool, sql) key used by the repetition guard."""
+        ti = action.tool_input
+        sql = ti if isinstance(ti, str) else json.dumps(ti, ensure_ascii=False)
+        return (action.tool, _clean_sql_input(sql))
+
+    def _keep_last_turn(self, text: str) -> str:
+        """Trim echoed reasoning history so the parser sees only the last turn.
+
+        Normal output has at most one `Action Input:` (or one `Action:`/
+        `Final Answer:`), so this is a no-op and existing behaviour is
+        preserved. A model that re-emits its scratchpad (granite4.2) yields
+        several of these markers; everything before the last `Action Input:`
+        is dead weight that misleads the first-match parsers. We cut at the
+        marker *immediately before* the final one, keeping that final marker
+        and everything after it.
+        """
+        if "Action Input" in text:
+            starts = [m.start() for m in self._ACTION_INPUT_START_RE.finditer(text)]
+            if len(starts) >= 2:
+                # Keep only the final "Action Input: ..." onward; the model's
+                # current action is always its newest one. The parser recovers
+                # the tool name from the JSON/SQL payload, so dropping the
+                # preceding "Action:" line is harmless.
+                text = text[starts[-1] :]
+        elif "Action:" in text:
+            starts = [m.start() for m in self._ACTION_LINE_START_RE.finditer(text)]
+            if len(starts) >= 2:
+                text = text[starts[-1] :]
+        return text
+
+    def _check_repetition(self, action: AgentAction) -> None:
+        """Abort if the model is about to re-run a query it has already executed
+        this many times in a row.
+
+        This is a second degenerate mode, distinct from the parse/format loop
+        the _record_parse_failure breaker catches: here every response parses
+        and every tool call executes, so no failure is ever recorded. The model
+        simply re-issues the identical SQL forever (observed with granite4.2
+        at temperature 0.1). State is maintained by the callback
+        (on_tool_start), which knows the real executed SQL.
+        """
+        key = self._action_key(action)
+        if (
+            key == self._cb._last_action_key
+            and self._cb._consecutive_repeats >= self._MAX_CONSECUTIVE_IDENTICAL
+        ):
+            print(
+                f"[local] parser: aborting - same query repeated "
+                f"{self._cb._consecutive_repeats + 1}x in a row: {key[1][:80]}",
+                flush=True,
+            )
+            raise RuntimeError(
+                "The model kept re-running the exact same query without making "
+                "progress, so the agent was stopped. Please rephrase the "
+                "question or try a different model."
+            )
+
+    def _action_from_tool_calls(self, msg) -> AgentAction | None:
+        """Build an AgentAction for run_query from an AIMessage's tool_calls.
+
+        Only accepts a tool named like ``run_query`` (case-insensitive) whose
+        argument is recognisably a SQL payload — the same SELECT/WITH
+        acceptance test the text recovery paths use. Returns ``None``
+        otherwise so the normal parse path (and its guards) takes over.
+        """
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            name = str(tc.get("name") or "").lower()
+            if "run_query" not in name:
+                continue
+            args = tc.get("args")
+            if isinstance(args, (dict, list)):
+                if isinstance(args, dict) and (args.get("sql") or args.get("query")):
+                    raw = str(args.get("sql") or args.get("query"))
+                else:
+                    raw = json.dumps(args, ensure_ascii=False)
+            else:
+                raw = str(args or "").strip()
+                if raw.startswith("{"):
+                    try:
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, dict) and (parsed.get("sql") or parsed.get("query")):
+                            raw = str(parsed.get("sql") or parsed.get("query"))
+                    except json.JSONDecodeError:
+                        pass
+            raw = raw.strip()
+            if not raw or len(raw) > 64 * 1024:
+                continue
+            clean_input = _clean_sql_input(raw)
+            if re.match(r"^\s*(SELECT|WITH)\b", clean_input, re.IGNORECASE):
+                return AgentAction(tool="run_query", tool_input=clean_input, log=raw)
+        return None
+
+    def _action_from_embedded_sql(self, text: str) -> AgentAction | None:
+        """Extract a run_query AgentAction from SQL written inline in prose.
+
+        ``gpt-oss:20b`` sometimes emits its whole answer as a reasoning dump
+        with the query embedded in the text and no usable tool_call.  We only
+        accept a very conservative shape — a SELECT/WITH statement written
+        verbatim (possibly multi-clause) and terminated by ``;`` or a
+        sentence-ending ``.`` — so legitimate prose that merely mentions SQL
+        keywords is never coerced into a query.
+        """
+        raw = self._extract_inline_sql(text)
+        if raw is None:
+            return None
+        clean_input = _clean_sql_input(raw)
+        if re.match(r"^\s*(SELECT|WITH)\b", clean_input, re.IGNORECASE) and len(clean_input) <= 64 * 1024:
+            return AgentAction(tool="run_query", tool_input=clean_input, log=clean_input)
+        return None
+
+    @staticmethod
+    def _extract_inline_sql(text: str) -> str | None:
+        """Locate a verbatim SQL statement embedded in prose.
+
+        The statement must start at the beginning of a line or immediately
+        after a colon (e.g. ``... So query: SELECT ...``).  Scanning forward
+        we stop at the first real terminator: a ``;`` (outside single-quoted
+        strings) or a sentence-ending ``.``.  Identifier dots such as
+        ``g.geometry`` and decimals are never terminators — a dot only ends
+        the statement when it is not flanked by alphanumerics on both sides.
+        Returns ``None`` when no anchored statement is found.  A statement
+        that runs to the very end of the text without a terminator is only
+        accepted when it at least has a FROM clause, so prose that merely
+        starts with "SELECT ..." but continues into sentences is rejected.
+        """
+        start = None
+        start_end = None
+        for m in re.finditer(r"(?i)\b(SELECT|WITH)\b", text):
+            line_start = text.rfind("\n", 0, m.start()) + 1
+            prefix = text[line_start:m.start()]
+            if prefix.strip() == "" or prefix.rstrip().endswith(":"):
+                start = m.start()
+                start_end = m.end()
+                break
+        if start is None:
+            return None
+        i = start_end
+        n = len(text)
+        in_str = False
+        while i < n:
+            c = text[i]
+            if in_str:
+                if c == "'":
+                    if i + 1 < n and text[i + 1] == "'":  # escaped ''
+                        i += 2
+                        continue
+                    in_str = False
+            elif c == "'":
+                in_str = True
+            elif c == ";":
+                return text[start:i + 1]
+            elif c == ".":
+                before = text[i - 1] if i > start else ""
+                after = text[i + 1] if i + 1 < n else ""
+                if not (before.isalnum() and after.isalnum()):
+                    return text[start:i]
+            i += 1
+        tail = text[start:]
+        # No terminator found — only accept a statement that looks complete.
+        if re.search(r"\bFROM\b", tail, re.IGNORECASE):
+            return tail
+        return None
 
     def _is_conversational(self) -> bool:
         """Return True when the user's input is a greeting or other non-query message."""
@@ -410,7 +745,54 @@ class _RobustReActParser(ReActSingleInputOutputParser):
             # Second attempt: model still didn't call the tool — let the answer
             # through to avoid an empty-output loop that never resolves.
 
+    def _coerce_unknown_tool(self, tool_name: str, tool_input) -> AgentAction | None:
+        """Recover an AgentAction whose tool name is not a real tool.
+
+        Returns an AgentAction bound to ``run_query`` when ``tool_input`` is
+        recognisably a SQL payload, and ``None`` otherwise. ``run_query``
+        expects a string, so the input is always normalised to a string here
+        (dicts are serialised first), then run through the same
+        ``_clean_sql_input`` the rest of the pipeline uses — which extracts
+        the bare SQL from JSON ``{"sql": ...}`` payloads and strips markdown
+        fences. A SELECT/WITH prefix after cleaning is the acceptance test,
+        identical to the existing Action-Input recovery path below.
+        """
+        if isinstance(tool_input, (dict, list)):
+            raw = json.dumps(tool_input, ensure_ascii=False)
+        else:
+            raw = str(tool_input)
+        raw = raw.strip()
+        if not raw or len(raw) > 64 * 1024:
+            return None
+        clean_input = _clean_sql_input(raw)
+        if re.match(r"^\s*(SELECT|WITH)\b", clean_input, re.IGNORECASE):
+            return AgentAction(tool="run_query", tool_input=clean_input, log=raw)
+        return None
+
     def parse(self, text: str) -> AgentAction | AgentFinish:
+        """Wrapper that feeds every failure into the parse-loop breaker.
+
+        All of _parse_impl's failure paths raise OutputParserException
+        (unknown tool, no-tool-call strikes, empty output, final give-up).
+        Recording here in one place means no raise site is missed; the
+        RuntimeError raised by _record_parse_failure passes through
+        untouched (it is not an OutputParserException) and aborts the agent.
+        """
+        try:
+            result = self._parse_impl(text)
+        except OutputParserException as e:
+            self._record_parse_failure(e)
+            raise
+        # Repetition guard: if the model is about to re-issue a query it has
+        # already run several times in a row, abort before it runs again. The
+        # RuntimeError raised by _check_repetition is not an
+        # OutputParserException, so it is not swallowed above and propagates
+        # out of AgentExecutor (same path as the parse-loop breaker).
+        if isinstance(result, AgentAction):
+            self._check_repetition(result)
+        return result
+
+    def _parse_impl(self, text: str) -> AgentAction | AgentFinish:
         # Strip <think>/<thought>/... blocks before any parsing so the standard
         # ReAct parser doesn't choke on Qwen3/DeepSeek/gemma4 reasoning prefixes.
         clean, _reasoning = _strip_reasoning_tags(text)
@@ -420,6 +802,14 @@ class _RobustReActParser(ReActSingleInputOutputParser):
         # Action/SQL/Final-Answer patterns inside it can still be extracted.
         if not clean.strip() and _reasoning.strip():
             clean = _reasoning
+
+        # A degenerate model (granite4.2 at low temperature) can re-emit its
+        # whole scratchpad in the response, producing several `Action Input:`
+        # lines. The parsers below use re.search() (FIRST match) and would then
+        # execute the OLDEST echoed query, silently dropping the model's
+        # genuinely-new one. Trim to the last turn before parsing (a no-op for
+        # normal single-turn outputs — see _keep_last_turn).
+        clean = self._keep_last_turn(clean)
 
         # Empty output — send one correction, then give up gracefully.
         if not clean.strip():
@@ -441,9 +831,29 @@ class _RobustReActParser(ReActSingleInputOutputParser):
 
         # Try the standard parser first (on the cleaned text)
         try:
-            return super().parse(clean)
+            result = super().parse(clean)
         except OutputParserException:
-            pass
+            result = None
+        else:
+            if isinstance(result, AgentAction) and result.tool not in self._tool_names:
+                # Local models (e.g. granite4.2) frequently emit a *sentence* or
+                # an invented name as the Action instead of the real tool name.
+                # If the input clearly is a SQL payload, coerce to the real tool;
+                # otherwise raise so the retry machinery can send a correction.
+                coerced = self._coerce_unknown_tool(result.tool, result.tool_input)
+                if coerced is not None:
+                    print(
+                        f"[local] parser: coerced unknown tool '{result.tool}' → run_query",
+                        flush=True,
+                    )
+                    return coerced
+                raise OutputParserException(
+                    f"Unknown tool name '{result.tool}'. The only available tool is run_query. "
+                    "Use this format:\n"
+                    "Action: run_query\n"
+                    'Action Input: {"sql": "SELECT ..."}'
+                )
+            return result
 
         # All subsequent parsing uses the cleaned text.
         text = clean
@@ -453,6 +863,34 @@ class _RobustReActParser(ReActSingleInputOutputParser):
         if fa:
             self._require_tool_call(text)
             return AgentFinish(return_values={"output": fa.group(1).strip()}, log=text)
+
+        # `Action: {"sql": ...}` — model put the JSON payload directly after
+        # `Action:` without an `Action Input:` line (observed with
+        # granite4.2:30b-q4_K_M). The standard parser then reads the whole JSON
+        # object as an unknown tool *name*, and the tool-call line is never
+        # executed; the correction loop can run for hours. Recover it here.
+        # (The Action-Input path below must keep priority — it handles the
+        # canonical format, and _ACTION_RE would otherwise mis-match a JSON
+        # payload as the tool name.)
+        if not self._INPUT_RE.search(text):
+            a_line = self._ACTION_RE.search(text)
+            if a_line:
+                name_part = a_line.group(1).strip()
+                if (
+                    name_part.startswith("{")
+                    and '"sql"' in name_part
+                    and len(name_part) <= 64 * 1024
+                ):
+                    clean_input = _clean_sql_input(name_part)
+                    if re.match(r"^\s*(SELECT|WITH)\b", clean_input, re.IGNORECASE):
+                        print(
+                            "[local] parser: recovered run_query from "
+                            "'Action: {json}' line (missing Action Input)",
+                            flush=True,
+                        )
+                        return AgentAction(
+                            tool="run_query", tool_input=clean_input, log=text
+                        )
 
         # Action Input present but tool name missing or wrong
         ai_match = self._INPUT_RE.search(text)
@@ -531,6 +969,87 @@ class _RobustReActParser(ReActSingleInputOutputParser):
         raise OutputParserException(f"Could not parse LLM output: `{text}`")
 
 
+# ── Per-model LLM invocation defaults (plan step c) ───────────────────────────
+# Prefix-keyed registry of invocation defaults derived from the local-model
+# probe matrix (see production/docs/local-model-probing.md). Longest matching
+# prefix wins. Each entry may set any of the user-visible Web UI controls:
+#   temperature (float 0..1)           → Temperature slider,  UI default 0.1
+#   thinking    (False|None|"low"|"medium"|"high") → Thinking dropdown, UI default "off"
+#             (None = omit Ollama's top-level think field entirely; needed by
+#             gpt-oss, where think:false measurably degrades tool-calling)
+#   num_ctx     (int tokens)           → Context window dropdown, UI default 65536
+# (num_predict stays env-driven via LOCAL_MAX_TOKENS; reserved for future
+# entries but not part of _resolve_llm_kwargs yet.)
+#
+# _resolve_llm_kwargs() applies an entry's values ONLY where the user left the
+# corresponding UI control at its default. Explicit user values always win.
+
+# The Web UI control defaults — a control sitting at these values is treated
+# as "the user did not touch it". Keep in sync with app.py (temperature
+# slider value=0.1, thinking dropdown value="off", num_ctx "64K (65,536)").
+_UI_DEFAULTS = {
+    "temperature": 0.1,
+    "thinking": False,
+    "num_ctx": 65536,
+}
+
+_MODEL_KWARG_DEFAULTS: dict[str, dict] = {
+    # gpt-oss:20b answers with empty content and delivers the query as an
+    # Ollama-native tool_call (see _RobustReActParser.parse_result, which
+    # recovers it). think MUST be omitted entirely (None), not false:
+    # measured through the real langchain path (35k-char system prompt,
+    # streaming) — think:false 3/6 recovered (incl. instant no-tool
+    # hallucinations), think:null 4/4, think:true 0/4; raw-Ollama probes
+    # (no think field) 10/10. A cool temperature keeps the runs short and
+    # stable.
+    "gpt-oss": {"temperature": 0.1, "thinking": None},
+    # thinking-then-empty class: Ollama 0.33.x gemma4 bug — a full query plan
+    # is produced in the reasoning stream, then content stays empty. Keeping
+    # thinking off is the best available configuration for these two models.
+    "gemma4:26b": {"thinking": False},
+    "gemma4:31b": {"thinking": False},
+}
+
+
+def _resolve_llm_kwargs(
+    model: str,
+    temperature: float,
+    enable_thinking: bool | str | None,
+    num_ctx: int | None,
+) -> tuple[float, bool | str, int | None]:
+    """Apply per-model invocation defaults where the user did not override.
+
+    Returns the (possibly replaced) (temperature, enable_thinking, num_ctx)
+    triple to pass to ChatOllama. A model default is applied only when the
+    corresponding UI control is still at its Web UI default (see
+    _UI_DEFAULTS); any explicit user value always wins. Unknown models pass
+    through unchanged. Note: enable_thinking may be None (omit Ollama's
+    think field); the "untouched UI" comparison is identity-based so the
+    profile's None is distinguishable from the UI's False.
+    """
+    m = model.lower()
+    spec: dict = {}
+    best_len = 0
+    for prefix in _MODEL_KWARG_DEFAULTS:
+        if m.startswith(prefix) and len(prefix) > best_len:
+            spec = _MODEL_KWARG_DEFAULTS[prefix]
+            best_len = len(prefix)
+
+    if not spec:
+        return temperature, enable_thinking, num_ctx
+
+    if "temperature" in spec and abs(temperature - _UI_DEFAULTS["temperature"]) < 1e-9:
+        temperature = spec["temperature"]
+    # Identity (is) not equality (==): False is not identity-equal to the
+    # UI default only when the profile already replaced it, and a profile
+    # value of None must survive as None.
+    if "thinking" in spec and enable_thinking is _UI_DEFAULTS["thinking"]:
+        enable_thinking = spec["thinking"]
+    if "num_ctx" in spec and num_ctx == _UI_DEFAULTS["num_ctx"]:
+        num_ctx = spec["num_ctx"]
+    return temperature, enable_thinking, num_ctx
+
+
 # ── Main entry point ───────────────────────────────────────────────────────────
 
 def react_stream(
@@ -540,21 +1059,28 @@ def react_stream(
     messages: list[dict],
     tool_executor: Callable[[str], str],
     *,
-    enable_thinking: bool | str = False,
+    enable_thinking: bool | str | None = False,
     num_ctx: int | None = None,
 ) -> Generator[tuple, None, None]:
     """LangChain ReAct agent for Ollama.
 
     enable_thinking: False disables reasoning; True enables it at the model's
     default depth; a string ("low"/"medium"/"high") sets an explicit thinking
-    level. All of these are forwarded to Ollama's top-level "think" field via
-    ChatOllama's `reasoning` kwarg (langchain-ollama >= 0.3). The ollama
-    client that langchain-ollama 0.3.x pins only accepts bool/low/medium/high
-    (its think field is Literal['low','medium','high']), so "max" is not a
-    valid level and must not be passed here.
+    level; None (set per-model by _resolve_llm_kwargs, e.g. for gpt-oss)
+    omits Ollama's top-level "think" field entirely. All of these are
+    forwarded via ChatOllama's `reasoning` kwarg (langchain-ollama >= 0.3).
+    The ollama client that langchain-ollama 0.3.x pins only accepts
+    bool/None/low/medium/high, so "max" is not a valid level and must not
+    be passed here.
     """
 
     # ── Build the LangChain LLM ────────────────────────────────────────────────
+    # Per-model invocation defaults (plan step c): only fill in controls the
+    # user left at their Web UI default. User overrides always win.
+    temperature, enable_thinking, num_ctx = _resolve_llm_kwargs(
+        model, temperature, enable_thinking, num_ctx
+    )
+
     from langchain_ollama import ChatOllama
     # num_ctx goes in model_kwargs (→ Ollama options field)
     # reasoning goes as a top-level ChatOllama kwarg (→ Ollama "think" field, not options)
@@ -648,6 +1174,10 @@ def react_stream(
         system_content = "\n\n".join(
             m.get("content", "") for m in messages if m["role"] == "system"
         )
+    # The template below is a ChatPromptTemplate, so any stray `{...}` in the
+    # (dynamic) MCP system content would be parsed as a template variable and
+    # break agent construction. Escape literal braces before embedding it.
+    system_content = _escape_template_braces(system_content)
 
     # Last user question
     _raw_user_q = next(
@@ -710,7 +1240,7 @@ def react_stream(
     callback = _EventCallback(event_q)
 
     # ── Build the agent executor ───────────────────────────────────────────────
-    agent = create_react_agent(llm, [sql_tool], react_prompt, output_parser=_RobustReActParser(callback, user_question=_raw_user_q))
+    agent = create_react_agent(llm, [sql_tool], react_prompt, output_parser=_RobustReActParser(callback, user_question=_raw_user_q, tool_names={sql_tool.name}))
     agent_executor = AgentExecutor(
         agent=agent,
         tools=[sql_tool],

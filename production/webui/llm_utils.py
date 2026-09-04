@@ -127,6 +127,13 @@ natural-language answers backed by real data.
 `run_query`. Only call `run_query` when the user is asking about data in the database.
 - You have direct database access via `run_query`. For any data question, ALWAYS call it — \
 never write SQL in your chat reply expecting the user to run it.
+- Never emit a `Final Answer` in a turn where no `Observation` from `run_query` \
+exists yet. If you have worked out a SQL query in your thinking, your response \
+must end with `Action: run_query` and `Action Input: {"sql": "..."}` (on its \
+own line — not the JSON directly after `Action:`) and wait for the \
+Observation. Quoting or describing SQL in prose is never a substitute for \
+calling the tool, and any number or objectid that does not appear in an \
+Observation is a hallucination — omit it.
 - The user sees the SQL in the Agent Activity panel. Only paste SQL text in your chat reply, if the user explicitly asks for it.
 - When the user asks "show me", "list", "which", or any counting question: \
 always write a query that SELECTs `feature.objectid AS objectid` plus relevant name/type columns — \
@@ -318,12 +325,15 @@ def _ollama_reachable() -> bool:
 
 
 def detect_default_provider() -> str | None:
+    # Ollama is the default provider: if it is reachable, prefer it even when
+    # cloud API keys / base URLs are also configured. The user can still switch
+    # to another provider in the UI at any time.
+    if _ollama_reachable():
+        return "ollama"
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "anthropic"
     if os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE"):
         return "openai"
-    if _ollama_reachable():
-        return "ollama"
     return None
 
 

@@ -46,6 +46,7 @@ from webui.llm_utils import (
     should_use_compact,
 )
 from webui.backends import stream as agent_stream
+from webui.model_profiles import profile_for_model
 from webui.mcp_client import assemble_system_prompt_sync, run_tool_sync
 
 _LOCAL_PROVIDERS = ("ollama",)
@@ -317,7 +318,13 @@ def _resolve_compact(prompt_mode: str, provider: str, model: str) -> tuple[bool,
         return True, "compact (forced)"
     if prompt_mode == "full":
         return False, "full (forced)"
-    # auto
+    # auto — the model's empirical class may demand a specific mode
+    # (e.g. wrong-sql models get the full prompt for stronger schema emphasis).
+    profile = profile_for_model(model) if provider in _LOCAL_PROVIDERS else None
+    if profile is not None and profile.default_prompt_mode in ("compact", "full"):
+        use_compact = profile.default_prompt_mode == "compact"
+        label = f"{profile.default_prompt_mode} (model class)"
+        return use_compact, label
     use_compact = should_use_compact(provider, model)
     label = "compact (auto)" if use_compact else "full (auto)"
     return use_compact, label
@@ -750,6 +757,10 @@ def on_provider_change(provider: str) -> tuple:
     warn = ""
     if is_ollama and not models:
         warn = "No models found — is OLLAMA_BASE_URL set and reachable?"
+    elif is_ollama and default:
+        # The model dropdown is about to be reset to `default`, so classify
+        # that — not the stale model of the previous provider.
+        warn = profile_for_model(default).warning
     return (
         gr.update(choices=models, value=default),
         gr.update(visible=is_ollama),
@@ -1824,10 +1835,12 @@ def build_ui() -> gr.Blocks:
     initial_model = initial_models[0] if initial_models else ""
     no_provider = detected_provider is None
     initial_is_ollama = initial_provider == "ollama"
-    initial_dynamic_warn = (
-        "No models found — is OLLAMA_BASE_URL set and reachable?"
-        if (initial_is_ollama and not initial_models) else ""
-    )
+    if initial_is_ollama and not initial_models:
+        initial_dynamic_warn = "No models found — is OLLAMA_BASE_URL set and reachable?"
+    elif initial_is_ollama and initial_model:
+        initial_dynamic_warn = profile_for_model(initial_model).warning
+    else:
+        initial_dynamic_warn = ""
 
     with gr.Blocks(
         title="3DCityDB-MCP",
@@ -2293,6 +2306,15 @@ window._reloadTiles = function() {
             ],
         )
         refresh_ollama_btn.click(fn=refresh_ollama_models, outputs=model_dropdown)
+
+        def _update_model_warn(model: str) -> str:
+            return profile_for_model(model).warning
+
+        model_dropdown.change(
+            fn=_update_model_warn,
+            inputs=model_dropdown,
+            outputs=dynamic_warn,
+        )
 
         def _update_status(provider: str, model: str, prompt_mode: str) -> str:
             _, label = _resolve_compact(prompt_mode, provider, model)
