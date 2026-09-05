@@ -310,6 +310,39 @@ def get_ollama_models() -> list[str]:
         return []
 
 
+def _ollama_root_from_openai_base(base_url: str) -> str:
+    """Strip only the OpenAI-compatible Ollama /v1 suffix from a base URL."""
+    base = (base_url or "").rstrip("/")
+    if base.lower().endswith("/v1"):
+        base = base[:-3]
+    return base.rstrip("/")
+
+
+def get_openai_ollama_models() -> list[str]:
+    """Return Ollama models exposed through an OpenAI-compatible endpoint."""
+    if os.environ.get("OPENAI_API_KEY", "").strip().lower() != "ollama":
+        return []
+    base = _ollama_root_from_openai_base(
+        os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE", "")
+    )
+    if not base:
+        return []
+    try:
+        req = urllib.request.Request(
+            f"{base}/api/tags", headers={"Accept": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        return [model["name"] for model in data.get("models", []) if model.get("name")]
+    except Exception:
+        return []
+
+
+def openai_uses_ollama() -> bool:
+    """Whether OpenAI mode has successfully discovered an Ollama endpoint."""
+    return bool(get_openai_ollama_models())
+
+
 
 def _ollama_reachable() -> bool:
     base = os.environ.get("OLLAMA_BASE_URL", "").rstrip("/")
@@ -325,15 +358,14 @@ def _ollama_reachable() -> bool:
 
 
 def detect_default_provider() -> str | None:
-    # Ollama is the default provider: if it is reachable, prefer it even when
-    # cloud API keys / base URLs are also configured. The user can still switch
-    # to another provider in the UI at any time.
+    # Prefer configured providers in this order. The user can still switch to
+    # another provider in the UI at any time.
+    if os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE"):
+        return "openai"
     if _ollama_reachable():
         return "ollama"
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "anthropic"
-    if os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE"):
-        return "openai"
     return None
 
 
@@ -341,7 +373,7 @@ def models_for_provider(provider: str) -> list[str]:
     if provider == "anthropic":
         return ANTHROPIC_MODELS
     if provider == "openai":
-        return OPENAI_MODELS
+        return get_openai_ollama_models() or OPENAI_MODELS
     if provider == "ollama":
         return get_ollama_models()
     return []
@@ -365,13 +397,15 @@ def _litellm_model_name(provider: str, model: str) -> str:
 # "temperature is deprecated for this model". Populated at runtime; not knowable
 # ahead of time since Anthropic adds these restrictions per new model release.
 _NO_TEMPERATURE_MODELS: set[str] = set()
+_NO_REASONING_EFFORT_MODELS: set[tuple[str, str]] = set()
 
 
 def _litellm_kwargs(
     provider: str,
     model: str,
-    temperature: float,
+    temperature: float | None,
     num_ctx: int | None = None,
+    enable_thinking: bool | str | None = None,
 ) -> dict:
     if provider == "ollama":
         default_timeout = os.environ.get("LITELLM_TIMEOUT_LOCAL", "300")
@@ -379,10 +413,11 @@ def _litellm_kwargs(
         default_timeout = os.environ.get("LITELLM_TIMEOUT", "120")
     kw: dict = {
         "model": _litellm_model_name(provider, model),
-        "temperature": temperature,
         "stream": False,
         "timeout": float(default_timeout),
     }
+    if temperature is not None:
+        kw["temperature"] = temperature
     if provider == "ollama":
         kw["max_tokens"] = int(os.environ.get("LOCAL_MAX_TOKENS", "16000"))
         kw["api_base"] = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -396,6 +431,17 @@ def _litellm_kwargs(
             # "gpt-4o"); a custom local model name like "my-local-model" won't
             # match anything, so it must be told explicitly.
             kw["custom_llm_provider"] = "openai"
+        reasoning_effort = {
+            False: "none",
+            "off": "none",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            True: "high",
+        }.get(enable_thinking)
+        reasoning_key = (kw["model"], kw.get("api_base", ""))
+        if reasoning_effort and reasoning_key not in _NO_REASONING_EFFORT_MODELS:
+            kw["reasoning_effort"] = reasoning_effort
     if kw["model"] in _NO_TEMPERATURE_MODELS:
         kw.pop("temperature", None)
     return kw
@@ -413,7 +459,23 @@ def safe_completion(kw: dict, **extra):
             _NO_TEMPERATURE_MODELS.add(call_kw.get("model", ""))
             call_kw.pop("temperature", None)
             return litellm.completion(**call_kw)
+        if "reasoning_effort" in call_kw and _is_reasoning_effort_rejection(exc):
+            model_key = (call_kw.get("model", ""), call_kw.get("api_base", ""))
+            _NO_REASONING_EFFORT_MODELS.add(model_key)
+            call_kw.pop("reasoning_effort", None)
+            return litellm.completion(**call_kw)
         raise
+
+
+def _is_reasoning_effort_rejection(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "reasoning_effort" in message
+        or "reasoning effort" in message
+    ) and any(
+        marker in message
+        for marker in ("unsupported", "unknown", "invalid", "unrecognized", "not allowed")
+    )
 
 
 # ── Markdown helpers ───────────────────────────────────────────────────────────

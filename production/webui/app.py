@@ -4,6 +4,7 @@ import json
 import os
 import re
 import threading
+import time
 from datetime import datetime
 from typing import Generator
 
@@ -36,7 +37,7 @@ import gradio as gr
 from webui.llm_utils import (
     ANTHROPIC_MODELS, OPENAI_MODELS, CHAT_INSTRUCTIONS,
     detect_default_provider, models_for_provider,
-    get_ollama_models,
+    get_ollama_models, get_openai_ollama_models,
     _rows_to_markdown_table,
     extract_highlight_payload, fallback_regex_extract,
     _compute_centroid_wgs84,
@@ -50,6 +51,18 @@ from webui.model_profiles import profile_for_model
 from webui.mcp_client import assemble_system_prompt_sync, run_tool_sync
 
 _LOCAL_PROVIDERS = ("ollama",)
+
+
+def _history_with_duration(history: list, started: float) -> list:
+  """Return a display-only history copy with the elapsed time appended."""
+  display_history = [row[:] for row in history]
+  if display_history and len(display_history[-1]) > 1:
+    elapsed = time.perf_counter() - started
+    display_history[-1][1] = (
+      f"{display_history[-1][1]}\n\n"
+      f"*Time to answer the question {elapsed:.3f} seconds*"
+    )
+  return display_history
 
 _CTX_OPTIONS = ["8K (8,192)", "32K (32,768)",  "64K (65,536)","128K (131,072)", "256K (262,144)"]
 _CTX_VALUES = {"8K (8,192)": 8192, "32K (32,768)": 32768, "64K (65,536)": 65536, "128K (131,072)": 131072, "256K (262,144)": 262144}
@@ -432,6 +445,7 @@ def chat_stream(
     history: list,
     provider: str,
     model: str,
+  set_temperature: bool,
     temperature: float,
     enable_thinking: bool | str,
     prompt_mode: str,
@@ -453,6 +467,9 @@ def chat_stream(
     cache_out = tool_cache if _cache_is_fresh(tool_cache) else None
     _pending_sql = ""
     print(f"[chat] history has {len(history)} turns", flush=True)
+
+    if not set_temperature:
+      temperature = None
 
     effective_compact, mode_label = _resolve_compact(prompt_mode, provider, model)
     print(f"[chat] prompt_mode={prompt_mode!r}  effective_compact={effective_compact}  ({mode_label})", flush=True)
@@ -479,6 +496,7 @@ def chat_stream(
         yield history, history, "*Idle.*", "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
         return
 
+    answer_started = time.perf_counter()
     stop_update = gr.update(visible=True)
 
     history = history + [[user_message, "● ● ●"]]
@@ -603,7 +621,8 @@ def chat_stream(
                 got_content = True
                 history[-1][1] = "*Stopped.*"
                 trace_md = log("⛔ **Stopped by user.**")
-                yield history, history[:-1], trace_md, "", gr.update(visible=False), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+                display_history = _history_with_duration(history, answer_started)
+                yield display_history, history[:-1], trace_md, "", gr.update(visible=False), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
                 return
 
             elif event == "ping":
@@ -691,7 +710,8 @@ def chat_stream(
         # usable reasoning — append a placeholder so reasoning_history stays
         # index-aligned with history turn-for-turn.
         reasoning_history = reasoning_history + [None]
-        yield history, history, trace_md, "", gr.update(visible=False), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+        display_history = _history_with_duration(history, answer_started)
+        yield display_history, history, trace_md, "", gr.update(visible=False), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
         return
 
     # ── Compute highlight payload and deliver final answer ─────────────────────
@@ -731,9 +751,10 @@ def chat_stream(
     trace_md = log("✅ **Final answer delivered**")
     history[-1][1] = accumulated
     updated_log_history = list(log_history) + [{"query": user_message, "trace": trace_md}]
+    display_history = _history_with_duration(history, answer_started)
     _n = len(updated_log_history)
     yield (
-        history, history, trace_md, "",
+      display_history, history, trace_md, "",
         gr.update(visible=False),
         highlight_payload, ctx_bar_html,
         updated_log_history,
@@ -754,6 +775,7 @@ def on_provider_change(provider: str) -> tuple:
     models = models_for_provider(provider)
     default = models[0] if models else ""
     is_ollama = provider == "ollama"
+    openai_ollama = provider == "openai" and bool(get_openai_ollama_models())
     warn = ""
     if is_ollama and not models:
         warn = "No models found — is OLLAMA_BASE_URL set and reachable?"
@@ -761,9 +783,14 @@ def on_provider_change(provider: str) -> tuple:
         # The model dropdown is about to be reset to `default`, so classify
         # that — not the stale model of the previous provider.
         warn = profile_for_model(default).warning
+    info = (
+        "Detected Ollama through OPENAI_BASE_URL; models were downloaded from the Ollama server."
+        if openai_ollama
+        else "Type a custom model name when using OPENAI_BASE_URL to point at vLLM, llama.cpp, or another OpenAI-compatible server."
+    )
     return (
-        gr.update(choices=models, value=default),
-        gr.update(visible=is_ollama),
+        gr.update(choices=models, value=default, info=info),
+        gr.update(visible=is_ollama or openai_ollama),
         gr.update(visible=is_ollama, value=warn),
         gr.update(),                            # prompt_mode_radio: unchanged (stays "auto")
         gr.update(visible=is_ollama),           # num_ctx_dropdown: only for local
@@ -772,10 +799,16 @@ def on_provider_change(provider: str) -> tuple:
     )
 
 
-def refresh_ollama_models() -> gr.update:
-    models = get_ollama_models()
+def refresh_provider_models(provider: str) -> gr.update:
+    models = models_for_provider(provider)
     default = models[0] if models else ""
-    return gr.update(choices=models, value=default)
+    openai_ollama = provider == "openai" and bool(get_openai_ollama_models())
+    info = (
+        "Detected Ollama through OPENAI_BASE_URL; models were downloaded from the Ollama server."
+        if openai_ollama
+        else "Type a custom model name when using OPENAI_BASE_URL to point at vLLM, llama.cpp, or another OpenAI-compatible server."
+    )
+    return gr.update(choices=models, value=default, info=info)
 
 
 # ── Import tab (fullstack only) ────────────────────────────────────────────────
@@ -1052,7 +1085,7 @@ _PRINT_CSS = """
   }
   .message-row.bot-row::before,
   .message-wrap.bot::before {
-    content: "🤖 Assistant" !important;
+    content: "🤖 Assistant (" attr(data-model) ")" !important;
     display: block !important;
     font-size: 0.75rem !important;
     font-weight: 700 !important;
@@ -1071,6 +1104,10 @@ _PRINT_CSS = """
   .message-wrap .prose h3, .message-wrap .prose h4,
   .message-wrap .prose h5 { color: #0f172a !important; }
   .message-wrap .prose a { color: #0369a1 !important; }
+  .answer-duration {
+    font-size: 0.78em !important;
+    color: #64748b !important;
+  }
   .message-wrap .prose code {
     background: #e2e8f0 !important; color: #374151 !important;
     border-radius: 3px; padding: 1px 4px; font-size: 0.85em;
@@ -1121,7 +1158,7 @@ _PRINT_CSS = """
 
   /* Static export header */
   body::before {
-    content: "3DCityDB-MCP — Chat-Export";
+    content: attr(data-print-title);
     display: block;
     width: 100%;
     font-size: 1.05rem;
@@ -1271,6 +1308,56 @@ async (_win, _event_data) => {
     var pending = SPECS.some(function (s) { return !document.getElementById(s.id); });
     SPECS.forEach(setupRow);
     if (pending && ++tries < 100) setTimeout(poll, 200);
+  })();
+
+  // Gradio rebuilds the chatbot DOM when a follow-up query starts. Keep
+  // completed answer timings display-only and restore them after that rebuild
+  // without adding them to the Python conversation history.
+  (function watchAnswerDurations() {
+    var timings = window._answerDurations || [];
+    window._answerDurations = timings;
+    var timingRe = /Time to answer the question [0-9]+[.][0-9]{3} seconds/;
+    function normalize(text) {
+      return text.replace(timingRe, "").replace(/ +/g, " ")
+        .split(String.fromCharCode(10)).join(" ")
+        .split(String.fromCharCode(13)).join(" ")
+        .split(String.fromCharCode(9)).join(" ").trim();
+    }
+    function scan() {
+      document.querySelectorAll(".message-row.bot-row .prose, .message-wrap.bot .prose").forEach(function (prose) {
+        var durationNode = Array.from(prose.querySelectorAll(".answer-duration"))[0];
+        if (!durationNode) {
+          Array.from(prose.querySelectorAll("p")).some(function (paragraph) {
+            if (timingRe.test(paragraph.textContent || "")) {
+              paragraph.classList.add("answer-duration");
+              durationNode = paragraph;
+              return true;
+            }
+            return false;
+          });
+        }
+        var base = normalize(prose.textContent || "");
+        if (durationNode) {
+          var timing = durationNode.textContent.trim();
+          if (!timings.some(function (item) { return item.base === base; })) {
+            timings.push({ base: base, timing: timing });
+          }
+        } else {
+          var saved = timings.find(function (item) { return item.base === base; });
+          if (saved) {
+            var paragraph = document.createElement("p");
+            paragraph.className = "answer-duration";
+            var emphasis = document.createElement("em");
+            emphasis.textContent = saved.timing;
+            paragraph.appendChild(emphasis);
+            prose.appendChild(paragraph);
+          }
+        }
+      });
+    }
+    var observer = new MutationObserver(function () { scan(); });
+    observer.observe(document.body, { childList: true, subtree: true });
+    scan();
   })();
 
   // ── PDF export via the native browser print dialog ─────────────────────
@@ -1811,7 +1898,33 @@ async (_win, _event_data) => {
   // has produced the final HTML/SVG, so the print CSS (see _PRINT_CSS above)
   // is all that is needed. A short delay lets a still-streaming answer settle
   // before the print dialog opens.
+  (function () {
+    var printButton = document.getElementById("export-pdf-btn");
+    if (printButton) {
+      var hint = "Print conversation (or save as PDF)";
+      printButton.title = hint;
+      var innerButton = printButton.querySelector("button");
+      if (innerButton) innerButton.title = hint;
+    }
+  })();
+
   window._exportPdf = function () {
+    var now = new Date();
+    // Date getters and toLocaleTimeString() use the browser's local timezone.
+    var printDateTime = now.getFullYear() + "-" +
+      String(now.getMonth() + 1).padStart(2, "0") + "-" +
+      String(now.getDate()).padStart(2, "0") + ", " +
+      now.toLocaleTimeString();
+    document.body.setAttribute(
+      "data-print-title",
+      "3DCityDB-MCP — Chat-Export — " + printDateTime
+    );
+    var modelControl = document.querySelector("#model-dropdown input") ||
+      document.querySelector("#model-dropdown [role='combobox']");
+    var model = modelControl && modelControl.value ? modelControl.value : "unknown model";
+    document.querySelectorAll(".message-row.bot-row, .message-wrap.bot").forEach(function (node) {
+      node.setAttribute("data-model", model);
+    });
     var prev = document.title;
     document.title = "3DCityDB-Chat-" + new Date().toISOString().slice(0, 10);
     setTimeout(function () {
@@ -1823,6 +1936,7 @@ async (_win, _event_data) => {
   };
   window.addEventListener("afterprint", function () {
     document.title = "3DCityDB-MCP";
+    document.body.removeAttribute("data-print-title");
   });
 }
 """.replace("__PRINT_CSS__", json.dumps(_PRINT_CSS))
@@ -1835,12 +1949,18 @@ def build_ui() -> gr.Blocks:
     initial_model = initial_models[0] if initial_models else ""
     no_provider = detected_provider is None
     initial_is_ollama = initial_provider == "ollama"
+    initial_openai_ollama = initial_provider == "openai" and bool(get_openai_ollama_models())
     if initial_is_ollama and not initial_models:
         initial_dynamic_warn = "No models found — is OLLAMA_BASE_URL set and reachable?"
     elif initial_is_ollama and initial_model:
         initial_dynamic_warn = profile_for_model(initial_model).warning
     else:
         initial_dynamic_warn = ""
+    initial_model_info = (
+      "Detected Ollama through OPENAI_BASE_URL; models were downloaded from the Ollama server."
+      if initial_openai_ollama
+      else "Type a custom model name when using OPENAI_BASE_URL to point at vLLM, llama.cpp, or another OpenAI-compatible server."
+    )
 
     with gr.Blocks(
         title="3DCityDB-MCP",
@@ -1855,6 +1975,66 @@ def build_ui() -> gr.Blocks:
         .header-bar h1 { color: #f8fafc; margin: 0; font-size: 1.4rem; }
         .header-bar p  { color: #94a3b8; margin: 4px 0 0; font-size: 0.85rem; }
         #send-btn, #stop-btn { min-width: 48px !important; width: 48px !important; padding: 0 !important; font-size: 1.1rem !important; }
+        #set-temperature-checkbox {
+          align-self: center !important;
+          display: flex !important;
+          align-items: center !important;
+        }
+        #set-temperature-checkbox label {
+          white-space: nowrap !important;
+          align-items: center !important;
+          margin: 0 !important;
+        }
+        .temperature-row,
+        #set-temperature-checkbox,
+        #set-temperature-checkbox .wrap {
+          overflow: visible !important;
+          background: transparent !important;
+          background-color: transparent !important;
+          background-image: none !important;
+          border: 0 !important;
+          box-shadow: none !important;
+          padding-top: 0 !important;
+          padding-bottom: 0 !important;
+          min-height: 0 !important;
+        }
+        #set-temperature-checkbox * {
+          background: transparent !important;
+          background-color: transparent !important;
+          background-image: none !important;
+        }
+        .temperature-row { flex-wrap: nowrap !important; }
+        .temperature-row > div:first-child {
+          background: transparent !important;
+          background-color: transparent !important;
+          background-image: none !important;
+          border: 0 !important;
+          box-shadow: none !important;
+        }
+        .temperature-row > div:first-child * {
+          background: transparent !important;
+          background-color: transparent !important;
+          background-image: none !important;
+          border-color: transparent !important;
+          box-shadow: none !important;
+        }
+        .temperature-row input[type="number"] {
+          background: #ffffff !important;
+          border: 1px solid #d1d5db !important;
+          border-radius: 8px !important;
+          box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05) !important;
+        }
+        #set-temperature-checkbox input[type="checkbox"] {
+          appearance: auto !important;
+          width: 16px !important;
+          height: 16px !important;
+          margin: 0 8px 0 0 !important;
+          border: 1px solid #cbd5e1 !important;
+          border-radius: 4px !important;
+          background: #ffffff !important;
+          accent-color: #2563eb !important;
+        }
+        .answer-duration { font-size: 0.78em !important; color: #64748b; }
 
         /* ── Agent trace: light mode (default) ───────────────────── */
         #agent-trace {
@@ -1989,28 +2169,38 @@ def build_ui() -> gr.Blocks:
                     choices=initial_models,
                     value=initial_model,
                     label="Model",
+                  elem_id="model-dropdown",
                     allow_custom_value=True,
-                    info="Type a custom model name when using OPENAI_BASE_URL to point at "
-                         "vLLM, llama.cpp, or another OpenAI-compatible server.",
+                    info=initial_model_info,
                 )
                 dynamic_warn = gr.Markdown(
                     visible=initial_is_ollama,
                     value=initial_dynamic_warn,
                 )
                 refresh_ollama_btn = gr.Button(
-                    "Refresh Ollama models", size="sm", visible=initial_is_ollama
+                  "Refresh models", size="sm", visible=initial_is_ollama or initial_openai_ollama
                 )
-                temperature_slider = gr.Slider(
-                    minimum=0.0, maximum=1.0, step=0.05,
-                    value=0.1, label="Temperature",
-                )
+                with gr.Row(equal_height=True, elem_classes="temperature-row"):
+                    set_temperature_checkbox = gr.Checkbox(
+                        label="Set temperature",
+                        value=False,
+                    scale=0,
+                      min_width=150,
+                      elem_id="set-temperature-checkbox",
+                    )
+                    temperature_slider = gr.Number(
+                      minimum=0.0, maximum=1.0, step=0.05,
+                      value=0.1, label="", show_label=False, interactive=False,
+                      scale=0,
+                      min_width=100,
+                    )
                 thinking_dropdown = gr.Dropdown(
                     choices=["off", "low", "medium", "high"],
                     value="off",
                     label="Thinking",
-                    info="Thinking level for thinking-capable Ollama models (e.g. Qwen3): "
-                         "off / low / medium / high. Slower but more thorough. "
-                         "Has no effect on OpenAI models.",
+                  info="Reasoning level for thinking-capable models: Ollama uses "
+                    "think; OpenAI-compatible endpoints use reasoning_effort. "
+                    "off / low / medium / high. Slower but more thorough.",
                 )
                 prompt_mode_radio = gr.Radio(
                     choices=["auto", "compact", "full"],
@@ -2273,7 +2463,8 @@ window._reloadTiles = function() {
 
         send_inputs = [
             msg_input, history_state, provider_radio, model_dropdown,
-            temperature_slider, thinking_dropdown, prompt_mode_radio, num_ctx_dropdown,
+            set_temperature_checkbox, temperature_slider,
+            thinking_dropdown, prompt_mode_radio, num_ctx_dropdown,
             log_history_state, tool_cache_state,
             reasoning_replay_checkbox, lessons_checkbox, reasoning_state, lessons_state,
         ]
@@ -2288,6 +2479,12 @@ window._reloadTiles = function() {
             return gr.update(visible=False)
 
         stop_btn.click(fn=_on_stop_click, outputs=[stop_btn], queue=False)
+
+        set_temperature_checkbox.change(
+          fn=lambda enabled: gr.update(interactive=enabled),
+          inputs=set_temperature_checkbox,
+          outputs=temperature_slider,
+        )
 
         # PDF export: pure client-side (window.print + @media print CSS).
         # fn=None + js= means no Python round-trip is needed — same pattern
@@ -2305,7 +2502,11 @@ window._reloadTiles = function() {
                 reasoning_replay_checkbox, lessons_checkbox,
             ],
         )
-        refresh_ollama_btn.click(fn=refresh_ollama_models, outputs=model_dropdown)
+        refresh_ollama_btn.click(
+          fn=refresh_provider_models,
+          inputs=provider_radio,
+          outputs=model_dropdown,
+        )
 
         def _update_model_warn(model: str) -> str:
             return profile_for_model(model).warning

@@ -24,20 +24,64 @@ from webui.llm_utils import (
 )
 
 
+def _reasoning_part_text(value) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("text", "content", "summary"):
+            text = _reasoning_part_text(value.get(key))
+            if text:
+                return text
+        return ""
+    if isinstance(value, list):
+        return "\n".join(
+            text for item in value if (text := _reasoning_part_text(item))
+        ).strip()
+    return ""
+
+
+def _extract_reasoning(message) -> str:
+    """Normalize reasoning fields used by OpenAI-compatible providers."""
+    candidates = [
+        getattr(message, "reasoning_content", None),
+        getattr(message, "reasoning", None),
+        getattr(message, "reasoning_details", None),
+    ]
+    additional = getattr(message, "additional_kwargs", {}) or {}
+    if isinstance(additional, dict):
+        candidates.extend(
+            additional.get(key)
+            for key in ("reasoning_content", "reasoning", "reasoning_details")
+        )
+    return "\n".join(
+        text for value in candidates if (text := _reasoning_part_text(value))
+    ).strip()
+
+
+def _merge_reasoning(*parts: str) -> str:
+    merged: list[str] = []
+    for part in parts:
+        if part and part not in merged:
+            merged.append(part)
+    return "\n\n".join(merged)
+
+
 def native_tool_stream(
     provider: str,
     model: str,
-    temperature: float,
+    temperature: float | None,
     messages: list[dict],
     tool_executor: Callable[[str], str],
     *,
-    enable_thinking: bool | str = True,  # unused for cloud, kept for API parity
+    enable_thinking: bool | str = True,
 ) -> Generator[tuple, None, None]:
     """Agentic loop using native tool calling (Anthropic, OpenAI).
 
     Yields the shared event protocol tuples defined in events.py.
     """
-    kw = _litellm_kwargs(provider, model, temperature)
+    kw = _litellm_kwargs(
+        provider, model, temperature, enable_thinking=enable_thinking
+    )
 
     last_error = ""
     last_had_error = False
@@ -110,6 +154,7 @@ def native_tool_stream(
 
         msg = response.choices[0].message
         content = msg.content or ""
+        reasoning = _extract_reasoning(msg)
         tool_calls = msg.tool_calls or []
 
         print(
@@ -181,7 +226,9 @@ def native_tool_stream(
             # Pure text — final answer
             if content:
                 print("[cloud] final text response", flush=True)
-                visible, reasoning = _strip_reasoning_tags(content)
+                visible, tagged_reasoning = _strip_reasoning_tags(content)
+                if tagged_reasoning:
+                    reasoning = _merge_reasoning(reasoning, tagged_reasoning)
                 if reasoning:
                     yield ("thinking", reasoning)
                 final_text = _post_process_markdown(visible)
@@ -194,13 +241,18 @@ def native_tool_stream(
         # Append assistant message (with tool_calls) to history
         working_messages.append(msg)
 
-        # Emit model reasoning alongside tool call.
+        # Emit model reasoning alongside tool call. OpenAI-compatible servers
+        # may return it outside message.content (for example as
+        # reasoning_content or reasoning_details).
         # When the content is substantial (>50 chars), treat it as a thinking event.
         # Also cache it in case the next iteration makes a redundant identical call.
         if content:
             if len(content) > 50:
                 _cached_content = content
-            yield ("thinking", content)
+            visible, tagged_reasoning = _strip_reasoning_tags(content)
+            reasoning = _merge_reasoning(reasoning, tagged_reasoning or visible)
+        if reasoning:
+            yield ("thinking", reasoning)
 
         for tc in tool_calls:
             if _is_stopped():
@@ -239,7 +291,10 @@ def native_tool_stream(
                     and _sql_norm == _last_tool_sql
                 ):
                     print("[cloud] redundant SQL detected — emitting cached content as final", flush=True)
-                    visible, reasoning = _strip_reasoning_tags(_cached_content)
+                    visible, tagged_reasoning = _strip_reasoning_tags(_cached_content)
+                    reasoning = _merge_reasoning(
+                        _extract_reasoning(msg), tagged_reasoning
+                    )
                     if reasoning:
                         yield ("thinking", reasoning)
                     final_text = _post_process_markdown(visible)
@@ -354,7 +409,8 @@ def native_tool_stream(
 
     fail_answer = r_fail.choices[0].message.content or ""
     if fail_answer:
-        visible, reasoning = _strip_reasoning_tags(fail_answer)
+        visible, tagged_reasoning = _strip_reasoning_tags(fail_answer)
+        reasoning = _merge_reasoning(_extract_reasoning(r_fail.choices[0].message), tagged_reasoning)
         if reasoning:
             yield ("thinking", reasoning)
         final_text = _post_process_markdown(visible)

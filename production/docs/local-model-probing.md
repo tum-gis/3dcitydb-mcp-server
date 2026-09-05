@@ -326,17 +326,32 @@ behaviour for plain prose. **Acceptance:** two live UI probes after
 deployment logged `recovered run_query from Ollama message` and rendered a
 13-row table (residual wrong-metric SQL is a model-quality issue, see §2).
 
-### c) Per-model LLM configuration — planned
+### c) Per-model LLM configuration — DONE
 
-A small registry in `local.py` (prefix-keyed, e.g. `"gpt-oss"`,
-`"gemma4:12b"`) holding invocation defaults: `temperature`, `enable_thinking`,
-`num_ctx`, `num_predict`. A `_resolve_llm_kwargs(model, ...)` helper applies the
-per-model defaults **only where the user did not override** the setting, and is
-called in `react_stream` before `ChatOllama(...)` is built. Initial entries come
-from the probe data (e.g. `gpt-oss` → thinking off, low temperature).
-**Test:** unit tests that the lookup returns the right overrides for sample
-model strings, falls back to defaults for unknown models, and that explicit user
-values always win.
+Implemented in `webui/backends/local.py` as a prefix-keyed registry with
+`temperature`, `enable_thinking`, and `num_ctx` defaults. `_resolve_llm_kwargs`
+applies per-model defaults only where the user left the corresponding control
+unchanged, and explicit user values always win. **Test:**
+`tests/test_local_kwargs.py` — 9 tests.
+
+The Web UI's **Set temperature** checkbox is off by default. While it is off,
+the temperature field is omitted from both cloud/OpenAI-compatible and Ollama
+requests, allowing the provider or model default to apply. When enabled, the
+slider value is sent explicitly.
+
+### h) OpenAI-compatible reasoning effort — DONE
+
+The existing Thinking dropdown is forwarded for `provider == "openai"` through
+LiteLLM as `reasoning_effort`: `off` → `none`, and `low`/`medium`/`high` map
+directly. `temperature` remains unchanged. Anthropic and Ollama requests keep
+their existing provider-specific behavior. If an OpenAI-compatible endpoint
+rejects the field as unsupported, the request retries once without it and the
+model/base-URL pair is remembered for later calls.
+
+**Test:** `tests/test_openai_kwargs.py` — 5 tests covering mapping, provider
+isolation, omission, rejection detection, and fallback retry. Support remains
+endpoint/model-dependent; the fallback preserves compatibility but cannot add
+reasoning to a server that does not implement it.
 
 ### e) Model-class routing registry — DONE
 
@@ -388,8 +403,7 @@ query instead of the oldest echoed one. No-op for single-turn output.
 
 - **Changing loop detection** — rejected: the 10-attempt
   `Retrying… (attempt N/MAX_ITERATIONS)` behavior is required and stays as is.
-- **OpenAI-compatible endpoint**, **Ollama upgrade** — noted as future work;
-  not part of this change set.
+- **Ollama upgrade** — noted as future work; not part of this change set.
 
 ## How changes are tested/deployed in this deployment
 
@@ -411,7 +425,7 @@ query instead of the oldest echoed one. No-op for single-turn output.
     citydb-mcp-agent:local python /repo/tests/<file>.py`.
   - Current totals (all green): `test_local_parser.py` 22/22,
     `test_local_gptoss.py` 15/15, `test_local_kwargs.py` 8/8,
-    `test_model_profiles.py` 4/4.
+    `test_model_profiles.py` 4/4, `test_openai_kwargs.py` 5/5.
 - Authoritative parse diagnostics come from `docker logs
   production-citydb-agent-1` — key lines: `[local] llm_start call=N msgs=…
   breakdown=[role:chars, …]` (per-LLM-call prompt shape), `[local] parser:

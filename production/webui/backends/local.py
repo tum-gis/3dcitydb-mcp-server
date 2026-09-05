@@ -1013,7 +1013,7 @@ _MODEL_KWARG_DEFAULTS: dict[str, dict] = {
 
 def _resolve_llm_kwargs(
     model: str,
-    temperature: float,
+    temperature: float | None,
     enable_thinking: bool | str | None,
     num_ctx: int | None,
 ) -> tuple[float, bool | str, int | None]:
@@ -1038,7 +1038,7 @@ def _resolve_llm_kwargs(
     if not spec:
         return temperature, enable_thinking, num_ctx
 
-    if "temperature" in spec and abs(temperature - _UI_DEFAULTS["temperature"]) < 1e-9:
+    if temperature is not None and "temperature" in spec and abs(temperature - _UI_DEFAULTS["temperature"]) < 1e-9:
         temperature = spec["temperature"]
     # Identity (is) not equality (==): False is not identity-equal to the
     # UI default only when the profile already replaced it, and a profile
@@ -1055,7 +1055,7 @@ def _resolve_llm_kwargs(
 def react_stream(
     provider: str,
     model: str,
-    temperature: float,
+    temperature: float | None,
     messages: list[dict],
     tool_executor: Callable[[str], str],
     *,
@@ -1088,13 +1088,14 @@ def react_stream(
     ollama_init: dict = dict(
         model=model,
         base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
-        temperature=temperature,
         timeout=float(os.environ.get("OLLAMA_TIMEOUT", "300")),
         num_predict=int(os.environ.get("LOCAL_MAX_TOKENS", "16000")),
         streaming=True,
         model_kwargs={"num_ctx": _ctx},
         reasoning=enable_thinking,
     )
+    if temperature is not None:
+        ollama_init["temperature"] = temperature
     llm = ChatOllama(**ollama_init)
 
     # ── Build the run_query tool ───────────────────────────────────────────────

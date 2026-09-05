@@ -82,6 +82,14 @@ def test_unknown_model_passthrough() -> None:
     assert th is None, "None thinking must pass through for unknown models"
 
 
+def test_unset_temperature_stays_unset() -> None:
+    """An unchecked temperature control must not activate model defaults."""
+    t, th, ctx = _resolve_llm_kwargs("gpt-oss:20b", None, UI_THINKING, UI_CTX)
+    assert t is None
+    assert th is None
+    assert ctx == UI_CTX
+
+
 def test_user_temperature_override_wins() -> None:
     """Any temperature other than the UI default beats the profile value."""
     for m in ("gpt-oss:20b", "gemma4:26b-a4b-it-q4_K_M"):

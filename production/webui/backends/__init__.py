@@ -6,7 +6,7 @@ from typing import Callable, Generator
 def stream(
     provider: str,
     model: str,
-    temperature: float,
+    temperature: float | None,
     messages: list[dict],
     tool_executor: Callable[[str], str],
     *,
