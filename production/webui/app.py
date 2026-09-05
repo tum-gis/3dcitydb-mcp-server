@@ -477,15 +477,12 @@ def chat_stream(
     # Resolve num_ctx (only meaningful for local providers)
     num_ctx = _CTX_VALUES.get(num_ctx_label, 32768) if provider in _LOCAL_PROVIDERS else None
 
-    # UI sends "off"|"low"|"medium"|"high" from the thinking dropdown;
-    # backends expect False (disabled) or the level string (enabled).
-    # "max" was never forwarded by the ollama client that langchain-ollama
-    # pins (its think field is Literal['low','medium','high']) — map it to
-    # "high" rather than surfacing a pydantic ValidationError.
+    # UI sends "off"|"low"|"medium"|"high" (+"max" for OpenAI-compatible
+    # endpoints) from the thinking dropdown; backends expect False (disabled)
+    # or the level string (enabled). "max" is only offered in the GUI for the
+    # OpenAI provider and is forwarded verbatim as reasoning_effort="max".
     if enable_thinking in ("off", ""):
         enable_thinking = False
-    elif enable_thinking == "max":
-        enable_thinking = "high"
 
     _clear_stop()
 
@@ -771,7 +768,7 @@ def chat_stream(
 
 # ── Provider helpers ───────────────────────────────────────────────────────────
 
-def on_provider_change(provider: str) -> tuple:
+def on_provider_change(provider: str, thinking: str) -> tuple:
     models = models_for_provider(provider)
     default = models[0] if models else ""
     is_ollama = provider == "ollama"
@@ -788,6 +785,12 @@ def on_provider_change(provider: str) -> tuple:
         if openai_ollama
         else "Type a custom model name when using OPENAI_BASE_URL to point at vLLM, llama.cpp, or another OpenAI-compatible server."
     )
+    # "max" is only offered for the OpenAI provider; reset the value when
+    # switching to a provider that does not send reasoning_effort.
+    thinking_choices = ["off", "low", "medium", "high"] + (
+        ["max"] if provider == "openai" else []
+    )
+    thinking_value = thinking if thinking in thinking_choices else "off"
     return (
         gr.update(choices=models, value=default, info=info),
         gr.update(visible=is_ollama or openai_ollama),
@@ -796,6 +799,7 @@ def on_provider_change(provider: str) -> tuple:
         gr.update(visible=is_ollama),           # num_ctx_dropdown: only for local
         gr.update(visible=is_ollama),           # reasoning_replay_checkbox: only for local
         gr.update(visible=is_ollama),           # lessons_checkbox: only for local
+        gr.update(choices=thinking_choices, value=thinking_value),  # thinking_dropdown
     )
 
 
@@ -2163,7 +2167,7 @@ def build_ui() -> gr.Blocks:
                 provider_radio = gr.Radio(
                     choices=["anthropic", "openai", "ollama"],
                     value=initial_provider,
-                    label="Provider",
+                    label="Provider / API",
                 )
                 model_dropdown = gr.Dropdown(
                     choices=initial_models,
@@ -2195,12 +2199,15 @@ def build_ui() -> gr.Blocks:
                       min_width=100,
                     )
                 thinking_dropdown = gr.Dropdown(
-                    choices=["off", "low", "medium", "high"],
+                    choices=["off", "low", "medium", "high"]
+                      + (["max"] if initial_provider == "openai" else []),
                     value="off",
                     label="Thinking",
                   info="Reasoning level for thinking-capable models: Ollama uses "
                     "think; OpenAI-compatible endpoints use reasoning_effort. "
-                    "off / low / medium / high. Slower but more thorough.",
+                    "off / low / medium / high"
+                    + (" (incl. max)" if initial_provider == "openai" else "")
+                    + ". Slower but more thorough.",
                 )
                 prompt_mode_radio = gr.Radio(
                     choices=["auto", "compact", "full"],
@@ -2496,10 +2503,10 @@ window._reloadTiles = function() {
 
         provider_radio.change(
             fn=on_provider_change,
-            inputs=provider_radio,
+            inputs=[provider_radio, thinking_dropdown],
             outputs=[
                 model_dropdown, refresh_ollama_btn, dynamic_warn, prompt_mode_radio, num_ctx_dropdown,
-                reasoning_replay_checkbox, lessons_checkbox,
+                reasoning_replay_checkbox, lessons_checkbox, thinking_dropdown,
             ],
         )
         refresh_ollama_btn.click(

@@ -437,6 +437,7 @@ def _litellm_kwargs(
             "low": "low",
             "medium": "medium",
             "high": "high",
+            "max": "max",
             True: "high",
         }.get(enable_thinking)
         reasoning_key = (kw["model"], kw.get("api_base", ""))
