@@ -333,12 +333,10 @@ def get_status_html(provider: str = "", model: str = "", prompt_mode_label: str 
     prov_ok = _check_provider_status(provider, model) if provider else False
     prov_label = f"Provider ({provider})" if provider else "Provider"
     mode_span = f'<span>📄 {prompt_mode_label}</span>' if prompt_mode_label else ""
-    mcp_version = get_mcp_version()
     return (
         f'<div style="display:flex;gap:16px;font-size:0.85rem;padding:6px 0;">'
         f'<span>{_dot_db(db_status)} DB</span>'
-        f'<span>{_dot(mcp_ok)} MCP server <code style="font-size:0.75rem;color:#64748b;">v{mcp_version}</code></span>'
-        f'<span>ChatBot <code style="font-size:0.75rem;color:#64748b;">v{CHATBOT_VERSION}</code></span>'
+        f'<span>{_dot(mcp_ok)} MCP server</span>'
         f'<span>{_dot(prov_ok)} {prov_label}</span>'
         f'{mode_span}'
         f'</div>'
@@ -2172,8 +2170,10 @@ def build_ui() -> gr.Blocks:
         with gr.Row(elem_classes="header-bar"):
             gr.HTML(
                 "<h1>3DCityDB-MCP</h1>"
-                "<p>Natural-language interface for 3DCityDB v5 &nbsp;&middot;&nbsp; "
-                f"{'Fullstack' if VARIANT == 'fullstack' else 'BYOD'} mode</p>"
+                "<p>Natural-language interface for 3DCityDB v5 "
+                f"&nbsp;&middot;&nbsp; 3DCityDB MCP Server v{get_mcp_version()} "
+                f"&nbsp;&middot;&nbsp; ChatBot v{CHATBOT_VERSION} "
+                f"&nbsp;&middot;&nbsp; {'Fullstack' if VARIANT == 'fullstack' else 'BYOD'} mode</p>"
             )
 
         if no_provider:
