@@ -166,13 +166,13 @@ Run the Gradio chat UI as a Docker container, connected to your existing 3DCityD
 
 > **⚠️ Spatial function support:** The AI agent uses SFCGAL functions (`CG_Volume`, `CG_3DArea`, `CG_MakeSolid`) for geometry calculations. These require PostGIS to be compiled with SFCGAL support.
 >
-> If your database lacks SFCGAL, volume and 3D area queries will fail silently or return errors. To get full spatial support, use **Option 3 (Fullstack)** instead — it ships a pre-patched `3dcitydb-pg` image with PostGIS + SFCGAL already enabled.
+> If your database lacks SFCGAL, volume and 3D area queries will fail silently or return errors. To get full spatial support, use **Option 3 (Fullstack)** instead — it ships a `3dcitydb-pg` image with PostGIS + pre-patched SFCGAL already enabled. The SFCGAL patch circumvents the much too strict geometry planarity checks normally compiled into SFCGAL (checking for nano meter planarity), so working with 3D geometry works e.g. with volume calculation, 3D surface area calculation as well as 3D boolean operations.
 >
 > You can verify SFCGAL availability on your instance with:
 > ```sql
 > SELECT postgis_sfcgal_version();
 > ```
-> If this returns an error, spatial queries will not work.
+> If this returns an error, many spatial queries will not work.
 
 ### Quick Start
 
@@ -228,14 +228,14 @@ The pre-built image (`khaoulakanna1/citydb-mcp-agent:latest`) is pulled automati
 | **MCP Inspector** | Lists all active MCP tools and lets you refresh the assembled system prompt |
 | **System Prompt** | Displays the full assembled system prompt sent to the LLM — useful for debugging |
 
-While the agent is working, the chat bubble shows live status: *Thinking…* → *Running query…* → *Interpreting results…*. Below the chat input, the **Agent activity panel** streams the full ReAct trace — each thought, tool call, and observation — with per-step timing.
+While the agent is working, the chat bubble shows live status: *Thinking…* → *Running query…* → *Interpreting results…*. Right next to the chat log, the **Agent activity panel** streams the full ReAct trace — each thought, tool call, and observation — with per-step timing.
 
 **Chat settings** (above the input field):
 
 | Setting | Options | Description |
 |---------|---------|-------------|
 | **Provider / API** | `anthropic` / `openai` / `ollama` | Auto-selected from `.env`; can be overridden per session |
-| **Model** | (populated per provider) | Dropdown with free-text entry; **Refresh models** re-discovers models from the Ollama endpoint |
+| **Model** | (populated per provider) | Dropdown with free-text entry possibility; **Refresh models** re-discovers models from the Ollama endpoint |
 | **Set temperature** | checkbox + value (0.0–1.0, default 0.1) | Unchecked = provider default; enable to pin a fixed temperature |
 | **Thinking** | `off` / `low` / `medium` / `high` (+ `max` for OpenAI) | Reasoning level for thinking-capable models. Ollama uses native `think`; OpenAI-compatible endpoints use `reasoning_effort`. Higher levels are slower but more thorough |
 | **Prompt mode** | `auto` / `compact` / `full` | `auto` picks compact for small local models; override for complex queries |
@@ -246,7 +246,7 @@ While the agent is working, the chat bubble shows live status: *Thinking…* →
 **Rendering and export:**
 
 - **Mermaid diagrams** are rendered inline in the chat, with a copy toolbar (SVG / PNG / source code) and a visible fallback box if a diagram fails to parse
-- **Inline LaTeX** is rendered in chat messages and the agent activity panel
+- **Inline LaTeX** is rendered in chat messages; the agent activity panel shows the unrendered source
 - **PDF export** (🖨 button next to the send button) prints the current conversation to a multi-page PDF via the browser's print dialog
 
 ### Local (Ollama) model support
@@ -256,7 +256,7 @@ The Chat Assistant is deliberately built to work with small local models, not ju
 - **Robust tool-call parser** — local models frequently emit ReAct actions in non-standard formats (e.g. a full sentence as the action name, extra whitespace, missing arguments). The parser normalises these automatically and repairs common malformations instead of aborting the run.
 - **Model profiling** — a built-in registry (`webui/model_profiles.py`) classifies known models by empirically observed behaviour (`works`, `sentence-as-tool`, `wrong-sql`, `thinking-then-empty`, `unknown`). The class drives a **warning line under the model dropdown** (e.g. a model known to emit broken SQL is forced into full prompt mode with an explanatory note), so you get an honest assessment of what a model can do before the first query.
 - **Endpoint & model discovery** — the **Refresh models** button queries the Ollama endpoint and repopulates the model dropdown, including custom or fine-tuned models.
-- **Native thinking** — for Ollama models with a thinking capability (e.g. `qwen3.8:27b`, `gpt-oss:20b`), the **Thinking** dropdown controls the native `think` parameter; no prompt engineering needed.
+- **Native thinking** — for Ollama models with a thinking capability (e.g. `qwen3.8:27b`, `gpt-oss:20b`), the **Thinking** dropdown controls the native `think` parameter; no prompt engineering needed. However, it seems that many Ollama models do not consider this parameter properly.
 
 See [`production/docs/local-model-probing.md`](production/docs/local-model-probing.md) for the full probing methodology, the per-model results, and how to add a new model profile.
 
@@ -316,7 +316,7 @@ Edit `.env`:
 POSTGRES_DB=citydb
 POSTGRES_USER=citydb
 POSTGRES_PASSWORD=citydb
-SRID=25832          # EPSG code for your data's coordinate system
+SRID=25832          # choose the right EPSG code of the coordinate reference system for the dataset you want to import
 
 # At least one LLM provider
 ANTHROPIC_API_KEY=sk-ant-...
@@ -373,6 +373,8 @@ Set `SRID` to the EPSG code for your data before the first start. Common values:
 | USA (NAD83 / UTM Zone 14N) | NAD83 | `26914` |
 | Global (WGS84) | WGS 84 | `4326` |
 
+Note that you should name a 3D SRID, if available. However, often the CRS used in CityGML datasets use a compound CRS with separate SRIDs for planimetry and height, and for these combinations often no predefined SRIDs are defined in PostGIS. In this case, just name the SRID of the planimetric coordinates (2D), like in the examples shown above. 
+
 ### Useful commands
 
 ```bash
@@ -412,7 +414,7 @@ All options are set via environment variables (`.env` file or Docker Compose `en
 | `POSTGRES_USER` | `citydb` | Database user for bundled PostgreSQL |
 | `POSTGRES_PASSWORD` | `citydb` | Database password for bundled PostgreSQL |
 | `SRID` | `25832` | EPSG code for the 3DCityDB spatial reference |
-| `POSTGIS_SFCGAL` | `true` | Enable SFCGAL extension (required for `CG_Volume`, `CG_3DArea`) |
+| `POSTGIS_SFCGAL` | `true` | Enable SFCGAL extension (required for, e.g., `CG_Volume`, `CG_3DArea`) |
 
 ### LLM providers
 
@@ -421,21 +423,21 @@ At least one must be configured for the Docker variants. The Gradio UI auto-sele
 | Variable | Description |
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Anthropic API key (`sk-ant-...`) |
-| `OPENAI_API_KEY` | OpenAI API key (`sk-...`); for Ollama via the OpenAI-compatible endpoint any non-empty value works (e.g. `ollama`) |
-| `OPENAI_BASE_URL` | Base URL for the OpenAI provider (e.g. `http://host.docker.internal:11434/v1/` to point it at a remote Ollama's OpenAI-compatible API) |
+| `OPENAI_API_KEY` | OpenAI API key (`sk-...`); when using Ollama via the OpenAI-compatible endpoint this value must be `ollama`) |
+| `OPENAI_BASE_URL` | Base URL for the OpenAI provider. Leave empty for models offered by OpenAI. When using a locally running LLM or a remote LLM (not hosted by OpenAI) via its OpenAI-compatible API (e.g., provided by llama.cpp, vLLM, or Ollama) provide the corresponding endpoint URL (e.g. `http://host.docker.internal:11434/v1/`) |
 | `OLLAMA_BASE_URL` | Ollama base URL (e.g. `http://host.docker.internal:11434`) |
 
 ### Query behaviour
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CATEGORICAL_THRESHOLD` | `20` | Max distinct values before a column is treated as free text (only applied when no known codelist exists) |
-| `SAMPLE_VALUES_COUNT` | `5` | Number of sample values shown per non-categorical column |
+| `CATEGORICAL_THRESHOLD` | `20` | Max distinct values for CityGML feature attributes before the attribute is considered not as an enumeration but as free text (only applied when no known codelist exists). The values of enumeration attributes are prefetched and added to the system prompt. |
+| `SAMPLE_VALUES_COUNT` | `5` | Number of sample values shown per non-categorical attribute |
 
 ### Country-specific codelists
 
 Code-type properties (`core:Code`) are resolved against country-specific codelist
-definitions. The country is selected from the database EPSG code
+definitions. The country is auto-selected from the database EPSG code
 (`database_srs`), falling back to a generic `DEFAULT` block for unknown countries:
 
 - **DE** (EPSG 25831–25833, 31466–31469, 5650) — ALKIS/AdV: `function` (31 codes), `usage`, `roofType` (roof form)
@@ -458,7 +460,7 @@ is a pure data change — no code changes required.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OLLAMA_NUM_CTX` | `32768` | Context window size (tokens) passed to the Ollama model |
+| `OLLAMA_NUM_CTX` | `65536` | Context window size (tokens) passed to the Ollama model |
 | `LOCAL_MAX_TOKENS` | `16000` | Maximum tokens the local model may generate per response |
 | `OLLAMA_TIMEOUT` | `300` | Timeout in seconds for Ollama requests |
 | `AGENT_MAX_ITERATIONS` | `10` | Maximum ReAct tool-call iterations per question |
@@ -543,7 +545,18 @@ is a pure data change — no code changes required.
 
 ## Citation
 
-This work was developed at the [Chair of Geoinformatics](https://www.asg.ed.tum.de/gis/startseite/), TUM, in the group of Prof. Dr. Thomas H. Kolbe. Main developer: Khaoula Kanna, M.Sc.
+This work was developed at the [Chair of Geoinformatics](https://www.asg.ed.tum.de/gis/startseite/), TUM, in the group of Thomas H. Kolbe. Main developer: Khaoula Kanna, M.Sc.
+
+The accompanying paper (to be published by end of September 2026) can be cited as:
+
+```bibtex
+@inproceedings{kanna2026enabling,
+    author    = {Kanna, Khaoula and Kolbe, Thomas H.},
+    title     = {Enabling AI Agents for Semantic 3D City Models through Automated Domain Context Generation},
+    booktitle = {ISPRS 21st 3D GeoInfo Conference},
+    year      = {2026},
+}
+```
 
 ---
 
