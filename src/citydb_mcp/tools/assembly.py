@@ -492,8 +492,9 @@ derive them from those tables.
 
 **Object-oriented model and inheritance.** CityGML is an object-oriented standard. \
 Classes form a deep inheritance hierarchy (e.g. Building → AbstractBuilding → \
-AbstractPhysicalSpace → AbstractOccupiedSpace → AbstractCityObject → AbstractFeature). \
-A class possesses not only the properties that are directly defined on it, but also \
+AbstractConstruction → AbstractOccupiedSpace → AbstractPhysicalSpace → AbstractSpace → \
+AbstractCityObject → AbstractFeatureWithLifespan → AbstractFeature → AbstractObject). \
+A class possesses not only the properties that are directly defined by it, but also \
 **all properties of all its transitive superclasses** (inherited attributes and \
 associations). The `objectclass.superclass_id` column encodes this hierarchy. When \
 you resolve properties for a class, you must walk the full superclass chain — this is \
@@ -501,40 +502,54 @@ what the `resolve_properties` tool does.
 
 3DCityDB v5 organises its tables into five logical modules:
 
-**Feature module** — the core of the schema. Every city object (building, road, \
-vegetation, etc.) is a row in `feature`, identified by `objectclass_id`. \
-Semantic attributes (height, function, address link, geometry link, …) are stored \
-as rows in `property`, linked back to `feature` via `feature_id`. \
-The `objectclass` table defines the class hierarchy (e.g. Building → AbstractBuilding \
-→ AbstractCityObject). Relationships between features (e.g. Building → WallSurface) \
-are encoded as `property` rows where `val_feature_id` points to the child feature and \
-`val_relation_type` indicates the relationship kind (0 = space, 1 = boundary).
-
+**Metadata module** — The `objectclass` table defines the class hierarchy \
+(e.g. Building → AbstractBuilding → ... → AbstractObject). \
+The `namespace` table maps namespace IDs to their URI prefixes \
+(e.g. namespace_id=1 → CityGML core, namespace_id=3 → generic attributes, \
+namespace_id=8 → building module). Always use `namespace_id` together with \
+`property.name` to unambiguously identify a property. \
 The `datatype` table registers every primitive and complex type used in CityGML \
 (e.g. Boolean, Integer, Double, String, Code, Measure, AddressProperty, \
 GeometryProperty, FeatureProperty, GenericAttributeSet, …). Each `property` row \
 carries a `datatype_id` that points to this table, which in turn determines which \
 `val_*` column in `property` holds the actual value (e.g. datatype Integer → \
 `val_int`, Code → `val_string`, Measure → `val_double` + `val_uom`, \
-GeometryProperty → `val_geometry_id` referencing `geometry_data`).
+GeometryProperty → `val_geometry_id` referencing `geometry_data`). \
+The `database_srs` table stores the coordinate reference system used for the dataset. \
+It contains a single row with the SRID (EPSG code) and its corresponding URN. \
+The `ade` table lists all Application Domain Extension modules present in the database, if any.
+
+**Feature module** — the core of the schema. Every city object (building, road, \
+vegetation, etc.) is a row in `feature`, identified by `objectclass_id`. \
+Semantic attributes (height, function, address link, geometry link, …) are stored \
+as rows in the `property` table, linked to the `feature` table via `feature_id`. \
+Relationships between features (e.g. Building → WallSurface) are encoded as \
+`property` rows where `val_feature_id` points to the child feature and \
+`val_relation_type` indicates the relationship kind (0 = general association, \
+1 = contains (a subfeature relationship, where the referenced feature is \
+considered a part of the parent feature). The `address` table holds postal \
+addresses, linked to features via `property.val_address_id`.
 
 **Geometry module** — explicit 3D geometry lives in `geometry_data`, one row per \
-geometry object, linked to its owning feature via `feature_id`. The \
-`geometry_properties` JSON column encodes the outermost geometry type (9=Solid, \
-6=CompositeSurface, …). Implicit (template-based) geometry is stored in \
+geometry object. A quick way to query to which feature a geometry belongs, is to join \
+`geometry_data.feature_id` to `feature.id`. Since features often have multiple geometries \
+(e.g. for different LoDs, or a Solid for volume and a MultiSurface for surface area), \
+always navigate to `geometry_data` via the property table, which provides the name and \
+namespace of each geometry. The `geometry_properties` JSON column provides additional \
+metadata about the geometry, e.g., id values of parts of the geometry as well as more \
+specific classification of the geometry (because CityGML allows many ISO19107 geometry \
+types like Solid, CompositeSurface or TIN, which are not supported by PostGIS); examples \
+for geometry types are: 9=Solid, 10=CompositeSolid, 6=CompositeSurface, 8=MultiSurface, \
+7=TriangulatedSurface. Implicit (template-based) geometry is stored in table \
 `implicit_geometry` and referenced from `property.val_implicitgeom_id`.
 
 **Appearance module** — textures, materials, and surface colour information. These \
-tables (`appearance`, `surface_data`, …) are present in the schema but are not \
-relevant for analytical queries and are excluded from this reference.
-
-**Metadata module** — the `namespace` table maps namespace IDs to their URI prefixes \
-(e.g. namespace_id=1 → CityGML core, namespace_id=3 → generic attributes, \
-namespace_id=8 → building module). Always use `namespace_id` together with \
-`property.name` to unambiguously identify a property.
+tables (`appearance`, `appear_to_surface_data`, `surface_data`, `surface_data_mapping`, \
+`tex_image`) are present in the schema but are not relevant for analytical queries \
+and are excluded from this reference.
 
 **Codelist module** — the `codelist` table registers named codelists \
-(e.g. `bldg:RoofTypeValue`). `codelist_entry` holds the individual code–definition \
+(e.g. `bldg:RoofTypeValue`). Table `codelist_entry` holds the individual code–definition \
 pairs. Code-type properties (datatype_id=14) store their value in \
 `property.val_string`; join `codelist_entry` on `code` to obtain the human-readable \
 definition.
@@ -552,15 +567,16 @@ _TABLE_DESCRIPTIONS = {
         "address link, geometry link, relationship to a child feature — is stored here. "
         "Use `name` + `namespace_id` to identify a property unambiguously. "
         "`val_relation_type` encodes feature-to-feature relationships "
-        "(0 = space/composition, 1 = boundary surface). "
-        "Nested properties (e.g. height → value) are linked via `parent_id`."
+        "(0=general association, 1=referenced feature is a part of this feature). " 
+        "Nested properties (e.g. height → value) are linked via `parent_id`. "
+        "Note that attributes and relationships can occur multiple times per feature "
+        "(same name, but different values)."
     ),
     "objectclass": (
         "The authoritative registry of the **entire CityGML 3.0 object-oriented data model**. "
         "Every CityGML class is one row. "
         "`superclass_id` encodes the full inheritance hierarchy (e.g. Building → AbstractBuilding "
-        "→ AbstractPhysicalSpace → … → AbstractGML); walk this chain to collect all inherited "
-        "properties. "
+        "→ … → AbstractObject); walk this chain to collect all inherited properties. "
         "`is_toplevel=1` marks classes whose instances can exist independently as top-level features. "
         "`schema` (JSON) documents every attribute and association of that class — its name, type, "
         "multiplicity, and the `property` column it maps to — making objectclass the single source "
