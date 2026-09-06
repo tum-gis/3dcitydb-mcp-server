@@ -5,7 +5,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server giving 
 It dynamically resolves CityGML object classes, properties, codelists, and generic attributes from the database so the AI can answer both spatial and semantic queries stated in natural language, write and execute SQL queries, and reason about CityGML data — without any manual prompt engineering. 
 By including the MCP server in agentic coding environments, it becomes easy to create software that can read and write complex structured 3D city models compliant to the [OGC CityGML standard](https://www.ogc.org/standards/citygml/) (and using [3DCityDB V5](https://github.com/3dcitydb/3dcitydb) as the data repository).
 
-Furthermore, a **Chat Assistant** is included offering a simple GUI for interactive query asking, reasoning, and answering. It is an agentic AI tool based on [LangChain](https://github.com/langchain-ai) utilising the [ReAct pattern](https://reference.langchain.com/javascript/langchain-react) for carrying out multi-step reasoning and automated error corrections. The Chat Assistent currently can be configured to work with OpenAI and Anthropic commercial LLMs as well as with locally running [Ollama](https://github.com/ollama/ollama) LLMs. For example, when using the [`qwen3.6:27b`](https://ollama.com/library/qwen3.6:27b) LLM running in Ollama, the Chat Assistant is capable of performing very complex analyses on any kind of stored 3D city model. 
+Furthermore, a **Chat Assistant** is included offering a simple GUI for interactive query asking, reasoning, and answering. It is an agentic AI tool based on [LangChain](https://github.com/langchain-ai) utilising the [ReAct pattern](https://reference.langchain.com/javascript/langchain-react) for carrying out multi-step reasoning and automated error corrections. The Chat Assistant currently can be configured to work with OpenAI and Anthropic commercial LLMs, any OpenAI-compatible endpoint, as well as with locally running [Ollama](https://github.com/ollama/ollama) LLMs. For example, when using the [`qwen3.8:27b`](https://ollama.com/library/qwen3.8:27b) LLM running in Ollama, the Chat Assistant is capable of performing very complex analyses on any kind of stored 3D city model, including multi-step SQL workflows with live reasoning traces, rendered diagrams, and PDF export.
 
 The evaluation of the MCP Server for the paper (link coming soon) was done using 100 queries of 4 different complexity levels. The complete list of the queries can be found [`here`](https://handy-porpoise-645.notion.site/Evaluation-Questions-31b3fb8cb4358084bfcdc6b4023c4c15).
 
@@ -19,7 +19,7 @@ The evaluation of the MCP Server for the paper (link coming soon) was done using
 - **Generic attribute enrichment** — automatic categorical detection for generic attributes
 - **Read-only query execution** — `run_query` enforces SELECT-only; writes are blocked
 - **Prompt assembly** — `assemble_prompt` orchestrates all tools into a complete system prompt in one call
-- **Gradio chat UI** — browser-based interface with multi-LLM support (Anthropic, OpenAI, Ollama)
+- **Gradio chat UI** — browser-based interface with multi-LLM support (Anthropic, OpenAI, Ollama), thinking-level control, live reasoning trace, mermaid/LaTeX rendering, and PDF export
 - **CityGML 1.0-3.0/CityJSON import** — one-click import via the Gradio UI (fullstack Docker mode only)
 
 ---
@@ -228,11 +228,37 @@ The pre-built image (`khaoulakanna1/citydb-mcp-agent:latest`) is pulled automati
 | **MCP Inspector** | Lists all active MCP tools and lets you refresh the assembled system prompt |
 | **System Prompt** | Displays the full assembled system prompt sent to the LLM — useful for debugging |
 
-While the agent is working, the chat bubble shows live status: *Thinking…* → *Running query…* → *Interpreting results…*
+While the agent is working, the chat bubble shows live status: *Thinking…* → *Running query…* → *Interpreting results…*. Below the chat input, the **Agent activity panel** streams the full ReAct trace — each thought, tool call, and observation — with per-step timing.
 
-> **Ollama users:** Models without native tool-calling support (e.g. Qwen3 with extended thinking enabled) are handled automatically via a prompt-based fallback — no configuration needed. Expect roughly two LLM round-trips per question instead of one.
->
-> **Prompt mode (auto):** Models with ≥ 14 B parameters receive the full system prompt; smaller models receive a compact version to fit the context window. Override this per-query with the **Prompt mode** radio button in the UI (Auto / Compact / Full).
+**Chat settings** (above the input field):
+
+| Setting | Options | Description |
+|---------|---------|-------------|
+| **Provider / API** | `anthropic` / `openai` / `ollama` | Auto-selected from `.env`; can be overridden per session |
+| **Model** | (populated per provider) | Dropdown with free-text entry; **Refresh models** re-discovers models from the Ollama endpoint |
+| **Set temperature** | checkbox + value (0.0–1.0, default 0.1) | Unchecked = provider default; enable to pin a fixed temperature |
+| **Thinking** | `off` / `low` / `medium` / `high` (+ `max` for OpenAI) | Reasoning level for thinking-capable models. Ollama uses native `think`; OpenAI-compatible endpoints use `reasoning_effort`. Higher levels are slower but more thorough |
+| **Prompt mode** | `auto` / `compact` / `full` | `auto` picks compact for small local models; override for complex queries |
+| **Context window (Ollama)** | 8K / 32K / 64K / 128K / 256K (default 64K) | Tokens available to the model; 128K recommended for complex queries |
+| **Include all reasoning steps in context (Ollama)** | on / off (default on) | Feeds each turn's full trace back into context on later turns; increases token usage |
+| **Add self-summarized "lessons learned" (Ollama)** | on / off (default off) | Asks the model to summarize what it learned after each turn and carries that note forward |
+
+**Rendering and export:**
+
+- **Mermaid diagrams** are rendered inline in the chat, with a copy toolbar (SVG / PNG / source code) and a visible fallback box if a diagram fails to parse
+- **Inline LaTeX** is rendered in chat messages and the agent activity panel
+- **PDF export** (🖨 button next to the send button) prints the current conversation to a multi-page PDF via the browser's print dialog
+
+### Local (Ollama) model support
+
+The Chat Assistant is deliberately built to work with small local models, not just commercial APIs:
+
+- **Robust tool-call parser** — local models frequently emit ReAct actions in non-standard formats (e.g. a full sentence as the action name, extra whitespace, missing arguments). The parser normalises these automatically and repairs common malformations instead of aborting the run.
+- **Model profiling** — a built-in registry (`webui/model_profiles.py`) classifies known models by empirically observed behaviour (`works`, `sentence-as-tool`, `wrong-sql`, `thinking-then-empty`, `unknown`). The class drives a **warning line under the model dropdown** (e.g. a model known to emit broken SQL is forced into full prompt mode with an explanatory note), so you get an honest assessment of what a model can do before the first query.
+- **Endpoint & model discovery** — the **Refresh models** button queries the Ollama endpoint and repopulates the model dropdown, including custom or fine-tuned models.
+- **Native thinking** — for Ollama models with a thinking capability (e.g. `qwen3.8:27b`, `gpt-oss:20b`), the **Thinking** dropdown controls the native `think` parameter; no prompt engineering needed.
+
+See [`production/docs/local-model-probing.md`](production/docs/local-model-probing.md) for the full probing methodology, the per-model results, and how to add a new model profile.
 
 ### Building locally (optional)
 
@@ -395,7 +421,8 @@ At least one must be configured for the Docker variants. The Gradio UI auto-sele
 | Variable | Description |
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Anthropic API key (`sk-ant-...`) |
-| `OPENAI_API_KEY` | OpenAI API key (`sk-...`) |
+| `OPENAI_API_KEY` | OpenAI API key (`sk-...`); for Ollama via the OpenAI-compatible endpoint any non-empty value works (e.g. `ollama`) |
+| `OPENAI_BASE_URL` | Base URL for the OpenAI provider (e.g. `http://host.docker.internal:11434/v1/` to point it at a remote Ollama's OpenAI-compatible API) |
 | `OLLAMA_BASE_URL` | Ollama base URL (e.g. `http://host.docker.internal:11434`) |
 
 ### Query behaviour
@@ -434,6 +461,7 @@ is a pure data change — no code changes required.
 | `OLLAMA_NUM_CTX` | `32768` | Context window size (tokens) passed to the Ollama model |
 | `LOCAL_MAX_TOKENS` | `16000` | Maximum tokens the local model may generate per response |
 | `OLLAMA_TIMEOUT` | `300` | Timeout in seconds for Ollama requests |
+| `AGENT_MAX_ITERATIONS` | `10` | Maximum ReAct tool-call iterations per question |
 
 ---
 
@@ -495,13 +523,14 @@ is a pure data change — no code changes required.
 
   Browser ──► Gradio UI (port 7860)           [Docker variants only]
                       │
-          ┌───────────┴────────────┐
-          │                        │
-   Anthropic / OpenAI          Ollama (local)
-   LiteLLM cloud backend       LangChain ReAct
-                                (ChatOllama)
-          │                        │
-          └───────────┬────────────┘
+          ┌───────────┴──────────────────────────────┐
+          │                                          │
+   Anthropic / OpenAI                        Ollama (local)
+   LiteLLM cloud backend                     LangChain ReAct (langchain-ollama)
+   (incl. OpenAI-compatible endpoints         robust tool-call parser
+    via OPENAI_BASE_URL)                      model profiles + native thinking
+          │                                          │
+          └──────────────────────┬───────────────────┘
                       │
                MCP Client (spawns citydb-mcp subprocess)
                       │
@@ -514,7 +543,7 @@ is a pure data change — no code changes required.
 
 ## Citation
 
-This work was developed at the [Chair of Geoinformatics](https://www.asg.ed.tum.de/gis/startseite/), TUM, in the group of Prof. Dr. Thomas H. Kolbe.
+This work was developed at the [Chair of Geoinformatics](https://www.asg.ed.tum.de/gis/startseite/), TUM, in the group of Prof. Dr. Thomas H. Kolbe. Main developer: Khaoula Kanna, M.Sc.
 
 ---
 
