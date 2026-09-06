@@ -1,3 +1,5 @@
-"""MCP server for natural-language querying of 3DCityDB v5."""
+"""Tool implementations for the 3DCityDB MCP server."""
 
-__version__ = "0.1.0b1"
+from citydb_mcp import __version__
+
+__all__ = ["__version__"]

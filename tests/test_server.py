@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from citydb_mcp.db import DatabaseConnection
 from citydb_mcp.tools.dynamic_tools import scan_objectclasses, get_db_context_snapshot
 from citydb_mcp.tools.runtime_tools import run_query
+from citydb_mcp.server import _execute_tool
 
 PASS = "\033[32m[ OK ]\033[0m"
 FAIL = "\033[31m[FAIL]\033[0m"
@@ -36,6 +37,14 @@ def check(label: str, fn):
 def main():
     print("\nMCP tool smoke test")
     print(SEP)
+
+    # 0. Server version (no DB access needed)
+    version = check(
+        "get_server_version",
+        lambda: _execute_tool("get_server_version", {}),
+    )
+    if version:
+        print(f"         server version: {version}")
 
     db = DatabaseConnection()
 

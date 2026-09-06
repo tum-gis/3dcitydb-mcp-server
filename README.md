@@ -473,6 +473,7 @@ is a pure data change — no code changes required.
 
 | Tool | Description |
 |------|-------------|
+| `get_server_version` | Version of the 3DCityDB MCP server package |
 | `get_database_schema` | 3DCityDB v5 table structures and foreign key relationships |
 | `get_query_guidelines` | SQL best practices and optimisation tips for 3DCityDB |
 
@@ -545,7 +546,7 @@ is a pure data change — no code changes required.
 
 ## Citation
 
-This work was developed at the [Chair of Geoinformatics](https://www.asg.ed.tum.de/gis/startseite/), TUM, in the group of Thomas H. Kolbe. Main developer: Khaoula Kanna, M.Sc.
+This work was developed at the [Chair of Geoinformatics](https://www.asg.ed.tum.de/gis/startseite/), TUM. Main developer: Khaoula Kanna; additional testing and programming: Thomas H. Kolbe.
 
 The accompanying paper (to be published by end of September 2026) can be cited as:
 

@@ -93,6 +93,12 @@ Returns:
 
 ---
 
+### `get_server_version()`
+
+Returns the version string of the `3dcitydb-mcp-server` package (e.g. `"0.3.0"`). Takes no arguments. Any MCP client can call it to display or log the server version; the Gradio WebUI uses it for its status bar and PDF export header.
+
+---
+
 ### `get_lod_config()`
 
 Lists which LoD levels are present in `geometry_data`, grouped by object class.

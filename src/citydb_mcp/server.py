@@ -16,6 +16,7 @@ from dataclasses import asdict
 from mcp.server import Server
 from mcp.types import Tool, TextContent
 
+from . import __version__
 from .db import DatabaseConnection
 from .tools.static_tools import get_database_schema, get_query_guidelines
 from .tools.dynamic_tools import (
@@ -54,6 +55,15 @@ def _to_json(obj) -> str:
 async def list_tools() -> list[Tool]:
     return [
         # Static tools
+        Tool(
+            name="get_server_version",
+            description=(
+                "Returns the version of the 3DCityDB MCP server package. "
+                "Useful for clients that want to display or log the server "
+                "version. Takes no arguments."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
         Tool(
             name="get_database_schema",
             description=(
@@ -283,6 +293,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 def _execute_tool(name: str, arguments: dict) -> str:
     """Routes tool calls to implementations."""
+
+    # --- Version ---
+    if name == "get_server_version":
+        return __version__
 
     # --- Static tools (with caching) ---
     if name == "get_database_schema":

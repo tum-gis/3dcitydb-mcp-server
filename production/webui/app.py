@@ -34,6 +34,7 @@ load_dotenv(override=False)
 
 import gradio as gr
 
+from webui import __version__ as WEBUI_VERSION
 from webui.llm_utils import (
     ANTHROPIC_MODELS, OPENAI_MODELS, CHAT_INSTRUCTIONS,
     detect_default_provider, models_for_provider,
@@ -230,6 +231,30 @@ def _check_mcp_status() -> bool:
         return False
 
 
+# Cached MCP server version (queried once, on first status-bar render).
+_mcp_version_cache: str | None = None
+
+
+def get_mcp_version() -> str:
+    """Retrieve the MCP server version via the get_server_version tool.
+
+    Falls back to the locally installed package version if the server is
+    unreachable, so the status bar can always show *something*.
+    """
+    global _mcp_version_cache
+    if _mcp_version_cache is None:
+        try:
+            _mcp_version_cache = str(run_tool_sync("get_server_version", {})).strip()
+        except Exception:
+            try:
+                import importlib.metadata
+
+                _mcp_version_cache = importlib.metadata.version("3dcitydb-mcp-server")
+            except Exception:
+                _mcp_version_cache = "unknown"
+    return _mcp_version_cache
+
+
 def _check_provider_status(provider: str, model: str) -> bool:
     if provider == "anthropic":
         return bool(os.environ.get("ANTHROPIC_API_KEY"))
@@ -308,10 +333,12 @@ def get_status_html(provider: str = "", model: str = "", prompt_mode_label: str 
     prov_ok = _check_provider_status(provider, model) if provider else False
     prov_label = f"Provider ({provider})" if provider else "Provider"
     mode_span = f'<span>📄 {prompt_mode_label}</span>' if prompt_mode_label else ""
+    mcp_version = get_mcp_version()
     return (
         f'<div style="display:flex;gap:16px;font-size:0.85rem;padding:6px 0;">'
         f'<span>{_dot_db(db_status)} DB</span>'
-        f'<span>{_dot(mcp_ok)} MCP server</span>'
+        f'<span>{_dot(mcp_ok)} MCP server <code style="font-size:0.75rem;color:#64748b;">v{mcp_version}</code></span>'
+        f'<span>WebUI <code style="font-size:0.75rem;color:#64748b;">v{WEBUI_VERSION}</code></span>'
         f'<span>{_dot(prov_ok)} {prov_label}</span>'
         f'{mode_span}'
         f'</div>'
@@ -1921,7 +1948,8 @@ async (_win, _event_data) => {
       now.toLocaleTimeString();
     document.body.setAttribute(
       "data-print-title",
-      "3DCityDB-MCP — Chat-Export — " + printDateTime
+      "3DCityDB-MCP — Chat-Export — " + printDateTime +
+      " (__VERSIONS__)"
     );
     var modelControl = document.querySelector("#model-dropdown input") ||
       document.querySelector("#model-dropdown [role='combobox']");
@@ -1943,7 +1971,13 @@ async (_win, _event_data) => {
     document.body.removeAttribute("data-print-title");
   });
 }
-""".replace("__PRINT_CSS__", json.dumps(_PRINT_CSS))
+""".replace("__PRINT_CSS__", json.dumps(_PRINT_CSS)).replace(
+    "__VERSIONS__",
+    "MCP Server v" + get_mcp_version() + " \u00b7 WebUI v" + WEBUI_VERSION,
+).replace(
+    "__VERSIONS__",
+    "MCP Server v" + get_mcp_version() + " \u00b7 WebUI v" + WEBUI_VERSION,
+)
 
 
 def build_ui() -> gr.Blocks:
