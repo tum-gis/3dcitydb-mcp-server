@@ -1084,7 +1084,7 @@ def react_stream(
     from langchain_ollama import ChatOllama
     # num_ctx goes in model_kwargs (→ Ollama options field)
     # reasoning goes as a top-level ChatOllama kwarg (→ Ollama "think" field, not options)
-    _ctx = num_ctx if num_ctx is not None else int(os.environ.get("OLLAMA_NUM_CTX", "32768"))
+    _ctx = num_ctx if num_ctx is not None else int(os.environ.get("OLLAMA_NUM_CTX", "65536"))
     ollama_init: dict = dict(
         model=model,
         base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),

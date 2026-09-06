@@ -426,7 +426,7 @@ def _summarize_reasoning_ollama(transcript: str, model: str, num_ctx: int | None
             timeout=float(os.environ.get("OLLAMA_TIMEOUT", "300")),
             num_predict=500,
             reasoning=False,
-            model_kwargs={"num_ctx": num_ctx or 32768},
+            model_kwargs={"num_ctx": num_ctx or 65536},
         )
         result = llm.invoke([{"role": "user", "content": prompt}])
         text = (result.content or "").strip()
@@ -475,7 +475,7 @@ def chat_stream(
     print(f"[chat] prompt_mode={prompt_mode!r}  effective_compact={effective_compact}  ({mode_label})", flush=True)
 
     # Resolve num_ctx (only meaningful for local providers)
-    num_ctx = _CTX_VALUES.get(num_ctx_label, 32768) if provider in _LOCAL_PROVIDERS else None
+    num_ctx = _CTX_VALUES.get(num_ctx_label, 65536) if provider in _LOCAL_PROVIDERS else None
 
     # UI sends "off"|"low"|"medium"|"high" (+"max" for OpenAI-compatible
     # endpoints) from the thinking dropdown; backends expect False (disabled)
@@ -2584,8 +2584,8 @@ window._reloadTiles = function() {
             sp = _get_system_prompt(compact=effective_compact)
             base_msgs = [{"role": "system", "content": CHAT_INSTRUCTIONS + "\n\n" + sp}]
             base_tok = _estimate_tokens(base_msgs)
-            num_ctx = _CTX_VALUES.get(num_ctx_label, 32768) if provider in _LOCAL_PROVIDERS else None
-            ctx_limit_reset = num_ctx if num_ctx else (_get_provider_ctx_limit(provider, model) if provider else 32768)
+            num_ctx = _CTX_VALUES.get(num_ctx_label, 65536) if provider in _LOCAL_PROVIDERS else None
+            ctx_limit_reset = num_ctx if num_ctx else (_get_provider_ctx_limit(provider, model) if provider else 65536)
             reset_bar = _make_ctx_bar(base_tok, ctx_limit_reset)
             return (
                 [],

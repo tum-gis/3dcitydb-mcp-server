@@ -82,7 +82,7 @@ def _get_ollama_model_ctx(model: str) -> int:
             return int(ctx)
     except Exception:
         pass
-    configured = int(os.environ.get("OLLAMA_NUM_CTX", "32768"))
+    configured = int(os.environ.get("OLLAMA_NUM_CTX", "65536"))
     _ollama_ctx_cache[model] = configured
     return configured
 
@@ -421,7 +421,7 @@ def _litellm_kwargs(
     if provider == "ollama":
         kw["max_tokens"] = int(os.environ.get("LOCAL_MAX_TOKENS", "16000"))
         kw["api_base"] = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        ctx = num_ctx if num_ctx is not None else int(os.environ.get("OLLAMA_NUM_CTX", "32768"))
+        ctx = num_ctx if num_ctx is not None else int(os.environ.get("OLLAMA_NUM_CTX", "65536"))
         kw["extra_body"] = {"options": {"num_ctx": ctx}}
     if provider == "openai":
         openai_base = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")

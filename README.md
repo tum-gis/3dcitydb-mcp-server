@@ -423,7 +423,7 @@ At least one must be configured for the Docker variants. The Gradio UI auto-sele
 | Variable | Description |
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Anthropic API key (`sk-ant-...`) |
-| `OPENAI_API_KEY` | OpenAI API key (`sk-...`); when using Ollama via the OpenAI-compatible endpoint this value must be `ollama`) |
+| `OPENAI_API_KEY` | OpenAI API key (`sk-...`); when using Ollama via the OpenAI-compatible endpoint this value must be `ollama` |
 | `OPENAI_BASE_URL` | Base URL for the OpenAI provider. Leave empty for models offered by OpenAI. When using a locally running LLM or a remote LLM (not hosted by OpenAI) via its OpenAI-compatible API (e.g., provided by llama.cpp, vLLM, or Ollama) provide the corresponding endpoint URL (e.g. `http://host.docker.internal:11434/v1/`) |
 | `OLLAMA_BASE_URL` | Ollama base URL (e.g. `http://host.docker.internal:11434`) |
 
