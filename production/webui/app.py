@@ -338,7 +338,7 @@ def get_status_html(provider: str = "", model: str = "", prompt_mode_label: str 
         f'<div style="display:flex;gap:16px;font-size:0.85rem;padding:6px 0;">'
         f'<span>{_dot_db(db_status)} DB</span>'
         f'<span>{_dot(mcp_ok)} MCP server <code style="font-size:0.75rem;color:#64748b;">v{mcp_version}</code></span>'
-        f'<span>WebUI <code style="font-size:0.75rem;color:#64748b;">v{WEBUI_VERSION}</code></span>'
+        f'<span>ChatBot <code style="font-size:0.75rem;color:#64748b;">v{WEBUI_VERSION}</code></span>'
         f'<span>{_dot(prov_ok)} {prov_label}</span>'
         f'{mode_span}'
         f'</div>'
@@ -1973,10 +1973,7 @@ async (_win, _event_data) => {
 }
 """.replace("__PRINT_CSS__", json.dumps(_PRINT_CSS)).replace(
     "__VERSIONS__",
-    "MCP Server v" + get_mcp_version() + " \u00b7 WebUI v" + WEBUI_VERSION,
-).replace(
-    "__VERSIONS__",
-    "MCP Server v" + get_mcp_version() + " \u00b7 WebUI v" + WEBUI_VERSION,
+    "MCP Server v" + get_mcp_version() + " \u00b7 ChatBot v" + WEBUI_VERSION,
 )
 
 
