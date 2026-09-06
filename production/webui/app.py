@@ -2169,7 +2169,8 @@ def build_ui() -> gr.Blocks:
 
         with gr.Row(elem_classes="header-bar"):
             gr.HTML(
-                "<h1>3DCityDB-MCP</h1>"
+                "<h1>3DCityDB MCP Server and Chatbot - The Natural Language "
+                "Interface to your 3D city model</h1>"
                 "<p>Natural-language interface for 3DCityDB v5 "
                 f"&nbsp;&middot;&nbsp; 3DCityDB MCP Server v{get_mcp_version()} "
                 f"&nbsp;&middot;&nbsp; ChatBot v{CHATBOT_VERSION} "
