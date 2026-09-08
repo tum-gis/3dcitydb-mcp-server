@@ -52,6 +52,20 @@ class DatabaseConnection:
                     )
         return self._pool
 
+    def _configure_connection(self, conn) -> None:
+        """Configure a borrowed connection for read-only query work.
+
+        - autocommit: each statement runs in its own implicit transaction.
+        - default_transaction_read_only: hard, DB-level guarantee that no
+          data-modifying statement (DML or DDL) can succeed on this session,
+          regardless of what the application sends. This is the security
+          boundary; application-level SQL string checks (e.g. in run_query)
+          are only fast-fail conveniences on top of it.
+        """
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SET default_transaction_read_only = on")
+
     def connect(self):
         """Back-compat: return a borrowed connection.
 
@@ -61,7 +75,7 @@ class DatabaseConnection:
         """
         pool = self._get_pool()
         conn = pool.getconn()
-        conn.autocommit = True
+        self._configure_connection(conn)
         return conn
 
     def _release(self, conn) -> None:
@@ -79,7 +93,7 @@ class DatabaseConnection:
         pool = self._get_pool()
         conn = pool.getconn()
         try:
-            conn.autocommit = True
+            self._configure_connection(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 # Identifier-quote the schema name; defence-in-depth on top of
                 # the regex validation in __init__.

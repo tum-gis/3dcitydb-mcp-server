@@ -17,7 +17,7 @@ The evaluation of the MCP Server for the paper (link coming soon) was done using
 - **Property filtering** — only includes properties that actually exist in the database
 - **Country-aware codelist resolution** — qualified `<namespace>:<Class>.<attribute>` keys, country selected via the database EPSG code; only codes actually present in the data are exposed
 - **Generic attribute enrichment** — automatic categorical detection for generic attributes
-- **Read-only query execution** — `run_query` enforces SELECT-only; writes are blocked
+- **Read-only query execution** — `run_query` enforces SELECT-only; writes are blocked at the application layer *and* the database layer, where every pooled connection runs in a read-only transaction (`default_transaction_read_only = on`) so even a crafted CTE hiding a write is rejected by PostgreSQL
 - **Prompt assembly** — `assemble_prompt` orchestrates all tools into a complete system prompt in one call
 - **Gradio chat UI** — browser-based interface with multi-LLM support (Anthropic, OpenAI, Ollama), thinking-level control, live reasoning trace, mermaid/LaTeX rendering, and PDF export
 - **CityGML 1.0-3.0/CityJSON import** — one-click import via the Gradio UI (fullstack Docker mode only)

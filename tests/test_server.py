@@ -81,6 +81,22 @@ def main():
     else:
         print(f"  {FAIL} run_query did not block INSERT -- check the guard in run_query()")
 
+    # 5b. run_query -- a CTE hiding a DELETE slips past the SELECT/WITH prefix
+    # guard, so it must be rejected at the database level by the
+    # default_transaction_read_only session setting (not by the string check).
+    cte_result = run_query(
+        db,
+        "WITH del AS (DELETE FROM feature WHERE id < 0 RETURNING *) "
+        "SELECT count(*) AS n FROM del",
+    )
+    blocked = (not cte_result.get("success")) and "read-only" in cte_result.get("error", "").lower()
+    if blocked:
+        print(f"  {PASS} run_query blocks CTE-DELETE at the DB level")
+        print(f"         error: {cte_result['error']}")
+    else:
+        print(f"  {FAIL} run_query did NOT block CTE-DELETE at the DB level")
+        print(f"         success={cte_result.get('success')} error: {cte_result.get('error')}")
+
     db.close()
     print(SEP)
     print("Done.\n")

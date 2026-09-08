@@ -28,7 +28,11 @@ def run_query(db: DatabaseConnection, sql: str, row_limit: int = 500) -> dict:
     Returns results as JSON with column names, rows, execution time.
     Maps to: QueryFeedback (execution_time_ms, result_count, error_message)
     """
-    # Safety: only allow SELECT statements
+    # Safety: fast-fail guard for the common case (plain SELECT/WITH).
+    # This is NOT the security boundary — DatabaseConnection configures every
+    # pooled session with `default_transaction_read_only = on`, so the database
+    # itself rejects any data-modifying statement (e.g. a CTE hiding a
+    # DELETE/UPDATE) even if it slips past this prefix check.
     sql_stripped = sql.strip().upper()
     if not sql_stripped.startswith("SELECT") and not sql_stripped.startswith("WITH"):
         return {
