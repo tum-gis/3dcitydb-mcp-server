@@ -840,6 +840,48 @@ def refresh_provider_models(provider: str) -> gr.update:
     return gr.update(choices=models, value=default, info=info)
 
 
+def _rediscover_models(provider: str, attempts: int = 3, delay: float = 1.0) -> tuple:
+    """Re-run model discovery for ``provider``, with a short bounded retry.
+
+    Model discovery also happens at build time, but on a freshly started
+    container the local (Ollama) endpoint may not be reachable yet. In that case
+    OpenAI mode silently falls back to the static model list and the "Refresh
+    models" button stays hidden, with no way to trigger a re-scan. This is called
+    from the page-load handler (after a browser connects, i.e. once the stack has
+    had time to come up) and retries a few times in case the endpoint is still
+    warming up.
+
+    Returns ``(models, openai_ollama)`` where ``openai_ollama`` is True when
+    OpenAI mode is actually backed by a reachable Ollama-compatible endpoint.
+    """
+    import time as _time
+
+    def _once() -> tuple:
+        # (models, local_ok)
+        if provider == "openai":
+            ollama = get_openai_ollama_models()
+            return (ollama or OPENAI_MODELS), bool(ollama)
+        if provider == "ollama":
+            found = get_ollama_models()
+            return found, bool(found)
+        return models_for_provider(provider), True
+
+    # Only retry when a local endpoint is actually configured and came back empty;
+    # otherwise a real OpenAI/Anthropic config would needlessly wait.
+    retryable = (
+        (provider == "ollama" and bool(os.environ.get("OLLAMA_BASE_URL", "").strip()))
+        or (provider == "openai" and os.environ.get("OPENAI_API_KEY", "").strip().lower() == "ollama")
+    )
+    models, local_ok = _once()
+    for _ in range(max(0, attempts - 1)):
+        if not (retryable and not local_ok):
+            break
+        _time.sleep(delay)
+        models, local_ok = _once()
+    openai_ollama = bool(local_ok) if provider == "openai" else False
+    return models, openai_ollama
+
+
 # ── Import tab (fullstack only) ────────────────────────────────────────────────
 
 def build_import_tab(
@@ -2678,7 +2720,26 @@ window._reloadTiles = function() {
                 "",
                 gr.update(interactive=False, placeholder="Assembling agent context, please wait…"),
                 gr.update(interactive=False),
+                gr.update(),
+                gr.update(),
             )
+
+            # Re-discover models now that a browser has connected. Model discovery
+            # also runs at build time, but on a freshly started container the local
+            # (Ollama) endpoint may not have been reachable yet, leaving OpenAI mode
+            # on the static fallback list with the Refresh button hidden. Re-run it
+            # here (with a short retry) so the dropdown reflects the real models.
+            models, openai_ollama = _rediscover_models(provider)
+            if models and model not in models:
+                model = models[0]
+            is_ollama = provider == "ollama"
+            model_info = (
+                "Detected Ollama through OPENAI_BASE_URL; models were downloaded from the Ollama server."
+                if openai_ollama
+                else "Type a custom model name when using OPENAI_BASE_URL to point at vLLM, llama.cpp, or another OpenAI-compatible server."
+            )
+            dropdown_upd = gr.update(choices=models, value=model, info=model_info)
+            refresh_upd = gr.update(visible=is_ollama or openai_ollama)
 
             _, label = _resolve_compact(prompt_mode, provider, model)
             db_status = _check_db_status()
@@ -2694,12 +2755,15 @@ window._reloadTiles = function() {
                 warning_html,
                 gr.update(interactive=True, placeholder="Ask about your city model…"),
                 gr.update(interactive=True),
+                dropdown_upd,
+                refresh_upd,
             )
 
         demo.load(
             fn=_on_load,
             inputs=[provider_radio, model_dropdown, prompt_mode_radio, num_ctx_dropdown],
-            outputs=[status_bar, context_bar, db_warning, msg_input, send_btn],
+            outputs=[status_bar, context_bar, db_warning, msg_input, send_btn,
+                     model_dropdown, refresh_ollama_btn],
         )
 
     return demo
