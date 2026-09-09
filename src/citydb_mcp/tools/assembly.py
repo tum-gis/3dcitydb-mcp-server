@@ -506,7 +506,7 @@ what the `resolve_properties` tool does.
 (e.g. Building → AbstractBuilding → ... → AbstractObject). \
 The `namespace` table maps namespace IDs to their URI prefixes \
 (e.g. namespace_id=1 → CityGML core, namespace_id=3 → generic attributes, \
-namespace_id=8 → building module). Always use `namespace_id` together with \
+namespace_id=10 → building module). Always use `namespace_id` together with \
 `property.name` to unambiguously identify a property. \
 The `datatype` table registers every primitive and complex type used in CityGML \
 (e.g. Boolean, Integer, Double, String, Code, Measure, AddressProperty, \
@@ -779,7 +779,7 @@ def _render_objectclasses(catalog: ObjectClassCatalog, compact: bool = False,
             lines.append("  A single building may have multiple geometry_data rows (one solid, one surface).")
             lines.append("  Filter by geometry type using: (g.geometry_properties->>'type')::int")
             lines.append("    - Volume queries:       WHERE (g.geometry_properties->>'type')::int IN (9, 10, 11)  -- Solid / CompositeSolid / MultiSolid")
-            lines.append("    - Surface area queries: WHERE (g.geometry_properties->>'type')::int IN (6, 8)  -- CompositeSurface / MultiSurface")
+            lines.append("    - Surface area queries: WHERE (g.geometry_properties->>'type')::int IN (5, 6, 7, 8)  -- Polygon / CompositeSurface / TriangulatedSurface / MultiSurface")
             lines.append("  If geometry_data is empty/null, fall back to boundary surfaces (GroundSurface, RoofSurface, etc.).")
             lines.append("  Volume: CG_Volume(CG_MakeSolid(g.geometry)) — geometry must be closed (ST_IsClosed = true).")
             lines.append("")
