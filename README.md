@@ -546,7 +546,7 @@ is a pure data change — no code changes required.
 
 ## Citation
 
-This work was developed at the [Chair of Geoinformatics](https://www.asg.ed.tum.de/gis/startseite/), TUM. Main developer: Khaoula Kanna; additional testing and programming: Thomas H. Kolbe.
+This work was developed at the [Chair of Geoinformatics](https://www.asg.ed.tum.de/gis/startseite/), Technical University of Munich (TUM). Main developer: Khaoula Kanna; additional testing and programming: Thomas H. Kolbe.
 
 The accompanying paper (to be published by end of September 2026) can be cited as:
 
@@ -558,6 +558,19 @@ The accompanying paper (to be published by end of September 2026) can be cited a
     year      = {2026},
 }
 ```
+
+---
+
+## Ideas for Future Developments
+
+We (the developers) have a number of ideas for future improvements and
+extensions of the ChatBot and the MCP server. They are described in these
+documents:
+
+- [`idea-for-future-multiple-MCP-servers.md`](production/docs/idea-for-future-multiple-MCP-servers.md) — turning the WebUI into a general-purpose agent shell that can connect to several MCP servers configured via `.env`.
+- [`idea-for-future-websearch.md`](production/docs/idea-for-future-websearch.md) — giving the ChatBot the ability to do web searches and to download & inspect files (e.g. specifications) using a self-hosted SearXNG metasearch engine.
+- [`idea-for-future-Openstreetmap-interface.md`](production/docs/idea-for-future-Openstreetmap-interface.md) — querying OpenStreetMap geodata (Nominatim / Overpass) to enrich 3DCityDB queries with real-world context.
+- [`idea-for-future-write-access.md`](production/docs/idea-for-future-write-access.md) — opt-in write access (DML / DDL) to the database for experimentation, off by default.
 
 ---
 
