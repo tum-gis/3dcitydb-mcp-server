@@ -51,9 +51,44 @@ def _cancel_active_future() -> None:
 _ollama_ctx_cache: dict[str, int] = {}
 
 
-def _estimate_tokens(messages: list[dict]) -> int:
-    """Rough token count using 3 chars ≈ 1 token heuristic."""
-    return sum(len(str(m.get("content") or "")) for m in messages) // 3
+def _msg_text(m) -> str:
+    """Extract the text of a message that actually goes into the model context:
+    the content plus any tool-call arguments (SQL queries make up a significant
+    share of the context in tool-calling turns). Works for plain dicts and
+    litellm/pydantic message objects."""
+    if hasattr(m, "get"):
+        try:
+            content = m.get("content")
+            tcs = m.get("tool_calls") or []
+        except Exception:
+            content, tcs = str(m or ""), []
+    else:
+        content, tcs = str(m or ""), []
+    out = str(content or "")
+    for tc in tcs:
+        if hasattr(tc, "function") and tc.function is not None:
+            fn = tc.function
+            name = str(getattr(fn, "name", "") or "")
+            args = getattr(fn, "arguments", None)
+        elif isinstance(tc, dict):
+            fnd = tc.get("function") or {}
+            name = str(fnd.get("name") or "")
+            args = fnd.get("arguments")
+        else:
+            name, args = "", None
+        if isinstance(args, (dict, list)):
+            args = json.dumps(args)
+        out += name + str(args or "")
+    return out
+
+
+def _estimate_tokens(messages: list) -> int:
+    """Rough token count using 3 chars ≈ 1 token heuristic.
+
+    Counts message content AND tool-call arguments, and includes replayed
+    reasoning transcripts (they are part of the assistant message content by
+    the time the messages list is built in app.py)."""
+    return sum(len(_msg_text(m)) for m in messages) // 3
 
 
 def _get_ollama_model_ctx(model: str) -> int:

@@ -240,8 +240,8 @@ While the agent is working, the chat bubble shows live status: *Thinking…* →
 | **Thinking** | `off` / `low` / `medium` / `high` (+ `max` for OpenAI) | Reasoning level for thinking-capable models. Ollama uses native `think`; OpenAI-compatible endpoints use `reasoning_effort`. Higher levels are slower but more thorough |
 | **Prompt mode** | `auto` / `compact` / `full` | `auto` picks compact for small local models; override for complex queries |
 | **Context window (Ollama)** | 8K / 32K / 64K / 128K / 256K (default 64K) | Tokens available to the model; 128K recommended for complex queries |
-| **Include all reasoning steps in context (Ollama)** | on / off (default on) | Feeds each turn's full trace back into context on later turns; increases token usage |
-| **Add self-summarized "lessons learned" (Ollama)** | on / off (default off) | Asks the model to summarize what it learned after each turn and carries that note forward |
+| **Include all reasoning steps in context** | on / off (default on; Ollama + OpenAI) | Feeds each turn's full reasoning trace back into context on later turns; increases token usage. Requires a reasoning-capable model (no effect for models without a reasoning stream) |
+| **Keep a distilled summary of how the answer was found** | on / off (default on; Ollama + OpenAI) | After each DB turn, distills the successful path (purpose + working SQL + short result) into a compact story carried into later turns. Adds one extra blocking generation per tool-using turn |
 
 **Rendering and export:**
 
@@ -464,6 +464,17 @@ is a pure data change — no code changes required.
 | `LOCAL_MAX_TOKENS` | `16000` | Maximum tokens the local model may generate per response |
 | `OLLAMA_TIMEOUT` | `300` | Timeout in seconds for Ollama requests |
 | `AGENT_MAX_ITERATIONS` | `10` | Maximum ReAct tool-call iterations per question |
+
+### WebUI story distillation (optional)
+
+The "Keep a distilled summary" feature (chat WebUI) distills each turn's
+reasoning trace into a compact story. Both knobs apply to the distillation
+call regardless of provider (Ollama or OpenAI-compatible).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STORY_TRANSCRIPT_MAX_CHARS` | `30000` | Maximum characters of the reasoning transcript fed into the distillation prompt. Tail-preserving: if the trace is longer, the *beginning* is cut (early exploration) so the final successful queries are always kept |
+| `STORY_MAX_TOKENS` | `2000` | Maximum tokens the story itself may contain (OpenAI-compatible provider; the Ollama path is fixed at 700) |
 
 ---
 

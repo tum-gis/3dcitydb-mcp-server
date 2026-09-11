@@ -218,6 +218,28 @@ class _EventCallback(BaseCallbackHandler):
         self._last_action_key = None
         self._consecutive_repeats = 0
         self._llm_calls = 0
+        # Live context-window tracking for the UI bar. ReAct re-sends the full
+        # system prompt + history plus the growing scratchpad to Ollama on
+        # every LLM call, so the pre-turn estimate grows during the run —
+        # mirror that growth with throttled context_update events.
+        self._ctx_base_tok = 0
+        self._ctx_limit = 0
+        self._ctx_growth_chars = 0
+        self._ctx_last_emit = 0.0
+
+    def set_context_state(self, base_tok: int, limit: int) -> None:
+        self._ctx_base_tok = base_tok
+        self._ctx_limit = limit
+
+    def _ctx_emit(self, chars: int, force: bool = False) -> None:
+        """Push a throttled context_update for the growing ReAct context."""
+        self._ctx_growth_chars += chars
+        now = _time.monotonic()
+        if not force and now - self._ctx_last_emit < 0.75:
+            return
+        self._ctx_last_emit = now
+        used = self._ctx_base_tok + self._ctx_growth_chars // 3
+        self._q.put(("context_update", {"used": used, "limit": self._ctx_limit}))
 
     @staticmethod
     def _parse_tool_output(output: str) -> dict:
@@ -286,6 +308,7 @@ class _EventCallback(BaseCallbackHandler):
         else:
             self._last_action_key = key
             self._consecutive_repeats = 1
+        self._ctx_emit(len(sql), force=True)
         self._q.put(("tool_call", {"tool": "run_query", "args": {"sql": sql}, "iteration": self._iteration}))
         self._q.put(("status", "Running query…"))
 
@@ -294,6 +317,7 @@ class _EventCallback(BaseCallbackHandler):
             self._in_error_retry = False
             return
         result_data = self._parse_tool_output(str(output))
+        self._ctx_emit(len(str(output)), force=True)
         self._q.put(("tool_result", {**result_data, "iteration": self._iteration}))
         self._iteration += 1
         has_problem = bool(result_data.get("error")) or result_data.get("row_count", 0) == 0
@@ -329,6 +353,7 @@ class _EventCallback(BaseCallbackHandler):
                     r = (msg.additional_kwargs or {}).get("reasoning_content", "")
                     if r:
                         self._raw_buffer += r
+                        self._ctx_emit(len(r))
                         now = _time.monotonic()
                         if len(self._raw_buffer) >= 8 or (now - self._last_flush) >= 0.05:
                             self._flush_raw()
@@ -342,6 +367,7 @@ class _EventCallback(BaseCallbackHandler):
             # tokens live into Agent Activity, batched to avoid flooding the
             # UI with a re-render on every single sub-word token.
             self._raw_buffer += token
+            self._ctx_emit(len(token))
             now = _time.monotonic()
             if len(self._raw_buffer) >= 8 or (now - self._last_flush) >= 0.05:
                 self._flush_raw()
@@ -1254,6 +1280,9 @@ def react_stream(
 
     # ── Context usage (approximate — system + conversation) ───────────────────
     _used_tok, _ctx_limit, _ = _log_context_usage(provider, model, messages, num_ctx=num_ctx)
+    # Let the callback keep the UI bar current while the ReAct scratchpad
+    # grows during the run (see _EventCallback._ctx_emit).
+    callback.set_context_state(_used_tok, _ctx_limit)
     yield ("context_update", {"used": _used_tok, "limit": _ctx_limit})
     yield ("status", "Reasoning…")
 

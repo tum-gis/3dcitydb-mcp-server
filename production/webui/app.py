@@ -392,13 +392,25 @@ def _esc_angle(text: str) -> str:
 
 def _build_reasoning_transcript(events: list) -> str:
     """Reconstruct a compact thought/action/observation transcript from the
-    raw event stream (Ollama only — relies on local.py's thinking_token
-    events). Used to optionally replay reasoning into future turns' context.
+    raw event stream. Used to optionally replay reasoning into future turns'
+    context.
+
+    Handles both reasoning styles:
+    - Ollama: live ``thinking_token`` stream (local.py).
+    - OpenAI-compatible: complete ``thinking`` blobs emitted per LLM call
+      (cloud.py, from reasoning_content / reasoning_details fields).
+    A given turn only ever uses one of the two, so both are appended to the
+    same buffer without ambiguity.
     """
     parts: list[str] = []
     buf = ""
     for event, data in events:
-        if event == "thinking_token":
+        if event in ("thinking_token", "thinking"):
+            # Flush any partial stream before a complete reasoning blob so
+            # the transcript stays in stream order.
+            if event == "thinking" and buf.strip():
+                parts.append(buf.strip())
+                buf = ""
             buf += data
         elif event == "tool_call":
             if buf.strip():
@@ -416,32 +428,67 @@ def _build_reasoning_transcript(events: list) -> str:
     return "\n".join(parts)
 
 
-def _summarize_reasoning_ollama(transcript: str, model: str, num_ctx: int | None) -> tuple[str, str]:
-    """Ask the same Ollama model to distill its own reasoning trace from this
-    turn into a short "lessons learned" note, carried into future turns.
+def _trim_transcript_for_story(transcript: str) -> str:
+    """Bound the transcript fed to the story distillation prompt.
 
-    Runs synchronously — adds one extra (blocking) generation after the turn
-    that just finished. Returns (summary, error) — exactly one is truthy.
-    On failure, or an empty/uninformative response, summary is "" and error
-    explains why, so the caller can surface it instead of failing silently.
+    Tail-preserving: the *latest* part of the trace is kept. The successful
+    final queries (the actual success path the story must capture) sit at
+    the END of the transcript, after early exploration and failed branches —
+    a prefix cut (the old behaviour) dropped exactly that material on long
+    thinking runs. 30k chars (~8k tokens) is small against the >=64k context
+    windows of the models we target, so most transcripts fit in full.
+    """
+    max_chars = int(os.environ.get("STORY_TRANSCRIPT_MAX_CHARS", "30000"))
+    if len(transcript) <= max_chars:
+        return transcript
+    return "[…] earlier trace truncated […]\n" + transcript[-max_chars:]
+
+
+def _summarize_story_ollama(transcript: str, question: str, model: str, num_ctx: int | None) -> tuple[str, str]:
+    """Ask the same Ollama model to distill this turn's reasoning chain into a
+    compact "how the answer was found" story: numbered steps of
+    purpose → verbatim SQL → short result, dead-end branches excluded (they
+    may only appear as one-line "Avoid:" warnings).
+
+    The story is replayed into later turns' context so follow-up questions
+    can adapt earlier (working) queries instead of re-deriving them from
+    scratch. Runs synchronously — adds one extra blocking generation after
+    the turn that just finished. Returns (story, error) — exactly one is
+    truthy; on failure story is "" and error explains why.
     """
     if not transcript.strip():
-        return "", "no reasoning transcript to summarize"
+        return "", "no reasoning transcript to distill"
 
-    # langchain-ollama >= 0.3 maps `reasoning=False` to Ollama's top-level
-    # "think": false, so the previous raw-urllib workaround (added because
-    # 0.2.0 had no think/reasoning field at all) is no longer needed.
     from langchain_ollama import ChatOllama
 
+    trace = _trim_transcript_for_story(transcript)
     prompt = (
-        "Below is your own reasoning trace from answering a database question, "
-        "including any failed attempts and corrections:\n\n"
-        f"{transcript[:8000]}\n\n"
-        "In at most 3 short bullet points, note anything durable you learned that "
-        "would help you answer similar questions faster next time (correct table/column "
-        "mappings, working SQL patterns, mistakes to avoid). Be concise and factual — "
-        "do not restate the question or the final answer. "
-        "If there is nothing generalizable, reply with exactly: (nothing to note)"
+        "A database assistant answered the user question below. Its full "
+        "reasoning trace (including abandoned, failed, or superseded "
+        "approaches) is provided after it. If the trace starts with a "
+        "truncation marker, the missing earlier part contained exploration "
+        "or failed branches — base the story only on the visible steps.\n\n"
+        f"USER QUESTION: {question[:500]}\n\n"
+        f"REASONING TRACE:\n{trace}\n\n"
+        "Write a compact story of ONLY the successful path that led to the "
+        "final answer, using exactly this structure:\n"
+        "1. <one short line: what this step achieved>\n"
+        "   SQL: <the SQL of this step, VERBATIM — copy it exactly, never "
+        "abbreviate, paraphrase, or truncate it>\n"
+        "   Result: <one or two lines: row count, the key values used, any "
+        "notable anomaly>\n"
+        "2. … (repeat per successful step, in order)\n"
+        "End with one 'Avoid:' line per abandoned or failed approach worth "
+        "remembering (one line each, e.g. a wrong column or code mapping the "
+        "agent corrected). If none, write 'Avoid: none'.\n"
+        "Rules:\n"
+        "- Do NOT include SQL from abandoned branches as numbered steps — "
+        "only as 'Avoid:' warnings.\n"
+        "- The SQL lines must be byte-for-byte identical to the trace.\n"
+        "- Make explicit WHY the final query works: the key table/column "
+        "mappings it relies on.\n"
+        "- Prose budget: at most 300 words outside the SQL blocks. No extra "
+        "sections, no restatement of the final answer."
     )
     try:
         llm = ChatOllama(
@@ -449,19 +496,93 @@ def _summarize_reasoning_ollama(transcript: str, model: str, num_ctx: int | None
             base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
             temperature=0.0,
             timeout=float(os.environ.get("OLLAMA_TIMEOUT", "300")),
-            num_predict=500,
+            num_predict=700,
             reasoning=False,
             model_kwargs={"num_ctx": num_ctx or 65536},
         )
         result = llm.invoke([{"role": "user", "content": prompt}])
         text = (result.content or "").strip()
         if not text:
-            return "", "model returned an empty response"
-        if text.lower().startswith("(nothing"):
-            return "", "model reported nothing generalizable to note"
+            return "", "model returned an empty story"
         return text, ""
     except Exception as exc:
-        print(f"[chat] lessons-learned summarization failed: {exc}", flush=True)
+        print(f"[chat] story summarization failed: {exc}", flush=True)
+        return "", f"{type(exc).__name__}: {exc}"
+
+
+def _summarize_story_openai(transcript: str, question: str, model: str) -> tuple[str, str]:
+    """OpenAI-provider twin of _summarize_story_ollama: distill this turn's
+    reasoning trace into the same compact "how the answer was found" story.
+
+    Uses the shared LiteLLM plumbing (safe_completion / _litellm_kwargs) so
+    OLLAMA-hosted OpenAI-compatible endpoints work out of the box. Runs
+    synchronously — one extra blocking generation. Returns (story, error);
+    exactly one is truthy.
+    """
+    if not transcript.strip():
+        return "", "no reasoning transcript to distill"
+
+    from webui.llm_utils import safe_completion, _litellm_kwargs
+
+    trace = _trim_transcript_for_story(transcript)
+    prompt = (
+        "A database assistant answered the user question below. Its full "
+        "reasoning trace (including abandoned, failed, or superseded "
+        "approaches) is provided after it. If the trace starts with a "
+        "truncation marker, the missing earlier part contained exploration "
+        "or failed branches — base the story only on the visible steps.\n\n"
+        f"USER QUESTION: {question[:500]}\n\n"
+        f"REASONING TRACE:\n{trace}\n\n"
+        "Write a compact story of ONLY the successful path that led to the "
+        "final answer, using exactly this structure:\n"
+        "1. <one short line: what this step achieved>\n"
+        "   SQL: <the SQL of this step, VERBATIM — copy it exactly, never "
+        "abbreviate, paraphrase, or truncate it>\n"
+        "   Result: <one or two lines: row count, the key values used, any "
+        "notable anomaly>\n"
+        "2. … (repeat per successful step, in order)\n"
+        "End with one 'Avoid:' line per abandoned or failed approach worth "
+        "remembering (one line each, e.g. a wrong column or code mapping the "
+        "agent corrected). If none, write 'Avoid: none'.\n"
+        "Rules:\n"
+        "- Do NOT include SQL from abandoned branches as numbered steps — "
+        "only as 'Avoid:' warnings.\n"
+        "- The SQL lines must be byte-for-byte identical to the trace.\n"
+        "- Make explicit WHY the final query works: the key table/column "
+        "mappings it relies on.\n"
+        "- Prose budget: at most 300 words outside the SQL blocks. No extra "
+        "sections, no restatement of the final answer."
+    )
+    try:
+        # enable_thinking=False → reasoning_effort "none" where supported,
+        # so the distillation call stays fast and cheap.
+        #
+        # Deliberately NO temperature here: forcing temperature=0.0 through
+        # the OpenAI-compatible path makes thinking models (gpt-oss,
+        # gemma4) spend the entire completion budget on reasoning and return
+        # empty content (finish_reason=length, content=""). With the model's
+        # default sampling they produce the requested structure reliably.
+        kw = _litellm_kwargs("openai", model, None, enable_thinking=False)
+        kw["max_tokens"] = int(os.environ.get("STORY_MAX_TOKENS", "2000"))
+        # litellm silently drops the reasoning_effort kwarg for generic
+        # OpenAI-compatible endpoints (verified: the outgoing create() call
+        # carries no reasoning_effort and an empty extra_body). extra_body is
+        # forwarded verbatim, so force it through there.
+        kw["extra_body"] = {"reasoning_effort": "none"}
+        for attempt in (1, 2):
+            resp = safe_completion(kw, messages=[{"role": "user", "content": prompt}])
+            text = (resp.choices[0].message.content or "").strip()
+            if text:
+                return text, ""
+            finish = resp.choices[0].finish_reason
+            print(
+                f"[chat] story summarization (openai) attempt {attempt} "
+                f"returned empty content (finish_reason={finish})",
+                flush=True,
+            )
+        return "", "model returned an empty story"
+    except Exception as exc:
+        print(f"[chat] story summarization (openai) failed: {exc}", flush=True)
         return "", f"{type(exc).__name__}: {exc}"
 
 
@@ -478,15 +599,18 @@ def chat_stream(
     log_history: list | None = None,
     tool_cache: dict | None = None,
     reasoning_replay: bool = False,
-    add_lessons: bool = False,
+    add_story: bool = False,
     reasoning_history: list | None = None,
-    lessons_note: str | None = None,
+    story_history: list | None = None,
 ) -> Generator[tuple, None, None]:
     if log_history is None:
         log_history = []
-    # Reasoning trace per turn (Ollama only), index-aligned with `history`.
-    # See _build_reasoning_transcript / the two toggles below.
+    # Reasoning trace per turn, index-aligned with `history`. See
+    # _build_reasoning_transcript / the two toggles below.
     reasoning_history = list(reasoning_history) if reasoning_history else []
+    # Distilled "how the answer was found" story per turn (index-aligned
+    # with `history`). See _summarize_story_ollama.
+    story_history = list(story_history) if story_history else []
     # Cache value to emit alongside every yield. Starts as whatever the UI
     # passed in; reassigned after a successful tool result this turn.
     cache_out = tool_cache if _cache_is_fresh(tool_cache) else None
@@ -515,7 +639,7 @@ def chat_stream(
     _NO_CTX = gr.update()
 
     if not user_message.strip():
-        yield history, history, "*Idle.*", "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+        yield history, history, "*Idle.*", "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
         return
 
     answer_started = time.perf_counter()
@@ -525,10 +649,10 @@ def chat_stream(
     # Enable "prev" immediately if earlier turns already exist, instead of
     # leaving the log-nav buttons frozen in their last-completed-turn state
     # for the whole duration of this (possibly slow, local-model) turn.
-    yield history, history, "*Idle.*", "", stop_update, _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(interactive=len(log_history) > 0), gr.update(interactive=False), cache_out, reasoning_history, lessons_note
+    yield history, history, "*Idle.*", "", stop_update, _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(interactive=len(log_history) > 0), gr.update(interactive=False), cache_out, reasoning_history, story_history
 
     history[-1][1] = "*Connecting to knowledge base…*"
-    yield history, history, "*Idle.*", "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+    yield history, history, "*Idle.*", "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
     sp = _get_system_prompt(compact=effective_compact)
     system_prompt = CHAT_INSTRUCTIONS + "\n\n" + sp
     total_chars = len(system_prompt)
@@ -539,7 +663,7 @@ def chat_stream(
         re.IGNORECASE,
     )
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
-    _replay_reasoning = reasoning_replay and provider == "ollama"
+    _replay_reasoning = reasoning_replay
     for idx, (user_msg, asst_msg) in enumerate(history[:-1]):
         if user_msg:
             messages.append({"role": "user", "content": user_msg})
@@ -549,14 +673,14 @@ def chat_stream(
             content = asst_msg
             if _replay_reasoning and idx < len(reasoning_history) and reasoning_history[idx]:
                 content = f"[Reasoning]\n{reasoning_history[idx]}\n\n[Answer]\n{asst_msg}"
+            if add_story and idx < len(story_history) and story_history[idx]:
+                content += (
+                    "\n\n[How I solved it (verified queries — adapt them for "
+                    "similar follow-ups; row counts are condition-bound)]\n"
+                    + story_history[idx]
+                )
             messages.append({"role": "assistant", "content": content})
     messages.append({"role": "user", "content": user_message})
-
-    # Self-summarized "lessons learned" from previous turns (Ollama only).
-    # Inserted before the tool-result cache note below so both survive
-    # _trim_messages (which keeps all system-role messages).
-    if add_lessons and provider == "ollama" and lessons_note:
-        messages.insert(1, {"role": "system", "content": f"[Lessons learned from previous turns]\n{lessons_note}"})
 
     # If we have a fresh cache from the previous turn, inject it as an extra
     # system message right after the main system prompt. _trim_messages keeps
@@ -610,7 +734,7 @@ def chat_stream(
             f"Start a **New conversation** if you want a clean slate."
         )
         history = history + [[None, ctx_warning]]
-    yield history, history, trace_md, "", gr.update(), _NO_HL, ctx_bar_html, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+    yield history, history, trace_md, "", gr.update(), _NO_HL, ctx_bar_html, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
 
     def _render_tool_call(sql: str, it: int) -> str:
         return log(
@@ -643,12 +767,13 @@ def chat_stream(
                 got_content = True
                 history[-1][1] = "*Stopped.*"
                 trace_md = log("⛔ **Stopped by user.**")
+                story_history = story_history + [None]  # keep index alignment
                 display_history = _history_with_duration(history, answer_started)
-                yield display_history, history[:-1], trace_md, "", gr.update(visible=False), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+                yield display_history, history[:-1], trace_md, "", gr.update(visible=False), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
                 return
 
             elif event == "ping":
-                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
 
             elif event == "status":
                 history[-1][1] = f"*{data}*"
@@ -658,23 +783,23 @@ def chat_stream(
                     trace_md = log(f"⏳ **Processing query using model {model}:** {_q}")
                 elif data not in ("Thinking…", "Formulating…", "Formulating query…", "Reasoning…"):
                     trace_md = log(f"⏳ **{data}**")
-                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
 
             elif event == "context_update":
                 ctx_bar_html = _make_ctx_bar(data["used"], ctx_limit)
-                yield history, history, trace_md, "", gr.update(), _NO_HL, ctx_bar_html, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+                yield history, history, trace_md, "", gr.update(), _NO_HL, ctx_bar_html, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
 
             elif event == "thinking":
                 got_content = True
                 # Escape < / > (mermaid <<stereotypes>>, --|> arrows) so the
                 # raw reasoning is displayed as literal text.
                 trace_md = log(f"🧠 **Model reasoning:**\n\n> {_esc_angle(data.strip())}")
-                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
 
             elif event == "thinking_token":
                 got_content = True
                 trace_md = _stream_thinking(data)
-                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
 
             elif event == "tool_call":
                 got_content = True
@@ -686,7 +811,7 @@ def chat_stream(
                 history[-1][1] = (
                     (accumulated + " *(running query…)*") if accumulated else "*Running query…*"
                 )
-                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
 
             elif event == "tool_result":
                 trace_md = _render_tool_result(data)
@@ -698,13 +823,13 @@ def chat_stream(
                     )
                     if new_cache is not None:
                         cache_out = new_cache
-                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
 
             else:  # "final"
                 got_content = True
                 accumulated += data
                 history[-1][1] = accumulated + " ▌"
-                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+                yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
 
     except Exception as exc:
         import traceback
@@ -732,8 +857,9 @@ def chat_stream(
         # usable reasoning — append a placeholder so reasoning_history stays
         # index-aligned with history turn-for-turn.
         reasoning_history = reasoning_history + [None]
+        story_history = story_history + [None]  # keep index alignment
         display_history = _history_with_duration(history, answer_started)
-        yield display_history, history, trace_md, "", gr.update(visible=False), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, lessons_note
+        yield display_history, history, trace_md, "", gr.update(visible=False), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
         return
 
     # ── Compute highlight payload and deliver final answer ─────────────────────
@@ -750,25 +876,36 @@ def chat_stream(
     else:
         highlight_payload = _NO_HL
 
-    # Track this turn's raw reasoning (Ollama only) so it can optionally be
-    # replayed into context on later turns. Always append something (even
-    # None) so reasoning_history stays index-aligned with history turn-for-turn.
-    turn_transcript = _build_reasoning_transcript(collected_events) if provider == "ollama" else ""
+    # Track this turn's raw reasoning so it can optionally be replayed into
+    # context on later turns. Always append something (even None) so
+    # reasoning_history stays index-aligned with history turn-for-turn.
+    # Non-reasoning models produce no thinking events → empty transcript → None.
+    turn_transcript = _build_reasoning_transcript(collected_events)
     reasoning_history = reasoning_history + [turn_transcript or None]
 
-    # Self-summarized "lessons learned" (Ollama only). Runs synchronously —
-    # adds one extra blocking generation on top of this turn. Best-effort:
-    # keeps the previous note if this turn produced nothing new, but always
-    # logs the outcome so the toggle's effect is visible either way.
-    if add_lessons and provider == "ollama" and turn_transcript:
-        trace_md = log(f"Begin of summarizing function!\n\n")
-        summary, summary_error = _summarize_reasoning_ollama(turn_transcript, model, num_ctx)
-        if summary:
-            lessons_note = summary
-            quoted = summary.replace("\n", "\n> ")
-            trace_md = log(f"📝 **Summary of what I learned:**\n\n> {quoted}")
+    # Distilled "how the answer was found" story. Runs synchronously —
+    # one extra blocking generation per tool-using turn. Best-effort:
+    # keeps state aligned on failure and logs the outcome.
+    if add_story and provider in ("ollama", "openai"):
+        if any(e == "tool_call" for e, _ in collected_events):
+            story_transcript = _build_reasoning_transcript(collected_events)
+            if story_transcript:
+                if provider == "openai":
+                    story, story_error = _summarize_story_openai(story_transcript, user_message, model)
+                else:
+                    story, story_error = _summarize_story_ollama(story_transcript, user_message, model, num_ctx)
+                if story:
+                    story_history = story_history + [story]
+                    quoted = story.replace("\n", "\n> ")
+                    trace_md = log(f"📖 **Distilled story added to context:**\n\n> {quoted}")
+                else:
+                    story_history = story_history + [None]
+                    trace_md = log(f"📖 **Story distillation skipped:** {story_error}")
+            else:
+                story_history = story_history + [None]
         else:
-            trace_md = log(f"📝 **Lessons-learned summary skipped:** {summary_error}")
+            # No tool calls this turn — nothing to distill.
+            story_history = story_history + [None]
 
     trace_md = log("✅ **Final answer delivered**")
     history[-1][1] = accumulated
@@ -786,7 +923,7 @@ def chat_stream(
         gr.update(interactive=False),
         cache_out,
         reasoning_history,
-        lessons_note,
+        story_history,
     )
     print(f"[chat] done. final response length={len(accumulated)}", flush=True)
 
@@ -822,8 +959,8 @@ def on_provider_change(provider: str, thinking: str) -> tuple:
         gr.update(visible=is_ollama, value=warn),
         gr.update(),                            # prompt_mode_radio: unchanged (stays "auto")
         gr.update(visible=is_ollama),           # num_ctx_dropdown: only for local
-        gr.update(visible=is_ollama),           # reasoning_replay_checkbox: only for local
-        gr.update(visible=is_ollama),           # lessons_checkbox: only for local
+        gr.update(visible=is_ollama or provider == "openai"),  # reasoning_replay_checkbox
+        gr.update(visible=is_ollama or provider == "openai"),  # story_checkbox
         gr.update(choices=thinking_choices, value=thinking_value),  # thinking_dropdown
     )
 
@@ -2288,6 +2425,15 @@ def build_ui() -> gr.Blocks:
                     label="Prompt mode",
                     info="Auto picks compact for small local models. Override for complex queries.",
                 )
+                story_checkbox = gr.Checkbox(
+                    label="Keep a distilled summary of how the answer was found",
+                    value=True,
+                    visible=initial_is_ollama or initial_provider == "openai",
+                    info="After each turn that used the database, distills the successful path "
+                         "(purpose + working SQL + short result) into a compact story carried "
+                         "into later turns, so follow-ups can adapt earlier queries. "
+                         "Adds one extra blocking generation per tool-using turn.",
+                )
                 num_ctx_dropdown = gr.Dropdown(
                     choices=_CTX_OPTIONS,
                     value=_CTX_DEFAULT,
@@ -2296,18 +2442,12 @@ def build_ui() -> gr.Blocks:
                     info="Tokens available to the model. 128K recommended for complex queries.",
                 )
                 reasoning_replay_checkbox = gr.Checkbox(
-                    label="Include all reasoning steps in context (Ollama)",
-                    value=True,
-                    visible=initial_is_ollama,
-                    info="Feeds each turn's full Thought/Action/Observation trace back into "
-                         "context on later turns. Increases token usage significantly.",
-                )
-                lessons_checkbox = gr.Checkbox(
-                    label="Add self-summarized \"lessons learned\" (Ollama)",
+                    label="Include all reasoning steps in context",
                     value=False,
-                    visible=initial_is_ollama,
-                    info="After each turn, asks the model to summarize what it learned and "
-                         "carries that note forward. Adds one extra blocking generation per turn.",
+                    visible=initial_is_ollama or initial_provider == "openai",
+                    info="Feeds each turn's full reasoning trace back into context on later "
+                         "turns. Increases token usage significantly. Requires a "
+                         "reasoning-capable model (no effect otherwise).",
                 )
                 reset_btn = gr.Button("New conversation", size="sm")
                 context_bar = gr.HTML(
@@ -2500,10 +2640,11 @@ def build_ui() -> gr.Blocks:
         # follow-up questions without re-querying. See _build_tool_cache.
         tool_cache_state = gr.State(None)
         # Ollama-only: per-turn raw reasoning trace (index-aligned with
-        # history_state) and the rolling self-summarized "lessons learned"
-        # note. See _build_reasoning_transcript / _summarize_reasoning_ollama.
+        # history_state). See _build_reasoning_transcript.
         reasoning_state = gr.State([])
-        lessons_state = gr.State(None)
+        # Per-turn distilled "how the answer was found" story (index-aligned
+        # with history_state). See _summarize_story_ollama.
+        story_state = gr.State([])
 
         if ENABLE_VIZ:
             gr.HTML("""
@@ -2546,9 +2687,10 @@ window._reloadTiles = function() {
             set_temperature_checkbox, temperature_slider,
             thinking_dropdown, prompt_mode_radio, num_ctx_dropdown,
             log_history_state, tool_cache_state,
-            reasoning_replay_checkbox, lessons_checkbox, reasoning_state, lessons_state,
+            reasoning_replay_checkbox, story_checkbox,
+            reasoning_state, story_state,
         ]
-        send_outputs = [chatbot, history_state, agent_trace, msg_input, stop_btn, highlight_state, context_bar, log_history_state, log_page_state, log_page_label, log_prev_btn, log_next_btn, tool_cache_state, reasoning_state, lessons_state]
+        send_outputs = [chatbot, history_state, agent_trace, msg_input, stop_btn, highlight_state, context_bar, log_history_state, log_page_state, log_page_label, log_prev_btn, log_next_btn, tool_cache_state, reasoning_state, story_state]
 
         submit_event = msg_input.submit(fn=chat_stream, inputs=send_inputs, outputs=send_outputs)
         click_event = send_btn.click(fn=chat_stream, inputs=send_inputs, outputs=send_outputs)
@@ -2579,7 +2721,7 @@ window._reloadTiles = function() {
             inputs=[provider_radio, thinking_dropdown],
             outputs=[
                 model_dropdown, refresh_ollama_btn, dynamic_warn, prompt_mode_radio, num_ctx_dropdown,
-                reasoning_replay_checkbox, lessons_checkbox, thinking_dropdown,
+                reasoning_replay_checkbox, story_checkbox, thinking_dropdown,
             ],
         )
         refresh_ollama_btn.click(
@@ -2674,7 +2816,7 @@ window._reloadTiles = function() {
                 gr.update(interactive=False),
                 None,
                 [],
-                None,
+                [],
             )
 
         reset_btn.click(
@@ -2683,7 +2825,7 @@ window._reloadTiles = function() {
             outputs=[chatbot, history_state, agent_trace, msg_input,
                      highlight_state, context_bar,
                      log_history_state, log_page_state, log_page_label, log_prev_btn, log_next_btn,
-                     tool_cache_state, reasoning_state, lessons_state],
+                     tool_cache_state, reasoning_state, story_state],
         )
         chatbot.clear(
             fn=clear_chat,
@@ -2691,7 +2833,7 @@ window._reloadTiles = function() {
             outputs=[chatbot, history_state, agent_trace, msg_input,
                      highlight_state, context_bar,
                      log_history_state, log_page_state, log_page_label, log_prev_btn, log_next_btn,
-                     tool_cache_state, reasoning_state, lessons_state],
+                     tool_cache_state, reasoning_state, story_state],
         )
 
         log_prev_btn.click(

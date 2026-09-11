@@ -20,8 +20,8 @@ code, and how each is (or will be) addressed.
 - **Fixed settings for all probes:** provider `ollama`, temperature `0.1`,
   thinking **off** (not all models support "thinking"; the `/no_think` marker is
   appended by the backend), prompt mode `full (auto)`, context **64K**
-  (65,536), include-reasoning on, lessons off. Every probe started a **new
-  conversation** first.
+  (65,536), include-reasoning on, story distillation off. Every probe
+  started a **new conversation** first.
 
 ## Results (10 models probed)
 
