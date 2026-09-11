@@ -3,8 +3,10 @@
 import json
 import os
 import re
+import shutil
 import threading
 import time
+from pathlib import Path
 from datetime import datetime
 from typing import Generator
 
@@ -1026,12 +1028,13 @@ def build_import_tab(
     msg_input: gr.Textbox | None = None,
     send_btn: gr.Button | None = None,
 ) -> None:
-    from webui.importer import import_city_file, list_gml_files, run_tiler
+    from webui.importer import DATA_DIR, import_city_file, list_gml_files, run_tiler
 
     with gr.Tab("Import CityGML / CityJSON"):
         gr.Markdown("### Import a CityGML or CityJSON file into 3DCityDB")
         gr.Markdown(
-            "Place your file in `./production/data/`, then select it below and click **Import**.  \n"
+            "Place your file in `./production/data/`, then select it below and click **Import** —  \n"
+            "or upload it directly with the **Upload file** button.  \n"
             "Supported formats: `.gml`, `.xml` (CityGML) · `.json`, `.jsonl` (CityJSON) · `.gz`, `.gzip`, `.zip` (compressed)"
         )
         with gr.Row():
@@ -1042,6 +1045,23 @@ def build_import_tab(
                 scale=4,
             )
             refresh_files_btn = gr.Button("Refresh", scale=1, size="sm")
+
+        gr.Markdown(
+            "Upload one or more CityGML/CityJSON files directly from your computer — "
+            "they are copied into `./production/data/` and automatically selected "
+            "in the dropdown above.",
+            elem_id="upload-hint",
+        )
+        upload_file = gr.File(
+            label="Upload file",
+            file_count="multiple",
+            file_types=[".gml", ".xml", ".json", ".jsonl", ".gz", ".gzip", ".zip"],
+        )
+
+        collision_md = gr.Markdown(visible=False)
+        with gr.Row(visible=False) as overwrite_row:
+            overwrite_cancel_btn = gr.Button("Cancel", variant="stop", scale=1)
+            overwrite_confirm_btn = gr.Button("Overwrite", variant="primary", scale=1)
 
         format_radio = gr.Radio(
             choices=["auto", "citygml", "cityjson"],
@@ -1070,6 +1090,101 @@ def build_import_tab(
         refresh_files_btn.click(
             fn=lambda: gr.update(choices=list_gml_files()),
             outputs=file_dropdown,
+        )
+
+                # ── File upload (browser file picker → ./production/data/) ────────────
+        _UPLOAD_OUTPUTS = [file_dropdown, import_log, overwrite_row,
+                           collision_md, upload_file]
+
+        def _extract_upload_items(value):
+            """Normalize the gr.File value into a list of (src_path, safe_name)."""
+            if not value:
+                return []
+            if isinstance(value, (str, dict)):
+                value = [value]
+            out = []
+            for it in value:
+                if isinstance(it, dict):
+                    path = it.get("path") or ""
+                    name = it.get("name") or os.path.basename(path)
+                else:
+                    path = str(it)
+                    name = os.path.basename(path)
+                name = Path(name).name  # sanitize — no path traversal
+                if path and name:
+                    out.append((path, name))
+            return out
+
+        def _move_uploads(items, overwrite: bool) -> tuple[str, list[str]]:
+            """Move uploaded files into DATA_DIR. Skips existing names unless
+            overwrite is True. Returns (log text, list of moved names)."""
+            lines, moved = [], []
+            for path, name in items:
+                target = DATA_DIR / name
+                if not overwrite and target.exists():
+                    lines.append(f"⚠ Skipped `{name}` (already exists).")
+                    continue
+                shutil.move(path, target)
+                moved.append(name)
+                lines.append(f"✓ Uploaded `{name}` "
+                             f"({target.stat().st_size / 1e6:.1f} MB)")
+            if not lines:
+                lines.append("Nothing to upload.")
+            return "\n".join(lines) + "\n", moved
+
+        def _dropdown_update(moved_names):
+            choices = list_gml_files()
+            first_new = next((n for n in moved_names if n in choices), None)
+            return gr.update(choices=choices, value=first_new)
+
+        def _upload_noop():
+            return (gr.update(), "", gr.update(visible=False),
+                    gr.update(visible=False), gr.update(value=None))
+
+        def check_upload(value):
+            items = _extract_upload_items(value)
+            if not items:
+                return _upload_noop()
+            existing = [n for _, n in items if (DATA_DIR / n).exists()]
+            if not existing:
+                log, moved = _move_uploads(items, overwrite=False)
+                return (_dropdown_update(moved), log, gr.update(visible=False),
+                        gr.update(visible=False, value=""),
+                        gr.update(value=None))
+            msg = ("### Overwrite existing file(s)?\n\n"
+                   "The following file(s) already exist in `./production/data/`:\n\n"
+                   + "\n".join(f"- `{n}`" for n in existing)
+                   + ("\n\nNew files will be uploaded as well. Overwrite the "
+                      "existing one(s)?" if len(existing) < len(items)
+                      else "\n\nOverwrite the existing file(s)?"))
+            return (gr.update(), "", gr.update(visible=True),
+                    gr.update(visible=True, value=msg), gr.update())
+
+        def confirm_overwrite(value):
+            log, moved = _move_uploads(_extract_upload_items(value), overwrite=True)
+            return (_dropdown_update(moved), log, gr.update(visible=False),
+                    gr.update(visible=False), gr.update(value=None))
+
+        def cancel_overwrite():
+            return (gr.update(),
+                    "Upload cancelled — no files were moved.\n",
+                    gr.update(visible=False), gr.update(visible=False),
+                    gr.update(value=None))
+
+        upload_file.change(
+            fn=check_upload,
+            inputs=upload_file,
+            outputs=_UPLOAD_OUTPUTS,
+        )
+        overwrite_confirm_btn.click(
+            fn=confirm_overwrite,
+            inputs=upload_file,
+            outputs=_UPLOAD_OUTPUTS,
+        )
+        overwrite_cancel_btn.click(
+            fn=cancel_overwrite,
+            inputs=[],
+            outputs=_UPLOAD_OUTPUTS,
         )
 
         tiling_done = reload_tiles_state is not None
