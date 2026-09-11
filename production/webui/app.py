@@ -958,9 +958,9 @@ def on_provider_change(provider: str, thinking: str) -> tuple:
         gr.update(visible=is_ollama or openai_ollama),
         gr.update(visible=is_ollama, value=warn),
         gr.update(),                            # prompt_mode_radio: unchanged (stays "auto")
-        gr.update(visible=is_ollama),           # num_ctx_dropdown: only for local
-        gr.update(visible=is_ollama or provider == "openai"),  # reasoning_replay_checkbox
         gr.update(visible=is_ollama or provider == "openai"),  # story_checkbox
+        gr.update(visible=is_ollama or provider == "openai"),  # reasoning_replay_checkbox
+        gr.update(visible=is_ollama),           # num_ctx_dropdown: only for local
         gr.update(choices=thinking_choices, value=thinking_value),  # thinking_dropdown
     )
 
@@ -2434,20 +2434,19 @@ def build_ui() -> gr.Blocks:
                          "into later turns, so follow-ups can adapt earlier queries. "
                          "Adds one extra blocking generation per tool-using turn.",
                 )
+                reasoning_replay_checkbox = gr.Checkbox(
+                    label="Include all reasoning steps in context",
+                    value=False,
+                    visible=initial_is_ollama or initial_provider == "openai",
+                    info="Feeds each turn's full reasoning trace back into context on later "
+                         "turns. Increases token usage significantly.",
+                )
                 num_ctx_dropdown = gr.Dropdown(
                     choices=_CTX_OPTIONS,
                     value=_CTX_DEFAULT,
                     label="Context window (Ollama)",
                     visible=initial_is_ollama,
                     info="Tokens available to the model. 128K recommended for complex queries.",
-                )
-                reasoning_replay_checkbox = gr.Checkbox(
-                    label="Include all reasoning steps in context",
-                    value=False,
-                    visible=initial_is_ollama or initial_provider == "openai",
-                    info="Feeds each turn's full reasoning trace back into context on later "
-                         "turns. Increases token usage significantly. Requires a "
-                         "reasoning-capable model (no effect otherwise).",
                 )
                 reset_btn = gr.Button("New conversation", size="sm")
                 context_bar = gr.HTML(
@@ -2720,8 +2719,8 @@ window._reloadTiles = function() {
             fn=on_provider_change,
             inputs=[provider_radio, thinking_dropdown],
             outputs=[
-                model_dropdown, refresh_ollama_btn, dynamic_warn, prompt_mode_radio, num_ctx_dropdown,
-                reasoning_replay_checkbox, story_checkbox, thinking_dropdown,
+                model_dropdown, refresh_ollama_btn, dynamic_warn, prompt_mode_radio, story_checkbox,
+                reasoning_replay_checkbox, num_ctx_dropdown, thinking_dropdown,
             ],
         )
         refresh_ollama_btn.click(

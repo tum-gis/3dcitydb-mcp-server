@@ -239,9 +239,9 @@ While the agent is working, the chat bubble shows live status: *Thinking…* →
 | **Set temperature** | checkbox + value (0.0–1.0, default 0.1) | Unchecked = provider default; enable to pin a fixed temperature |
 | **Thinking** | `off` / `low` / `medium` / `high` (+ `max` for OpenAI) | Reasoning level for thinking-capable models. Ollama uses native `think`; OpenAI-compatible endpoints use `reasoning_effort`. Higher levels are slower but more thorough |
 | **Prompt mode** | `auto` / `compact` / `full` | `auto` picks compact for small local models; override for complex queries |
-| **Context window (Ollama)** | 8K / 32K / 64K / 128K / 256K (default 64K) | Tokens available to the model; 128K recommended for complex queries |
-| **Include all reasoning steps in context** | on / off (default on; Ollama + OpenAI) | Feeds each turn's full reasoning trace back into context on later turns; increases token usage. Requires a reasoning-capable model (no effect for models without a reasoning stream) |
 | **Keep a distilled summary of how the answer was found** | on / off (default on; Ollama + OpenAI) | After each DB turn, distills the successful path (purpose + working SQL + short result) into a compact story carried into later turns. Adds one extra blocking generation per tool-using turn |
+| **Include all reasoning steps in context** | on / off (default on; Ollama + OpenAI) | Feeds each turn's full reasoning trace back into context on later turns; increases token usage |
+| **Context window (Ollama)** | 8K / 32K / 64K / 128K / 256K (default 64K) | Tokens available to the model; 128K recommended for complex queries |
 
 **Rendering and export:**
 
