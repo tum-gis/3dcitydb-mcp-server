@@ -267,6 +267,14 @@ async def list_tools() -> list[Tool]:
                         "description": "Compact rendering for local models with small context windows (default: false)",
                         "default": False,
                     },
+                    "force_refresh": {
+                        "type": "boolean",
+                        "description": (
+                            "Bypass the cache and rebuild the prompt from the database "
+                            "(use after importing new data). Default: false."
+                        ),
+                        "default": False,
+                    },
                 },
                 "required": [],
             },
@@ -382,7 +390,13 @@ def _execute_tool(name: str, arguments: dict) -> str:
     if name == "assemble_prompt":
         include_extras = arguments.get("include_query_agent_extras", True)
         compact = arguments.get("compact", False)
-        result = assemble_prompt(db, include_query_agent_extras=include_extras, compact=compact)
+        force_refresh = arguments.get("force_refresh", False)
+        result = assemble_prompt(
+            db,
+            include_query_agent_extras=include_extras,
+            compact=compact,
+            force_refresh=force_refresh,
+        )
         return result
 
     raise ValueError(f"Unknown tool: {name}")

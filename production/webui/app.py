@@ -180,7 +180,7 @@ _system_prompt_cache: dict = {}
 _sp_lock = threading.Lock()
 
 
-def _get_system_prompt(compact: bool = False) -> str:
+def _get_system_prompt(compact: bool = False, force_refresh: bool = False) -> str:
     cache_key = "compact" if compact else "full"
     with _sp_lock:
         if cache_key not in _system_prompt_cache:
@@ -188,6 +188,7 @@ def _get_system_prompt(compact: bool = False) -> str:
                 _system_prompt_cache[cache_key] = assemble_system_prompt_sync(
                     include_query_agent_extras=True,
                     compact=compact,
+                    force_refresh=force_refresh,
                 )
                 size = len(_system_prompt_cache[cache_key])
                 print(f"[prompt] compact={compact}, size={size} chars", flush=True)
@@ -201,7 +202,9 @@ def _get_system_prompt(compact: bool = False) -> str:
 def _refresh_system_prompt() -> None:
     with _sp_lock:
         _system_prompt_cache.clear()
-    _get_system_prompt()
+    # The DB just changed (e.g. after an import) — force the server to bypass
+    # its own cache and rebuild from scratch.
+    _get_system_prompt(compact=False, force_refresh=True)
 
 
 # ── Status checks ──────────────────────────────────────────────────────────────
@@ -1033,8 +1036,8 @@ def build_import_tab(
     with gr.Tab("Import CityGML / CityJSON"):
         gr.Markdown("### Import a CityGML or CityJSON file into 3DCityDB")
         gr.Markdown(
-            "Place your file in `./production/data/`, then select it below and click **Import** —  \n"
-            "or upload it directly with the **Upload file** button.  \n"
+            "Place your file in `./production/data/`, then select it below and click **Import** — "
+            "or upload it with the **Upload file** button.  \n"
             "Supported formats: `.gml`, `.xml` (CityGML) · `.json`, `.jsonl` (CityJSON) · `.gz`, `.gzip`, `.zip` (compressed)"
         )
         with gr.Row():

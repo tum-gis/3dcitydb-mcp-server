@@ -62,6 +62,7 @@ async def call_tool(session: ClientSession, tool_name: str, arguments: dict) -> 
 async def assemble_system_prompt(
     include_query_agent_extras: bool = True,
     compact: bool = False,
+    force_refresh: bool = False,
 ) -> str:
     async with mcp_session() as session:
         raw = await call_tool(
@@ -69,6 +70,7 @@ async def assemble_system_prompt(
             {
                 "include_query_agent_extras": include_query_agent_extras,
                 "compact": compact,
+                "force_refresh": force_refresh,
             },
         )
     return raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
@@ -90,9 +92,12 @@ def _run_sync(coro):
 def assemble_system_prompt_sync(
     include_query_agent_extras: bool = True,
     compact: bool = False,
+    force_refresh: bool = False,
 ) -> str:
     return _run_sync(
-        assemble_system_prompt(include_query_agent_extras, compact=compact)
+        assemble_system_prompt(
+            include_query_agent_extras, compact=compact, force_refresh=force_refresh
+        )
     )
 
 

@@ -1,6 +1,7 @@
 """Prompt assembly - orchestrates all tools into a system prompt."""
 
 import json
+import threading
 from datetime import datetime
 from ..db import DatabaseConnection
 from ..models import (
@@ -82,12 +83,64 @@ _CLASS_SEMANTIC_HINTS = {
 }
 
 
+# ---- Prompt cache (never expires; busted via force_refresh or invalidate) ----
+# Building the prompt re-runs a battery of full-table aggregate queries over
+# feature/property/geometry_data, which is very expensive for large city
+# datasets. The assembled prompt is effectively static per database state, so
+# we cache it for the process lifetime and only rebuild when asked to.
+_prompt_cache: dict = {}
+_prompt_cache_lock = threading.Lock()
+
+
+def _prompt_cache_key(include_query_agent_extras: bool, compact: bool) -> tuple:
+    return (
+        "extras" if include_query_agent_extras else "no_extras",
+        "compact" if compact else "full",
+    )
+
+
+def invalidate_prompt_cache() -> None:
+    """Clear the assembled-prompt cache (e.g. after a data re-import)."""
+    with _prompt_cache_lock:
+        _prompt_cache.clear()
+
+
 def assemble_prompt(
     db: DatabaseConnection,
     include_query_agent_extras: bool = True,
     compact: bool = False,
+    force_refresh: bool = False,
 ) -> str:
-    """Assembles the complete system prompt from all components.
+    """Assembles the complete system prompt (cached for the process lifetime).
+
+    The result is cached and never expires on its own, so repeat calls are
+    instant. Pass ``force_refresh=True`` to bypass the cache and rebuild the
+    prompt (e.g. after importing new data), or call ``invalidate_prompt_cache()``.
+
+    Args:
+        db: Database connection
+        include_query_agent_extras: Include SQL examples and query guidelines.
+        compact: Use compact rendering for local models with small context windows.
+                 Skips full property trees and verbose schema (~200 lines vs 600-1000).
+        force_refresh: When True, recompute the prompt even if a cached copy exists.
+    """
+    key = _prompt_cache_key(include_query_agent_extras, compact)
+    if not force_refresh:
+        cached = _prompt_cache.get(key)
+        if cached is not None:
+            return cached
+    rendered = _assemble_prompt_uncached(db, include_query_agent_extras, compact)
+    with _prompt_cache_lock:
+        _prompt_cache[key] = rendered
+    return rendered
+
+
+def _assemble_prompt_uncached(
+    db: DatabaseConnection,
+    include_query_agent_extras: bool = True,
+    compact: bool = False,
+) -> str:
+    """Builds the system prompt from scratch (no caching).
 
     Args:
         db: Database connection
