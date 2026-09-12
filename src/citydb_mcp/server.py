@@ -33,7 +33,46 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("citydb-mcp")
 
 # Initialize server and database
-server = Server("citydb-context-server")
+server = Server(
+    "citydb-context-server",
+    instructions=(
+        "This MCP server is connected to a running 3D geodatabase: an instance "
+        "of 3DCityDB v5 (https://www.3dcitydb.org), which stores CityGML 3.0 "
+        "city models in a relational PostgreSQL/PostGIS database. It provides "
+        "read-only access to the database schema, the data model, and the data "
+        "contents.\n\n"
+        "IMPORTANT: The server is generic - the actual database contents and "
+        "coordinate reference system depend on the specific 3DCityDB instance "
+        "behind it. Never assume object classes, property names, or the CRS. "
+        "Use the following tools to learn about the current database:\n"
+        "- get_db_context_snapshot: coordinate reference system (EPSG), "
+        "bounding box, feature counts per object class, available LoDs, "
+        "null-value rates.\n"
+        "- scan_objectclasses: which object classes (e.g. Building, Vegetation) "
+        "actually exist in the database, with the class hierarchy.\n"
+        "- resolve_properties: which properties exist for a given object class, "
+        "including codelist values.\n\n"
+        "The two most important tools are:\n"
+        "1. assemble_prompt - Builds a detailed, database-grounded description "
+        "of the relevant aspects of the CityGML 3.0 data model, the 3DCityDB "
+        "v5 relational schema, and the actual contents of the database "
+        "(object classes, properties, codelists, feature counts, coordinate "
+        "reference system). This prompt is the recommended starting point for "
+        "creating SQL from natural-language user queries. Note: on large "
+        "databases the first call can take several minutes; the result is then "
+        "cached for the lifetime of the server process, so subsequent calls "
+        "return it immediately. Pass force_refresh=true to rebuild (e.g. after "
+        "a data import).\n"
+        "2. run_query - Executes a read-only SQL query against the database and "
+        "returns the results (capped at 500 rows).\n\n"
+        "Typical workflow: call assemble_prompt once (or get_db_context_snapshot "
+        "for a quick orientation), then write SQL for the user's question and "
+        "execute it with run_query. The remaining tools (get_database_schema, "
+        "get_query_guidelines, get_generic_attributes, get_lod_config, "
+        "get_examples, ...) provide supporting details and are also used "
+        "internally by assemble_prompt."
+    ),
+)
 db = DatabaseConnection()
 
 # Cache for static components
@@ -252,7 +291,12 @@ async def list_tools() -> list[Tool]:
                 "containing database schema, object classes with resolved "
                 "properties and codelists, generic attributes, spatial context, "
                 "and optionally SQL examples and query guidelines. "
-                "Set include_query_agent_extras=false for non-query agents."
+                "Set include_query_agent_extras=false for non-query agents.\n\n"
+                "Performance note: on large databases the first call can take "
+                "several minutes to complete. The result is cached for the "
+                "lifetime of the server process, so subsequent calls return "
+                "the cached prompt immediately. Pass force_refresh=true to "
+                "force a full rebuild (e.g. after a data import)."
             ),
             inputSchema={
                 "type": "object",
