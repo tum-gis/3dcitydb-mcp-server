@@ -19,7 +19,19 @@ Builds the complete system prompt for the agent. Orchestrates all other tools an
 - SQL examples tailored to the present object classes
 - Query guidelines and indexed columns
 
-**Call once at the start of every session.** The agent uses this as its primary context.
+**Parameters** (all optional):
+
+- `include_query_agent_extras` (bool, default `true`) — include SQL examples and query guidelines
+- `compact` (bool, default `false`) — compact rendering for local models with small context windows
+- `force_refresh` (bool, default `false`) — bypass the cache and rebuild the prompt from the database (use after importing new data)
+
+**Caching:** The assembled prompt is cached for the lifetime of the server process.
+On large databases the *first* call can take several minutes; subsequent calls
+return the cached prompt immediately — so it is fine to call the tool repeatedly.
+Use `force_refresh=true` to rebuild (e.g. after a CityGML import).
+
+The agent uses this prompt as its primary context for turning natural-language
+queries into SQL.
 
 ---
 
