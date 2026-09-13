@@ -32,7 +32,9 @@ COPY production/webui/ ./webui/
 
 # ─── Entrypoint ─────────────────────────────────────────────────────────────
 COPY production/docker/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Normalize line endings: on Windows checkouts (core.autocrlf=true) the script
+# is CRLF, which would break the shebang (#!/bin/sh\r) at container start.
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 # Run as non-root to limit blast radius. The /app/data volume is owned by the
 # host user inside the bind mount; entrypoint stays root-readable.
