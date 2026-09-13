@@ -21,6 +21,12 @@ class CodeListDefinition:
     property_name: str
     object_class_name: str
     entries: list[CodeEntry] = field(default_factory=list)
+    unresolved_codes: list[str] = field(default_factory=list)  # codes actually present in
+                                                                 # this database's data that
+                                                                 # have no matching definition
+                                                                 # (from a static codelist or
+                                                                 # codelist_entry) — explicit,
+                                                                 # not inferred from code==value
 
 
 @dataclass
@@ -83,6 +89,11 @@ class GenericAttribute:
     min_value: str | None = None
     max_value: str | None = None
     categorical_threshold: int = 20
+    uom: str | None = None  # unit of measure (property.val_uom), populated for Measure (datatype_id=17)
+    code_labels: dict[str, str] | None = None  # code -> label, when this attribute is a known
+                                                # alias for an existing schema-property codelist
+                                                # (see dynamic_tools.GENERIC_ATTR_CODELIST_ALIASES)
+    code_labels_source: str | None = None      # the aliased codelist's qualified key, e.g. "bldg:Building.function"
 
 
 # ============================================================
@@ -107,6 +118,8 @@ class SpatialContext:
     coord_dim: int = 0          # actual geometry coordinate dimension (2 or 3)
     srid_is_2d: bool = False    # True when the SRID is a 2D CRS
     z_reference: str = ""       # vertical reference system description
+    is_cartesian: bool = True   # True for a projected CRS (PROJCS), False for geographic (GEOGCS)
+    xy_unit: str = "meter"      # linear unit of the x/y axes (e.g. "meter", "degree")
 
 
 @dataclass
@@ -247,3 +260,5 @@ class QueryGuidelines:
 class VocabularyData:
     street_names: list = field(default_factory=list)          # list of (name, count) tuples
     generic_attr_values: dict = field(default_factory=dict)   # attr_name -> list of (value, count)
+    street_count: int = 0       # total distinct street names (independent of whether street_names is populated)
+    city_count: int = 0         # total distinct non-empty city values in the address table
