@@ -1710,6 +1710,10 @@ def get_db_context_snapshot(db: DatabaseConnection) -> DBContextSnapshot:
                 val_int IS NULL AND val_double IS NULL AND 
                 val_string IS NULL AND val_timestamp IS NULL AND
                 val_uri IS NULL AND val_array IS NULL
+                AND val_address_id IS NULL
+                AND val_feature_id IS NULL
+                AND val_geometry_id IS NULL
+                AND val_implicitgeom_id IS NULL
             ) AS null_count
         FROM property
         WHERE namespace_id != 3
