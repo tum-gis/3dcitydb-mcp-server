@@ -13,6 +13,48 @@ DATA_DIR = Path(__file__).parent.parent / "data"
 CITYDB_TOOL_IMAGE = "ghcr.io/3dcitydb/citydb-tool"
 TILER_IMAGE = "ghcr.io/tum-gis/citydb-3dtiler:latest"
 TILER_OUTPUT_PATH = "/home/tester/citydb-3dtiler/shared"  # inside the tiler container
+IFC_TO_CITYGML_IMAGE = "ghcr.io/tum-gis/ifc-to-citygml3:latest"
+
+
+def _pull_image_with_progress(client, image: str) -> Generator[str, None, None]:
+    """Pull `image` if not present locally, yielding progress lines.
+
+    Factored out of run_tiler()'s original "check/pull with progress" logic
+    so import_city_file() and convert_ifc_to_citygml() can reuse it too —
+    without this, either would silently block for several minutes on an
+    implicit pull the first time a given image is used, with no feedback in
+    the Gradio log.
+    """
+    import docker
+
+    yield f"Checking image {image}...\n"
+    try:
+        client.images.get(image)
+        yield "  Image already present locally.\n"
+        return
+    except docker.errors.ImageNotFound:
+        pass
+
+    yield "  Image not found locally — pulling from registry (this may take a few minutes)...\n"
+    try:
+        seen_layers: set = set()
+        for event in client.api.pull(image, stream=True, decode=True):
+            status = event.get("status", "")
+            layer = event.get("id", "")
+            progress = event.get("progressDetail", {})
+            if status == "Pull complete" and layer not in seen_layers:
+                seen_layers.add(layer)
+                yield f"  ✓ Layer {layer}\n"
+            elif status == "Downloading" and progress.get("total"):
+                done = progress.get("current", 0)
+                total = progress["total"]
+                pct = int(done * 100 / total)
+                yield f"\r  Downloading {layer}: {pct}%"
+            elif status not in ("Waiting", "Pulling fs layer", "Downloading", ""):
+                yield f"  {layer} {status}\n".strip() + "\n"
+        yield "  Pull complete.\n"
+    except Exception as exc:
+        yield f"  WARNING: Pull failed ({exc}) — trying with local image if available.\n"
 
 
 def _network_name(client=None) -> str:
@@ -96,17 +138,20 @@ def _tiles_volume_name(client) -> str:
     return "production_tiles_data"
 
 
-_SUPPORTED_EXTENSIONS = (".gml", ".xml", ".citygml", ".json", ".jsonl", ".gz", ".gzip", ".zip")
+_SUPPORTED_EXTENSIONS = (".gml", ".xml", ".citygml", ".json", ".jsonl", ".ifc", ".gz", ".gzip", ".zip")
 
 
 def _detect_format(filename: str) -> str:
-    """Return 'cityjson' or 'citygml' based on file extension.
+    """Return 'cityjson', 'ifc', or 'citygml' based on file extension.
 
     For compressed files (.gz, .gzip, .zip), the inner extension is checked
     (e.g. 'model.json.gz' → cityjson). Plain archives with no recognisable
-    inner extension default to 'citygml'.
+    inner extension default to 'citygml'. '.ifc' is never compressed in
+    practice, so it's checked directly, ahead of the archive-stripping step.
     """
     name = filename.lower()
+    if name.endswith(".ifc"):
+        return "ifc"
     for ext in (".gz", ".gzip", ".zip"):
         if name.endswith(ext):
             name = name[: -len(ext)]
@@ -145,31 +190,7 @@ def run_tiler() -> Generator[str, None, None]:
         return
 
     # ── Pull image if not present locally ────────────────────────────────────
-    yield f"Checking image {TILER_IMAGE}...\n"
-    try:
-        client.images.get(TILER_IMAGE)
-        yield "  Image already present locally.\n"
-    except docker.errors.ImageNotFound:
-        yield "  Image not found locally — pulling from registry (this may take a few minutes)...\n"
-        try:
-            seen_layers: set = set()
-            for event in client.api.pull(TILER_IMAGE, stream=True, decode=True):
-                status = event.get("status", "")
-                layer = event.get("id", "")
-                progress = event.get("progressDetail", {})
-                if status == "Pull complete" and layer not in seen_layers:
-                    seen_layers.add(layer)
-                    yield f"  ✓ Layer {layer}\n"
-                elif status == "Downloading" and progress.get("total"):
-                    done = progress.get("current", 0)
-                    total = progress["total"]
-                    pct = int(done * 100 / total)
-                    yield f"\r  Downloading {layer}: {pct}%"
-                elif status not in ("Waiting", "Pulling fs layer", "Downloading", ""):
-                    yield f"  {layer} {status}\n".strip() + "\n"
-            yield "  Pull complete.\n"
-        except Exception as exc:
-            yield f"  WARNING: Pull failed ({exc}) — trying with local image if available.\n"
+    yield from _pull_image_with_progress(client, TILER_IMAGE)
 
     # ── Resolve runtime params ────────────────────────────────────────────────
     volume_name = _tiles_volume_name(client)
@@ -227,6 +248,117 @@ def run_tiler() -> Generator[str, None, None]:
             yield "3D tile generation finished successfully.\n"
         else:
             yield f"Tiler exited with code {exit_code}.\n"
+    finally:
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass
+
+
+def convert_ifc_to_citygml(
+    filename: str,
+    georef_oktoberfest: bool = False,
+    no_storeys: bool = False,
+    unrelated_doors_windows_dummy_bce: bool = False,
+) -> Generator[str, None, None]:
+    """Convert an .ifc file to CityGML 3.0 via the ifc-to-citygml3 container.
+
+    Output is deterministic: <stem>.gml, written next to the input file in
+    DATA_DIR. Yields "Conversion finished successfully" on success so callers
+    can detect completion the same way import_city_file() signals "Import
+    finished successfully".
+
+    CLI verified directly against `docker run ... ifc-to-citygml3 --help`:
+        ifc2citygml.py [-o OUTPUT] [--georef-oktoberfest] [--no-storeys]
+                        [--unrelated-doors-and-windows-in-dummy-bce] ...
+                        input_ifc
+    (the container's ENTRYPOINT is `python ifc2citygml.py`, working dir
+    /app — so /app must NOT be used as the data mount point, it would shadow
+    the script itself; mount at /data instead, matching citydb-tool.)
+    """
+    try:
+        import docker
+    except ImportError:
+        yield "ERROR: 'docker' Python package not installed. Run: pip install docker\n"
+        return
+
+    if not filename:
+        yield "ERROR: No file selected.\n"
+        return
+
+    safe_name = Path(filename).name
+    if not safe_name or safe_name in (".", ".."):
+        yield f"ERROR: Invalid filename: {filename!r}\n"
+        return
+    if safe_name != filename:
+        yield f"ERROR: Filename must not contain path components: {filename!r}\n"
+        return
+    filename = safe_name
+
+    ifc_path = (DATA_DIR / filename).resolve()
+    try:
+        ifc_path.relative_to(DATA_DIR.resolve())
+    except ValueError:
+        yield f"ERROR: Filename escapes data directory: {filename!r}\n"
+        return
+    if not ifc_path.exists():
+        yield f"ERROR: File not found: {ifc_path}\n"
+        return
+
+    output_name = Path(filename).stem + ".gml"
+
+    try:
+        client = docker.from_env()
+    except Exception as exc:
+        yield f"ERROR: Cannot connect to Docker socket: {exc}\n"
+        return
+
+    yield from _pull_image_with_progress(client, IFC_TO_CITYGML_IMAGE)
+
+    host_data_dir = _host_data_dir(client)
+    network = _network_name(client)
+    yield f"Mounting host directory {host_data_dir} -> /data, network: {network}\n"
+
+    # Command as a list, not a string — same reasoning as import_city_file():
+    # docker-py splits a string command on whitespace with no shell, which
+    # breaks on a filename containing a space.
+    cmd = [f"/data/{filename}", "-o", f"/data/{output_name}"]
+    if georef_oktoberfest:
+        cmd.append("--georef-oktoberfest")
+    if no_storeys:
+        cmd.append("--no-storeys")
+    if unrelated_doors_windows_dummy_bce:
+        cmd.append("--unrelated-doors-and-windows-in-dummy-bce")
+
+    yield (
+        f"Converting {filename} -> {output_name} "
+        f"(georef_oktoberfest={georef_oktoberfest}, no_storeys={no_storeys}, "
+        f"unrelated_doors_windows_dummy_bce={unrelated_doors_windows_dummy_bce})...\n"
+    )
+
+    try:
+        container = client.containers.run(
+            image=IFC_TO_CITYGML_IMAGE,
+            command=cmd,
+            volumes={host_data_dir: {"bind": "/data", "mode": "rw"}},
+            network=network,
+            detach=True,
+            remove=False,
+        )
+    except Exception as exc:
+        yield f"ERROR: Failed to start container: {exc}\n"
+        return
+
+    try:
+        for log_bytes in container.logs(stream=True, follow=True):
+            yield log_bytes.decode("utf-8", errors="replace")
+
+        result = container.wait()
+        exit_code = result.get("StatusCode", -1)
+        if exit_code == 0 and (DATA_DIR / output_name).exists():
+            yield "\nConversion finished successfully.\n"
+        else:
+            yield f"\nConversion exited with code {exit_code}.\n"
     finally:
         try:
             container.remove(force=True)
@@ -293,6 +425,8 @@ def import_city_file(filename: str, fmt_override: str = "auto") -> Generator[str
         yield f"ERROR: Cannot connect to Docker socket: {exc}\n"
         return
 
+    yield from _pull_image_with_progress(client, CITYDB_TOOL_IMAGE)
+
     host_data_dir = _host_data_dir(client)
     network = _network_name(client)
     yield f"Mounting host directory {host_data_dir} -> /data, network: {network}\n"
@@ -300,7 +434,11 @@ def import_city_file(filename: str, fmt_override: str = "auto") -> Generator[str
     try:
         container = client.containers.run(
             image=CITYDB_TOOL_IMAGE,
-            command=f"import {fmt} /data/{filename}",
+            # A list, not an f-string: docker-py splits a string command on
+            # whitespace with no shell involved, so a filename containing a
+            # space (e.g. from Gradio's upload widget renaming on a
+            # collision) breaks argument parsing inside the container.
+            command=["import", fmt, f"/data/{filename}"],
             environment=_db_env(),
             volumes={host_data_dir: {"bind": "/data", "mode": "rw"}},
             network=network,

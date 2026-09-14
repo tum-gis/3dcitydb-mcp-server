@@ -1031,14 +1031,17 @@ def build_import_tab(
     msg_input: gr.Textbox | None = None,
     send_btn: gr.Button | None = None,
 ) -> None:
-    from webui.importer import DATA_DIR, import_city_file, list_gml_files, run_tiler
+    from webui.importer import (
+        DATA_DIR, convert_ifc_to_citygml, import_city_file, list_gml_files, run_tiler,
+    )
 
-    with gr.Tab("Import CityGML / CityJSON"):
-        gr.Markdown("### Import a CityGML or CityJSON file into 3DCityDB")
+    with gr.Tab("Import CityGML / CityJSON / IFC"):
+        gr.Markdown("### Import a CityGML, CityJSON, or IFC file into 3DCityDB")
         gr.Markdown(
             "Place your file in `./production/data/`, then select it below and click **Import** — "
             "or upload it with the **Upload file** button.  \n"
-            "Supported formats: `.gml`, `.xml` (CityGML) · `.json`, `.jsonl` (CityJSON) · `.gz`, `.gzip`, `.zip` (compressed)"
+            "Supported formats: `.gml`, `.xml` (CityGML) · `.json`, `.jsonl` (CityJSON) · "
+            "`.ifc` (IFC BIM — converted to CityGML 3.0 first) · `.gz`, `.gzip`, `.zip` (compressed)"
         )
         with gr.Row():
             file_dropdown = gr.Dropdown(
@@ -1058,7 +1061,7 @@ def build_import_tab(
         upload_file = gr.File(
             label="Upload file",
             file_count="multiple",
-            file_types=[".gml", ".xml", ".json", ".jsonl", ".gz", ".gzip", ".zip"],
+            file_types=[".gml", ".xml", ".json", ".jsonl", ".ifc", ".gz", ".gzip", ".zip"],
         )
 
         collision_md = gr.Markdown(visible=False)
@@ -1067,11 +1070,34 @@ def build_import_tab(
             overwrite_confirm_btn = gr.Button("Overwrite", variant="primary", scale=1)
 
         format_radio = gr.Radio(
-            choices=["auto", "citygml", "cityjson"],
+            choices=["auto", "citygml", "cityjson", "ifc"],
             value="auto",
             label="Format",
-            info="Auto-detect works for most files. Override for plain .zip archives whose format cannot be inferred from the filename.",
+            info="Auto-detect works for most files, including .ifc. Override 'ifc' to force IFC "
+                 "conversion regardless of filename, or override for plain .zip archives whose "
+                 "format cannot be inferred from the filename.",
         )
+
+        with gr.Group(visible=False) as ifc_options_group:
+            gr.Markdown(
+                "**IFC conversion options** (passed to the `ifc-to-citygml3` converter; "
+                "shown only when an `.ifc` file is selected)"
+            )
+            ifc_georef_checkbox = gr.Checkbox(
+                label="Georeference to Oktoberfest / Munich",
+                value=False,
+                info="Use when the IFC model carries no real-world georeferencing of its own.",
+            )
+            ifc_no_storeys_checkbox = gr.Checkbox(
+                label="Skip storeys",
+                value=False,
+                info="Don't create Storey features from the IFC building structure.",
+            )
+            ifc_unrelated_checkbox = gr.Checkbox(
+                label="Group unrelated doors/windows into a dummy BuildingConstructiveElement",
+                value=False,
+                info="For IFC models where door/window openings aren't properly related to a wall.",
+            )
 
         auto_tile_checkbox = gr.Checkbox(
             label="Generate 3D tiles after import",
@@ -1093,6 +1119,31 @@ def build_import_tab(
         refresh_files_btn.click(
             fn=lambda: gr.update(choices=list_gml_files()),
             outputs=file_dropdown,
+        )
+
+        def _is_ifc_selection(filename: str, fmt_override: str) -> bool:
+            """Single source of truth for "does this file/format combo route
+            through the IFC converter" — shared by the ifc_options_group
+            visibility toggle below and the actual pipeline routing in
+            run_import_and_tile(), so the two can't disagree."""
+            if fmt_override == "ifc":
+                return True
+            if fmt_override in ("citygml", "cityjson"):
+                return False
+            return bool(filename) and filename.lower().endswith(".ifc")
+
+        def _toggle_ifc_options(filename, fmt_override):
+            return gr.update(visible=_is_ifc_selection(filename, fmt_override))
+
+        file_dropdown.change(
+            fn=_toggle_ifc_options,
+            inputs=[file_dropdown, format_radio],
+            outputs=ifc_options_group,
+        )
+        format_radio.change(
+            fn=_toggle_ifc_options,
+            inputs=[file_dropdown, format_radio],
+            outputs=ifc_options_group,
         )
 
                 # ── File upload (browser file picker → ./production/data/) ────────────
@@ -1194,21 +1245,52 @@ def build_import_tab(
         extra_outputs = [reload_tiles_state] if tiling_done else []
         lock_chat = msg_input is not None and send_btn is not None
 
-        def run_import_and_tile(filename: str, fmt_override: str, auto_tile: bool, current_reload: int = 0):
-            def _pack(log_val: str, reload_val: int, finished: bool):
+        def run_import_and_tile(filename: str, fmt_override: str, auto_tile: bool,
+                                 ifc_georef: bool = False, ifc_no_storeys: bool = False,
+                                 ifc_unrelated_bce: bool = False, current_reload: int = 0):
+            def _pack(log_val: str, reload_val: int, finished: bool, dropdown_update=None):
                 out = [log_val]
                 if tiling_done:
                     out.append(reload_val)
+                out.append(dropdown_update if dropdown_update is not None else gr.update())
                 if lock_chat:
                     chat_update = gr.update(interactive=finished)
                     out.extend([chat_update, chat_update])
                 return tuple(out) if len(out) > 1 else out[0]
 
             log = ""
-            import_succeeded = False
             no_change = current_reload
+            import_filename = filename
+            import_fmt = fmt_override
 
-            for line in import_city_file(filename, fmt_override):
+            # ── Stage 0: IFC → CityGML 3.0 conversion (only when selected) ─────────
+            if _is_ifc_selection(filename, fmt_override):
+                log += "Stage 0/2: Converting IFC to CityGML 3.0...\n"
+                yield _pack(log, no_change, False)
+
+                conversion_succeeded = False
+                for line in convert_ifc_to_citygml(
+                    filename, ifc_georef, ifc_no_storeys, ifc_unrelated_bce
+                ):
+                    log += line
+                    if "Conversion finished successfully" in line:
+                        conversion_succeeded = True
+                    yield _pack(log, no_change, False)
+
+                if not conversion_succeeded:
+                    log += "\nSkipping database import because IFC conversion did not succeed.\n"
+                    yield _pack(log, no_change, True)
+                    return
+
+                # citydb-tool imports the generated CityGML file, not the .ifc.
+                import_filename = Path(filename).stem + ".gml"
+                import_fmt = "citygml"
+                log += f"\nContinuing with generated file: {import_filename}\n"
+                yield _pack(log, no_change, False, gr.update(choices=list_gml_files(), value=import_filename))
+
+            import_succeeded = False
+
+            for line in import_city_file(import_filename, import_fmt):
                 log += line
                 if "Import finished successfully" in line:
                     import_succeeded = True
@@ -1254,8 +1336,11 @@ def build_import_tab(
 
         _import_event(
             fn=run_import_and_tile,
-            inputs=[file_dropdown, format_radio, auto_tile_checkbox] + ([reload_tiles_state] if tiling_done else []),
-            outputs=[import_log] + extra_outputs + ([msg_input, send_btn] if lock_chat else []),
+            inputs=[file_dropdown, format_radio, auto_tile_checkbox,
+                    ifc_georef_checkbox, ifc_no_storeys_checkbox, ifc_unrelated_checkbox]
+                   + ([reload_tiles_state] if tiling_done else []),
+            outputs=[import_log] + extra_outputs + [file_dropdown]
+                    + ([msg_input, send_btn] if lock_chat else []),
         )
 
 

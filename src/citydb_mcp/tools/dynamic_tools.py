@@ -2270,8 +2270,14 @@ def get_datatypes_reference(db: DatabaseConnection) -> list:
     'properties' and 'description' — the same source resolve_properties()
     reads for PropertyDefinition.type/description.
     """
+    # DISTINCT ON (dt.id) instead of plain DISTINCT: dt.schema is `json` on
+    # some 3DCityDB deployments (only `jsonb` has a built-in equality
+    # operator), which makes plain `SELECT DISTINCT dt.id, dt.schema` fail
+    # outright ("could not identify an equality operator for type json").
+    # dt.id is already the datatype table's PK, so DISTINCT ON (dt.id) only
+    # needs an equality operator for dt.id itself and sidesteps the problem.
     rows = db.execute("""
-        SELECT DISTINCT dt.id, dt.schema
+        SELECT DISTINCT ON (dt.id) dt.id, dt.schema
         FROM property p
         JOIN datatype dt ON dt.id = p.datatype_id
         ORDER BY dt.id
