@@ -1,8 +1,37 @@
 """Static tools - called once and cached for session lifetime."""
 
 import json
+from psycopg2 import sql as _pg_sql
 from ..db import DatabaseConnection
 from ..models import DatabaseSchema, QueryGuidelines
+
+
+def _columns_with_data(db: DatabaseConnection, schema: str, table: str, candidates: list[str]) -> set[str]:
+    """Return the subset of `candidates` that have at least one non-NULL value
+    in the live table, via one aggregate query (COUNT(col) skips NULLs).
+
+    Empty-table fallback: if the table has zero rows at all, there's no
+    signal either way — return every candidate unfiltered rather than
+    hiding all its columns.
+    """
+    select_exprs = [
+        _pg_sql.SQL("COUNT({col}) AS {alias}").format(
+            col=_pg_sql.Identifier(col), alias=_pg_sql.Identifier(col)
+        )
+        for col in candidates
+    ]
+    query = _pg_sql.SQL("SELECT COUNT(*) AS __total__, {exprs} FROM {schema}.{table}").format(
+        exprs=_pg_sql.SQL(", ").join(select_exprs),
+        schema=_pg_sql.Identifier(schema),
+        table=_pg_sql.Identifier(table),
+    )
+    try:
+        row = db.execute_single(query)
+    except Exception:
+        return set(candidates)  # can't tell — don't hide anything
+    if not row or not row.get("__total__"):
+        return set(candidates)  # empty table — no signal, show everything
+    return {col for col in candidates if row.get(col)}
 
 
 def get_database_schema(db: DatabaseConnection) -> DatabaseSchema:
@@ -29,8 +58,8 @@ def get_database_schema(db: DatabaseConnection) -> DatabaseSchema:
                   "address", "codelist", "codelist_entry"]
     # Only include important columns per table
     ESSENTIAL_COLUMNS = {
-        "feature": ["id", "objectclass_id", "objectid", "identifier", "envelope",
-                    "creation_date", "termination_date"],
+        "feature": ["id", "objectclass_id", "objectid", "identifier", "identifier_codespace",
+                    "envelope", "creation_date", "termination_date"],
         "property": ["id", "feature_id", "parent_id", "datatype_id", "namespace_id",
                      "name", "val_int", "val_double", "val_string", "val_timestamp",
                      "val_uri", "val_codespace", "val_uom", "val_lod",
@@ -91,6 +120,18 @@ def get_database_schema(db: DatabaseConnection) -> DatabaseSchema:
                     if udt:
                         TYPE_MAP[c["column_name"]] = udt[0]["udt_name"]
 
+            candidate_cols = [
+                c["column_name"] for c in cols
+                if table not in ESSENTIAL_COLUMNS
+                or c["column_name"] in ESSENTIAL_COLUMNS[table]
+            ]
+            # Only list columns that actually hold data in this database —
+            # a column that exists in the schema but is always NULL here
+            # just adds noise. PK/FK/NOT-NULL columns trivially always have
+            # data; this mainly prunes nullable columns unused by this
+            # particular dataset (e.g. feature.termination_date).
+            populated_cols = _columns_with_data(db, db.schema, table, candidate_cols)
+
             table_details[table] = [
                 {
                     "column": c["column_name"],
@@ -100,8 +141,8 @@ def get_database_schema(db: DatabaseConnection) -> DatabaseSchema:
                     "not_null": c["is_nullable"] == "NO",
                 }
                 for c in cols
-                if table not in ESSENTIAL_COLUMNS
-                or c["column_name"] in ESSENTIAL_COLUMNS[table]
+                if c["column_name"] in candidate_cols
+                and c["column_name"] in populated_cols
             ]
     # Build relationships from per-table FK data
     relationships = []
@@ -157,18 +198,19 @@ def get_query_guidelines(db: DatabaseConnection) -> QueryGuidelines:
         rules=[
             "Always filter by objectclass_id when querying features to avoid full table scans.",
             "Use namespace_id to distinguish between schema properties (namespace_id != 3) and generic attributes (namespace_id = 3).",
-            "For Code-type properties (datatype_id = 14), values are stored in val_string with optional val_codespace.",
             "Always use the property name AND namespace_id together for unambiguous property identification.",
+            "For Code-type properties (datatype_id = 14), values are stored in val_string with optional val_codespace.",
+            "For Measure-type properties (datatype_id = 17), values are stored in val_double or val_int with optional val_uom that stores the unit.",
             "For spatial queries, use PostGIS functions on the envelope column in the feature table for fast filtering.",
-            "Use val_lod in property table to filter geometry by Level of Detail.",
+            "Use val_lod in property table to filter geometry by LoD + filter fpr specific role of geometry",
             "When counting or aggregating, always include objectclass_id in GROUP BY for clarity.",
-            "Feature properties (datatype_id = 10) link features via val_feature_id — use this for relationships like building→buildingPart.",
-            "Buildings link to their boundary surfaces (roof, wall, ground) via property table: val_relation_type = 1 and val_feature_id points to the surface feature.",
+            "Feature properties (datatype_id = 10) link features via val_feature_id — use this for relationships like Building[boundary]→BuildingPart.",
+            "Buildings link to their boundary surfaces (roof, wall, ground) via property table: val_feature_id points to the surface feature.",
             "For hierarchical/nested properties like height, use parent_id chain: JOIN property parent ON parent.name = 'height' then JOIN property child ON child.parent_id = parent.id AND child.name = 'value'. The actual value is in child.val_double.",
             "For 3D volume calculations, use CG_Volume(CG_MakeSolid(geometry)). Geometry must be a closed PolyhedralSurface.",
             "For true 3D surface area (accounting for tilted surfaces), use CG_3DArea(geometry). ST_Area only gives 2D projected area.",
             "Always check ST_IsClosed(geometry) = true before volume/solid calculations to avoid errors.",
-            "Filter geometry_data by type using (g.geometry_properties->>'type')::int: use IN (9,10,11) for Solid/CompositeSolid/MultiSolid (volume), IN (6,8) for CompositeSurface/MultiSurface (area). A feature can have multiple geometry_data rows — always filter by type to avoid duplicates.",
+            "Filter geometry_data by type using (g.geometry_properties->>'type')::int: use IN (9,10,11) for Solid/CompositeSolid/MultiSolid (volume), IN (5,6,7,8) for Polygon/CompositeSurface/TriangulatedSurface/MultiSurface (area). A feature can have multiple geometry_data rows — always filter by type to avoid duplicates.",
             "CG_3DDistance(geomA, geomB) gives true 3D distance between geometries.",
             "For 'which X is inside Y' containment questions: FIRST query the property table for "
             "explicit parent/child relationships (val_relation_type IN (0,1) with val_feature_id). "

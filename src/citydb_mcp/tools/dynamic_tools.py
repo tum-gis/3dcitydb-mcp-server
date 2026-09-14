@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from ..db import DatabaseConnection
 
@@ -441,6 +442,33 @@ COUNTRY_CODELISTS = {
             "53009_2070": "Siel",
             "53009_2080": "Sperrwerk",
             "53009_2090": "Schöpfwerk",
+            # --- ALKIS without the prefix 310001
+            "1000": "residential",
+            "1010": "tenement",
+            "1020": "hostel",
+            "1100": "residential (with commercial use)",
+            "1120": "residential/office",
+            "1130": "residential/business",
+            "1379": "residential",
+            "2000": "commercial/industrial",
+            "2100": "industrial",
+            "2200": "commercial",
+            "2400": "transport",
+            "2500": "utility",
+            "2700": "agriculture/forestry",
+            "3000": "public use",
+            "3010": "administration",
+            "3020": "education/research",
+            "3040": "healthcare",
+            "3060": "security/order",
+            "3065": "school/daycare",
+            "3070": "religious",
+            "3074": "garage/infrastructure",
+            "3080": "cultural",
+            "3087": "residential/industrial",
+            "3090": "church",
+            "3100": "recreation",
+            "3211": "sport club",
         },
         "bldg:Building.usage": {
             # Official AdV BuildingFunctionType codelist (301 entries; ALKIS + ATKIS).
@@ -831,6 +859,23 @@ def get_static_codelists(epsg_code: int) -> dict:
     return COUNTRY_CODELISTS.get(country, COUNTRY_CODELISTS["DEFAULT"])
 
 
+# Generic (namespace_id=3) attribute names known to carry the SAME code
+# values as an existing schema-property static codelist, just stored under
+# a different mechanism. Confirmed case: Bavaria Open Data LoD2 exports
+# don't use the core CityGML `function` property at all — they store the
+# building function as a generic attribute named 'citygml_function' instead,
+# using the same official ALKIS/AdV codes already covered by
+# COUNTRY_CODELISTS["DE"]["bldg:Building.function"] (verified: every code
+# LDBV's catalogue used is already present there). Rather than duplicating
+# that codelist under a second, unqualified key, this alias tells
+# _build_generic_attr() to resolve 'citygml_function' against the existing
+# bldg:Building.function codelist instead.
+# Maps: generic attribute name (lower-cased) -> (namespace_alias, classname, attribute)
+GENERIC_ATTR_CODELIST_ALIASES: dict[str, tuple[str, str, str]] = {
+    "citygml_function": ("bldg", "Building", "function"),
+}
+
+
 def _qual_key(namespace_alias: str, classname: str, attribute: str) -> str:
     """Build a qualified codelist key: '<alias>:<Classname>.<attribute>'.
 
@@ -1049,8 +1094,12 @@ def resolve_properties(db: DatabaseConnection, objectclass_id: int, epsg_code: i
         join_info = DATATYPE_JOIN_INFO.get(datatype_id)
         type_name = DATATYPE_NAMES.get(datatype_id, sp["type"])
 
-        # Skip internal/metadata properties not useful for user queries
-        SKIP_PROPERTIES = {"appearance", "externalReference", "boundary", "relatedTo"}
+        # Skip internal/metadata properties not useful for user queries.
+        # "boundary" is NOT skipped — it's the Space→SpaceBoundary association
+        # (e.g. Building→WallSurface) and now gets rendered in the Associations
+        # section (see assembly.py::_render_association()) instead of being
+        # discarded entirely.
+        SKIP_PROPERTIES = {"appearance", "externalReference", "relatedTo"}
         if sp["name"] in SKIP_PROPERTIES:
             continue
 
@@ -1132,12 +1181,13 @@ def _resolve_codelist_for_property(
         ]
         return CodeListDefinition(
             codelist_id=-1,
-            codelist_name=f"static:{qual_key}",
+            codelist_name=qual_key,
             source_url="",
             mime_type="",
             property_name=property_name,
             object_class_name="",
-            entries=code_entries
+            entries=code_entries,
+            unresolved_codes=[c for c in code_values if c not in static_map],
         )
 
     # Step 3: No known codelist — if too many distinct values, treat as free text
@@ -1203,10 +1253,11 @@ def _resolve_codelist_for_property(
             mime_type=matched_codelist.get("mime_type", ""),
             property_name=property_name,
             object_class_name="",
-            entries=code_entries
+            entries=code_entries,
+            unresolved_codes=[str(c) for c in unresolved],
         )
 
-    # Step 5: No codelist found — return raw codes
+    # Step 5: No codelist found at all — return raw codes, all unresolved
     return CodeListDefinition(
         codelist_id=-1,
         codelist_name="",
@@ -1214,7 +1265,8 @@ def _resolve_codelist_for_property(
         mime_type="",
         property_name=property_name,
         object_class_name="",
-        entries=[CodeEntry(code=c, value=c) for c in code_values]
+        entries=[CodeEntry(code=c, value=c) for c in code_values],
+        unresolved_codes=[str(c) for c in code_values],
     )
 
 # ============================================================
@@ -1239,12 +1291,37 @@ def _set_scope(set_name: str | None) -> tuple[str, str, tuple]:
     return join, "", (set_name,)
 
 
+def _resolve_generic_attr_codelist(attr: GenericAttribute, epsg_code: int, alias: tuple[str, str, str]) -> None:
+    """Resolve a generic attribute's already-collected codes against an
+    existing schema-property static codelist (see
+    GENERIC_ATTR_CODELIST_ALIASES) — e.g. Bavaria Open Data's generic
+    attribute 'citygml_function' uses the exact same codes as the core
+    bldg:Building.function property. Reuses whatever codes enrichment
+    already collected (distinct_values for a categorical attribute,
+    sample_values otherwise) — no extra DB query needed. Mutates attr in
+    place; a no-op if the aliased codelist or none of the codes match.
+    """
+    namespace_alias, classname, attribute = alias
+    match = _find_static_codelist(get_static_codelists(epsg_code), namespace_alias, classname, attribute)
+    if not match:
+        return
+    qual_key, static_map = match
+    codes = attr.distinct_values or attr.sample_values
+    if not codes:
+        return
+    labels = {code: static_map[code] for code in codes if code in static_map}
+    if labels:
+        attr.code_labels = labels
+        attr.code_labels_source = qual_key
+
+
 def _build_generic_attr(
     db: DatabaseConnection,
     name: str,
     datatype_id: int,
     objectclass_id: int,
     set_name: str | None = None,
+    epsg_code: int = 0,
 ) -> GenericAttribute | None:
     """Build and enrich one generic attribute, scoped either to standalone attrs or to a
     named GenericAttributeSet. Returns None when the attribute has no usable values."""
@@ -1275,10 +1352,20 @@ def _build_generic_attr(
 
     if enriched and attr.distinct_value_count == 0 and not attr.min_value and not attr.sample_values:
         return None
+
+    # Known alias: this generic attribute carries the same codes as an
+    # existing schema-property codelist — resolve them instead of leaving
+    # the LLM with bare, unexplained codes.
+    alias = GENERIC_ATTR_CODELIST_ALIASES.get(name.lower())
+    if alias:
+        _resolve_generic_attr_codelist(attr, epsg_code, alias)
+
     return attr
 
 
-def get_generic_attributes(db: DatabaseConnection, filter_objectclass_ids: set | None = None) -> dict:
+def get_generic_attributes(
+    db: DatabaseConnection, filter_objectclass_ids: set | None = None, epsg_code: int = 0
+) -> dict:
     """
     Fetches generic attributes (namespace_id = 3) grouped by objectclass_id.
     Returns: dict[objectclass_id] = {
@@ -1293,6 +1380,8 @@ def get_generic_attributes(db: DatabaseConnection, filter_objectclass_ids: set |
     members in different sets stay distinct.
 
     filter_objectclass_ids: if provided, only return attrs for those classes (e.g. toplevel only).
+    epsg_code: needed to select the right country-specific static codelist when a generic
+    attribute name matches GENERIC_ATTR_CODELIST_ALIASES (e.g. 'citygml_function').
     Maps to UML: GenericAttribute
     """
     if filter_objectclass_ids:
@@ -1346,7 +1435,7 @@ def get_generic_attributes(db: DatabaseConnection, filter_objectclass_ids: set |
     for oc_id, info in standalone_by_class.items():
         attrs = [
             a for ga in info["raw"]
-            if (a := _build_generic_attr(db, ga["name"], ga["datatype_id"], oc_id)) is not None
+            if (a := _build_generic_attr(db, ga["name"], ga["datatype_id"], oc_id, epsg_code=epsg_code)) is not None
         ]
         attrs = _filter_generic_attrs(attrs)
         if attrs:
@@ -1373,7 +1462,7 @@ def get_generic_attributes(db: DatabaseConnection, filter_objectclass_ids: set |
         for set_name, raw_members in info["sets"].items():
             attrs = [
                 a for ga in raw_members
-                if (a := _build_generic_attr(db, ga["name"], ga["datatype_id"], oc_id, set_name)) is not None
+                if (a := _build_generic_attr(db, ga["name"], ga["datatype_id"], oc_id, set_name, epsg_code=epsg_code)) is not None
             ]
             # Skip the constant-value filter for set members: in small datasets every
             # attribute may have only one distinct value (e.g. one building), but the set
@@ -1498,11 +1587,17 @@ def _enrich_numeric_generic(db: DatabaseConnection, attr: GenericAttribute, obje
     """Enriches a numeric-type generic attribute with range, scoped to one objectclass and
     (optionally) to one GenericAttributeSet."""
     join_sql, where_sql, lead = _set_scope(set_name)
+    # STRING_AGG(DISTINCT val_uom, ...) picks up the unit of measure recorded
+    # for Measure-typed attributes (datatype_id=17); NULL for plain Integer/
+    # Double attributes, which never populate val_uom. Joining with '/' rather
+    # than picking one handles the rare case of inconsistent units across rows
+    # instead of silently discarding the discrepancy.
     stats = db.execute_single(f"""
         SELECT
             COUNT(DISTINCT p.{attr.value_column}) AS cnt,
             MIN(p.{attr.value_column})::text AS min_val,
-            MAX(p.{attr.value_column})::text AS max_val
+            MAX(p.{attr.value_column})::text AS max_val,
+            STRING_AGG(DISTINCT p.val_uom, '/' ORDER BY p.val_uom) AS uom
         FROM property p
         JOIN feature f ON p.feature_id = f.id
         {join_sql}
@@ -1514,8 +1609,16 @@ def _enrich_numeric_generic(db: DatabaseConnection, attr: GenericAttribute, obje
         return attr
 
     attr.distinct_value_count = stats["cnt"]
-    attr.min_value = stats["min_val"]
-    attr.max_value = stats["max_val"]
+    attr.uom = stats["uom"]
+
+    # Round val_double ranges to 2 decimal places for display; val_int has no
+    # decimals to round.
+    if attr.value_column == "val_double" and stats["min_val"] is not None:
+        attr.min_value = f"{float(stats['min_val']):.2f}"
+        attr.max_value = f"{float(stats['max_val']):.2f}"
+    else:
+        attr.min_value = stats["min_val"]
+        attr.max_value = stats["max_val"]
 
     if stats["cnt"] <= attr.categorical_threshold and stats["cnt"] > 0:
         attr.is_categorical = True
@@ -1631,18 +1734,30 @@ def get_db_context_snapshot(db: DatabaseConnection) -> DBContextSnapshot:
     epsg_code = srs["srid"] if srs else 0
     coord_system = f"EPSG:{epsg_code}" if epsg_code else ""
 
-    # Detect whether the SRID is a 2D CRS by querying spatial_ref_sys.
+    # Detect whether the SRID is a 2D CRS, and whether it's Cartesian/projected
+    # (PROJCS — linear x/y unit, e.g. meters) vs. geographic (bare GEOGCS —
+    # angular x/y unit, e.g. degrees), by querying spatial_ref_sys once.
     # A compound or geographic 3D CRS has COMPD_CS or GEOGCS[... with AXIS containing UP.
     # For simplicity: absence of VERT_CS / COMPD_CS in srtext → 2D.
     srid_is_2d = True
+    is_cartesian = True
+    xy_unit = "meter"
+    _UOM_LABELS = {"m": "meter", "us-ft": "US survey foot", "ft": "foot", "km": "kilometer"}
     if epsg_code:
         try:
             srs_row = db.execute_single(
-                "SELECT srtext FROM spatial_ref_sys WHERE srid = %s", (epsg_code,)
+                "SELECT srtext, proj4text FROM spatial_ref_sys WHERE srid = %s", (epsg_code,)
             )
             if srs_row and srs_row["srtext"]:
                 srtext = srs_row["srtext"].upper()
                 srid_is_2d = "COMPD_CS" not in srtext and "VERT_CS" not in srtext
+                is_cartesian = "PROJCS" in srtext
+                proj4text = srs_row.get("proj4text") or ""
+                unit_match = re.search(r"\+units=(\S+)", proj4text)
+                if unit_match:
+                    xy_unit = _UOM_LABELS.get(unit_match.group(1), unit_match.group(1))
+                elif not is_cartesian:
+                    xy_unit = "degree"
         except Exception:
             srid_is_2d = True  # assume 2D on error
 
@@ -1684,6 +1799,8 @@ def get_db_context_snapshot(db: DatabaseConnection) -> DBContextSnapshot:
             coord_dim=coord_dim,
             srid_is_2d=srid_is_2d,
             z_reference=z_reference,
+            is_cartesian=is_cartesian,
+            xy_unit=xy_unit,
         ),
     )
 
@@ -1749,12 +1866,14 @@ def get_examples(available_objectclass_ids: list[int], classnames: set[str] | No
     patterns = {
 
         "0_volume_query":
-"""-- Volume of a feature (use geometry_properties type filter to target Solid rows only)
--- Filter (geometry_properties->>'type')::int IN (9,10,11) ensures only Solid/CompositeSolid/MultiSolid rows
--- are joined — avoids processing MultiSurface rows that also exist for the same feature.
+"""-- Volume of a feature at a specific LoD (property-mediated join — a feature can have
+-- geometry at more than one LoD, or a Solid AND a MultiSurface at the same LoD, so
+-- geometry_data.feature_id alone can't tell you which row you're getting).
+-- Filter (geometry_properties->>'type')::int IN (9,10,11) ensures only Solid/CompositeSolid/MultiSolid rows.
 SELECT f.objectid, CG_Volume(CG_MakeSolid(g.geometry)) AS volume_m3
 FROM feature f
-JOIN geometry_data g ON g.feature_id = f.id
+JOIN property gp ON gp.feature_id = f.id AND gp.val_geometry_id IS NOT NULL AND gp.val_lod = '<LoD>'
+JOIN geometry_data g ON g.id = gp.val_geometry_id
 WHERE f.objectclass_id = <ID>
   AND g.geometry IS NOT NULL
   AND ST_IsClosed(g.geometry) = true
@@ -1762,11 +1881,12 @@ WHERE f.objectclass_id = <ID>
 ORDER BY volume_m3 DESC LIMIT 10;""",
 
         "1_direct_query":
-"""-- Surface area of a feature (target CompositeSurface/MultiSurface rows only)
--- Filter (geometry_properties->>'type')::int IN (6,8) avoids Solid rows that may also exist.
+"""-- Surface area of a feature at a specific LoD (same property-mediated join as Pattern 0).
+-- Filter (geometry_properties->>'type')::int IN (6,8) targets CompositeSurface/MultiSurface rows.
 SELECT COUNT(*), SUM(CG_3DArea(g.geometry)) AS total_area_m2
 FROM feature f
-JOIN geometry_data g ON g.feature_id = f.id
+JOIN property gp ON gp.feature_id = f.id AND gp.val_geometry_id IS NOT NULL AND gp.val_lod = '<LoD>'
+JOIN geometry_data g ON g.id = gp.val_geometry_id
 WHERE f.objectclass_id = <ID>
   AND g.geometry IS NOT NULL
   AND (g.geometry_properties->>'type')::int IN (6, 8);""",
@@ -2141,10 +2261,70 @@ WHERE f.objectclass_id = 610
     )
 
 
+def get_datatypes_reference(db: DatabaseConnection) -> list:
+    """Compact reference for every datatype_id actually used by `property`
+    rows in this database — id, qualified type name, the val_* column (or
+    join spec, or "nested" for multi-sub-property complex types) it uses,
+    and a one-sentence description. Sourced from datatype.schema (JSON),
+    which already carries this via 'identifier', 'value'/'column', 'join',
+    'properties' and 'description' — the same source resolve_properties()
+    reads for PropertyDefinition.type/description.
+    """
+    # DISTINCT ON (dt.id) instead of plain DISTINCT: dt.schema is `json` on
+    # some 3DCityDB deployments (only `jsonb` has a built-in equality
+    # operator), which makes plain `SELECT DISTINCT dt.id, dt.schema` fail
+    # outright ("could not identify an equality operator for type json").
+    # dt.id is already the datatype table's PK, so DISTINCT ON (dt.id) only
+    # needs an equality operator for dt.id itself and sidesteps the problem.
+    rows = db.execute("""
+        SELECT DISTINCT ON (dt.id) dt.id, dt.schema
+        FROM property p
+        JOIN datatype dt ON dt.id = p.datatype_id
+        ORDER BY dt.id
+    """)
+    result = []
+    for r in rows:
+        schema_data = r["schema"] if isinstance(r["schema"], dict) else (
+            json.loads(r["schema"]) if r["schema"] else {}
+        )
+        properties = schema_data.get("properties")
+        join = schema_data.get("join")
+        value = schema_data.get("value")
+        if properties and len(properties) > 1:
+            # Multi-sub-property complex type (e.g. con:Height, core:ExternalReference)
+            # — the per-property ⚠️ NESTED TYPE guidance already expands these where
+            # they appear; no need to duplicate the sub-property list here.
+            column_or_join = "nested"
+        elif join:
+            column_or_join = f"{join.get('fromColumn')} → {join.get('table')}.{join.get('toColumn')}"
+        elif isinstance(value, dict):
+            column_or_join = value.get("column", "")
+        else:
+            column_or_join = ""
+        result.append({
+            "id": r["id"],
+            "identifier": schema_data.get("identifier", ""),
+            "column_or_join": column_or_join,
+            "description": schema_data.get("description", ""),
+        })
+    return result
+
+
 def get_geometry_types_per_class(db: DatabaseConnection) -> dict:
     """
-    Queries which geometry type codes exist in geometry_data per objectclass.
-    Returns a dict: objectclass_id → {classname, types: [{code, label, count}]}
+    Queries which named, LoD-specific geometry properties (role) and geometry
+    type codes exist per objectclass. Returns a dict:
+    objectclass_id → {classname, types: [{code, label, role, lod, count}]}
+
+    Joined through `property` (property.val_geometry_id → geometry_data.id)
+    rather than geometry_data.feature_id directly — a feature can have more
+    than one geometry_data row (e.g. one per LoD, or a Solid alongside a
+    MultiSurface at the same LoD), and feature_id alone can't tell you which
+    row a given count belongs to. Going through property also gives us the
+    "role" (property.name, e.g. lod2Solid) and its LoD (property.val_lod),
+    so `count` is unambiguous: it's the number of <role> geometries of this
+    type that exist for this class — not a mix of possibly-different-LoD
+    rows silently summed together.
 
     geometry_properties is a JSON column encoding the geometry hierarchy.
     The 'type' field at the top level tells you the outermost geometry kind:
@@ -2178,16 +2358,19 @@ def get_geometry_types_per_class(db: DatabaseConnection) -> dict:
         SELECT
             f.objectclass_id,
             oc.classname,
+            p.name AS role,
+            p.val_lod AS lod,
             (g.geometry_properties->>'type')::int AS geom_type,
             COUNT(*) AS cnt
         FROM feature f
-        JOIN geometry_data g ON g.feature_id = f.id
+        JOIN property p ON p.feature_id = f.id AND p.val_geometry_id IS NOT NULL
+        JOIN geometry_data g ON g.id = p.val_geometry_id
         JOIN objectclass oc ON f.objectclass_id = oc.id
         WHERE g.geometry IS NOT NULL
           AND g.geometry_properties IS NOT NULL
           AND (g.geometry_properties->>'type') ~ '^[0-9]+$'
-        GROUP BY f.objectclass_id, oc.classname, geom_type
-        ORDER BY f.objectclass_id, geom_type
+        GROUP BY f.objectclass_id, oc.classname, p.name, p.val_lod, geom_type
+        ORDER BY f.objectclass_id, p.name, geom_type
     """)
 
     result = {}
@@ -2199,6 +2382,8 @@ def get_geometry_types_per_class(db: DatabaseConnection) -> dict:
         result[oc_id]["types"].append({
             "code": geom_type,
             "label": TYPE_LABELS.get(geom_type, f"type {geom_type}"),
+            "role": row["role"],
+            "lod": row["lod"],
             "count": row["cnt"],
         })
 
@@ -2228,18 +2413,20 @@ def get_vocabulary(db: DatabaseConnection):
     if _vocab_cache and (now - _vocab_cache_ts) < _VOCAB_TTL:
         return _vocab_cache["data"]
 
-    # Street names: only include when there are fewer than 20 distinct values.
-    # Large datasets with thousands of streets add noise without helping the LLM.
+    # Street count: always computed, independent of whether the name list itself
+    # is shown (the address-table description states the total either way).
     try:
         count_row = db.execute_single(
             "SELECT COUNT(DISTINCT street) AS n FROM address "
             "WHERE street IS NOT NULL AND street != ''"
         )
-        _distinct_streets = count_row["n"] if count_row else 0
+        distinct_streets = count_row["n"] if count_row else 0
     except Exception:
-        _distinct_streets = 999
+        distinct_streets = None
 
-    if _distinct_streets < 20:
+    # Street names: only list them when there are fewer than 20 distinct values.
+    # Large datasets with thousands of streets add noise without helping the LLM.
+    if distinct_streets is not None and distinct_streets < 20:
         try:
             street_rows = db.execute("""
                 SELECT street, COUNT(*) AS n
@@ -2254,6 +2441,18 @@ def get_vocabulary(db: DatabaseConnection):
             street_names = []
     else:
         street_names = []
+
+    # City count: how many distinct cities this dataset spans. Used to warn the
+    # LLM when a street name alone is ambiguous (the same street can occur in
+    # more than one city) — see _render_address_vocabulary() in assembly.py.
+    try:
+        city_row = db.execute_single(
+            "SELECT COUNT(DISTINCT city) AS n FROM address "
+            "WHERE city IS NOT NULL AND city != ''"
+        )
+        city_count = city_row["n"] if city_row else 0
+    except Exception:
+        city_count = 0
 
     # Generic attribute distinct values per attribute (frequency-ordered)
     # Only include attributes with ≤ 30 distinct values (categorical).
@@ -2280,6 +2479,8 @@ def get_vocabulary(db: DatabaseConnection):
     result = VocabularyData(
         street_names=street_names,
         generic_attr_values=generic_attr_values,
+        street_count=distinct_streets or 0,
+        city_count=city_count,
     )
     _vocab_cache = {"data": result}
     _vocab_cache_ts = now
@@ -2390,11 +2591,13 @@ SELECT a.street, SUM(CG_3DArea(g.geometry)) AS total_roof_m2
 FROM feature b
 JOIN property p_addr ON p_addr.feature_id = b.id AND p_addr.name = 'address'
 JOIN address a ON a.id = p_addr.val_address_id
-JOIN property rel ON rel.feature_id = b.id AND rel.val_relation_type = 1
+JOIN property rel ON rel.feature_id = b.id AND rel.name = 'boundary'
 JOIN feature s ON s.id = rel.val_feature_id AND s.objectclass_id = {roof_id}
-JOIN geometry_data g ON g.feature_id = s.id
+JOIN property gp ON gp.feature_id = s.id AND gp.val_geometry_id IS NOT NULL
+JOIN geometry_data g ON g.id = gp.val_geometry_id
 WHERE b.objectclass_id = {oc_id}
   AND a.street ILIKE '%{top_street}%'
+  AND (g.geometry_properties->>'type')::int IN (6, 8)
 GROUP BY a.street;""")
 
     examples.append(f"""\
