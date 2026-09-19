@@ -1,10 +1,22 @@
 services:
 
   # ── PostgreSQL + 3DCityDB v5 with SFCGAL ───────────────────────────────────
+  #    Default parameters are tuned for better performance with large datasets.
   postgres:
     image: khaoulakanna1/3dcitydb-v5-docker-sfcgal-patched:latest
     ports:
       - "5432:5432" 
+    shm_size: '2gb'
+    command: >
+      postgres
+      -c shared_buffers=2GB
+      -c effective_cache_size=6GB
+      -c maintenance_work_mem=512MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=512MB
+      -c work_mem=512MB
+      -c max_wal_size=4GB
+      -c random_page_cost=1.1    
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-citydb}
       POSTGRES_USER: ${POSTGRES_USER:-citydb}
@@ -45,8 +57,14 @@ services:
       - CITYDB_SCHEMA=${CITYDB_SCHEMA:-citydb}
       # CITYDB_DOCKER_NETWORK / CITYDB_HOST_DATA_DIR are auto-detected from the
       # running container; set them only if you need to override the defaults.
+      # Expose the MCP server over SSE/HTTP on port 8080 (endpoint: /sse) so
+      # external MCP clients (e.g. VS Code) can connect without a local process.
+      - CITYDB_MCP_SSE=1
+      - MCP_SSE_HOST=0.0.0.0
+      - MCP_SSE_PORT=8080
     ports:
       - "7860:7860"
+      - "8080:8080"
     volumes:
       - ./data:/app/data
       # Docker socket — needed so Gradio can launch the citydb-tool container
