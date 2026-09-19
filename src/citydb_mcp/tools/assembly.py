@@ -1108,6 +1108,13 @@ def _render_property(prop: PropertyDefinition) -> str:
                     if len(prop.qualifier_values) > 30 else "")
             parts.append(f"    - Qualifier `val_string` values (e.g. typeOfArea / typeOfVolume): {vals_str}{more}")
             parts.append("      (closed set — filter / GROUP BY these; the numeric measure is in `val_double` and is intentionally not listed)")
+        if prop.information_system_values:
+            shown = prop.information_system_values[:5]
+            vals_str = ", ".join(f"`{v}`" for v in shown)
+            more = (f" (+{len(prop.information_system_values) - 5} more)"
+                    if len(prop.information_system_values) > 5 else "")
+            parts.append(f"    - informationSystem (`val_codespace`) values for this class: {vals_str}{more}")
+            parts.append("      (closed set of external information systems; the targetResource URIs in `val_uri` are external IDs — query them directly, not listed)")
     # Nested complex types: a sub-property carries a 'join' marker in the
     # datatype.schema, so the value lives in child property rows via parent_id.
     elif prop.storage_layout == "nested":

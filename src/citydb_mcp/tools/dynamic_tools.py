@@ -1256,8 +1256,10 @@ def resolve_properties(db: DatabaseConnection, objectclass_id: int, epsg_code: i
         # "boundary" is NOT skipped — it's the Space→SpaceBoundary association
         # (e.g. Building→WallSurface) and now gets rendered in the Associations
         # section (see assembly.py::_render_association()) instead of being
-        # discarded entirely.
-        SKIP_PROPERTIES = {"appearance", "externalReference", "relatedTo"}
+        # discarded entirely. "externalReference" is NOT skipped either — it is
+        # rendered as a flat property with its distinct informationSystem
+        # (val_codespace) values (see below).
+        SKIP_PROPERTIES = {"appearance", "relatedTo"}
         if sp["name"] in SKIP_PROPERTIES:
             continue
 
@@ -1303,6 +1305,32 @@ def resolve_properties(db: DatabaseConnection, objectclass_id: int, epsg_code: i
             qvals = [r["val_string"] for r in qrows]
             if 1 <= len(qvals) <= QUALIFIER_MAX_VALUES:
                 prop_def.qualifier_values = qvals
+
+        # core:ExternalReference: the targetResource values (val_uri) are
+        # opaque external IDs — not useful to list. Instead list the distinct
+        # informationSystem (val_codespace) values present for this feature
+        # type (a closed set, usually 1–2 values). relationType (val_string)
+        # is intentionally not listed.
+        if (sp["name"] == "externalReference"
+                and prop_def.storage_layout == "flat"):
+            isys_rows = db.execute(
+                """
+                SELECT DISTINCT p.val_codespace
+                FROM property p
+                JOIN feature f ON p.feature_id = f.id
+                WHERE f.objectclass_id = %s
+                  AND p.name = %s
+                  AND p.namespace_id = %s
+                  AND p.datatype_id = %s
+                  AND p.val_codespace IS NOT NULL
+                  AND p.val_codespace <> ''
+                ORDER BY p.val_codespace
+                """,
+                (objectclass_id, sp["name"], actual_namespace_id, datatype_id),
+            )
+            isys_vals = [r["val_codespace"] for r in isys_rows]
+            if 1 <= len(isys_vals) <= QUALIFIER_MAX_VALUES:
+                prop_def.information_system_values = isys_vals
 
         # Step 5: For Code-type properties (datatype_id = 14), resolve codelist
         if datatype_id == 14:

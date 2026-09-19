@@ -63,6 +63,12 @@ class PropertyDefinition:
                                        # the distinct qualifier values, a closed
                                        # classification. The measure value (val_double)
                                        # itself is NOT listed.
+    information_system_values: list[str] | None = None  # core:ExternalReference:
+                                       # the distinct informationSystem (val_codespace)
+                                       # values present for the feature type — a closed
+                                       # set of external information systems. The
+                                       # targetResource URI values (val_uri) are
+                                       # external IDs and are intentionally NOT listed.
 
 
 @dataclass
