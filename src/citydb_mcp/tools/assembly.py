@@ -1094,13 +1094,28 @@ def _render_property(prop: PropertyDefinition) -> str:
     if prop.value_column:
         parts.append(f"    - col: `{prop.value_column}`")
 
-    # Flag composite/nested types that need parent_id access
-    if prop.type in ("con:Height", "con:Elevation", "core:Occupancy",
-                     "core:QualifiedArea", "core:QualifiedVolume",
-                     "core:ExternalReference", "core:CityObjectRelation"):
-        parts.append(f"    - ⚠️ NESTED TYPE: Access via parent_id chain.")
+    # Flat types: the value lives on the property row itself (datatype.schema
+    # has no 'join'-bearing sub-property; the top-level + per-property
+    # 'value.column' entries give the column mapping, e.g.
+    # core:QualifiedArea / core:QualifiedVolume / core:ExternalReference).
+    if prop.storage_layout == "flat":
+        note = f" — {prop.storage_note}" if prop.storage_note else ""
+        parts.append(f"    - FLAT TYPE: value is on the property row itself{note}")
+        if prop.qualifier_values:
+            shown = prop.qualifier_values[:30]
+            vals_str = ", ".join(f"`{v}`" for v in shown)
+            more = (f" (+{len(prop.qualifier_values) - 30} more)"
+                    if len(prop.qualifier_values) > 30 else "")
+            parts.append(f"    - Qualifier `val_string` values (e.g. typeOfArea / typeOfVolume): {vals_str}{more}")
+            parts.append("      (closed set — filter / GROUP BY these; the numeric measure is in `val_double` and is intentionally not listed)")
+    # Nested complex types: a sub-property carries a 'join' marker in the
+    # datatype.schema, so the value lives in child property rows via parent_id.
+    elif prop.storage_layout == "nested":
+        parts.append(f"    - ⚠️ NESTED TYPE: value is stored in child rows via parent_id.")
+        if prop.storage_note:
+            parts.append(f"      Child properties: {prop.storage_note}")
         parts.append(f"      JOIN property parent ON parent.feature_id = f.id AND parent.name = '{prop.name}'")
-        parts.append(f"      JOIN property child ON child.parent_id = parent.id AND child.name = 'value'")
+        parts.append(f"      JOIN property child ON child.parent_id = parent.id")
 
     if prop.is_deprecated:
         parts.append(f"    - ⚠️ DEPRECATED")

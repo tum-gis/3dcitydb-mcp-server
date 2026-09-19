@@ -17,6 +17,9 @@ from ..models import (
 
 CATEGORICAL_THRESHOLD = int(os.getenv("CATEGORICAL_THRESHOLD", 20))
 SAMPLE_VALUES_COUNT = int(os.getenv("SAMPLE_VALUES_COUNT", 5))
+# Max distinct values to list for a flat measure type's val_string type qualifier
+# (typeOfArea / typeOfVolume); above this it is treated as free text and skipped.
+QUALIFIER_MAX_VALUES = int(os.getenv("QUALIFIER_MAX_VALUES", "50"))
 
 
 # ============================================================
@@ -59,6 +62,108 @@ DATATYPE_NAMES = {
     22: "core:StringOrRef", 23: "core:TimePosition", 24: "core:Duration",
     200: "generics:GenericAttributeSet",
 }
+
+
+_DT_COLUMN_SPECS_CACHE: dict[int, str] | None = None
+_DT_QUALIFIER_CACHE: dict[int, str | None] | None = None
+
+
+def _datatype_column_specs(db: DatabaseConnection) -> dict[int, str]:
+    """Flat column mapping per datatype, derived from the datatype.schema
+    JSONs (cached for the lifetime of the server process).
+
+    For each non-nested datatype (no sub-property carries a 'join'/'joinTable'
+    marker) the mapping lists the top-level value column plus every
+    sub-property's contribution. A sub-property's contribution is either its
+    explicit ``value.column`` entry or — when it only references a named
+    child datatype via ``"type"`` (upstream CityGML catalog style, e.g.
+    core:QualifiedArea whose 'area' property is ``type: core:Measure``) —
+    the referenced datatype's own value column plus its properties'
+    ``value.column`` entries (Measure → val_double (+val_uom), Code →
+    val_string (+val_codespace)).
+    """
+    global _DT_COLUMN_SPECS_CACHE, _DT_QUALIFIER_CACHE
+    if _DT_COLUMN_SPECS_CACHE is not None:
+        return _DT_COLUMN_SPECS_CACHE
+
+    dt_by_id: dict[int, dict] = {}
+    dt_by_name: dict[str, dict] = {}
+    for r in db.execute("SELECT id, typename, schema FROM datatype"):
+        s = r["schema"] if isinstance(r["schema"], dict) else (
+            json.loads(r["schema"]) if r["schema"] else {}
+        )
+        dt_by_id[r["id"]] = s
+        dt_by_name[r["typename"]] = s
+        if s.get("identifier"):
+            # Sub-property 'type' references in datatype schemas use the
+            # qualified name (e.g. "core:Measure") — that's the identifier.
+            dt_by_name[s["identifier"]] = s
+
+    def _cols_of(dt: dict) -> list[str]:
+        value = dt.get("value")
+        top = value.get("column") if isinstance(value, dict) else None
+        cols: list[str] = [top] if top else []
+        for p in dt.get("properties") or []:
+            if not isinstance(p, dict) or "join" in p or "joinTable" in p:
+                continue
+            pv = p.get("value")
+            if isinstance(pv, dict) and pv.get("column"):
+                extras: list[str] = [pv["column"]]
+            else:
+                child = dt_by_name.get(p.get("type") or "")
+                if child is None:
+                    continue
+                extras = []
+                cv = child.get("value")
+                if isinstance(cv, dict) and cv.get("column"):
+                    extras.append(cv["column"])
+                for cp in child.get("properties") or []:
+                    if not isinstance(cp, dict) or "join" in cp or "joinTable" in cp:
+                        continue
+                    cpv = cp.get("value")
+                    if (isinstance(cpv, dict) and cpv.get("column")
+                            and cpv["column"] not in extras):
+                        extras.append(cpv["column"])
+            for c in extras:
+                if c not in cols:
+                    cols.append(c)
+        return cols
+
+    raw_cols: dict[int, list[str]] = {
+        dt_id: _cols_of(s)
+        for dt_id, s in dt_by_id.items()
+        if not any(
+            isinstance(p, dict) and ("join" in p or "joinTable" in p)
+            for p in (s.get("properties") or [])
+        )
+    }
+
+    def _fmt(cols: list[str]) -> str:
+        if len(cols) > 1:
+            return f"{cols[0]} (+{'+'.join(cols[1:])})"
+        return cols[0] if cols else ""
+
+    _DT_COLUMN_SPECS_CACHE = {dt_id: _fmt(c) for dt_id, c in raw_cols.items()}
+    # A FLAT datatype whose value is a Measure (val_double as primary column) and
+    # which also carries a val_string column uses that string as a type qualifier
+    # (core:QualifiedArea -> typeOfArea, core:QualifiedVolume -> typeOfVolume). Its
+    # distinct values are worth listing in the prompt; the numeric measure itself
+    # (val_double) is not.
+    _DT_QUALIFIER_CACHE = {
+        dt_id: ("val_string" if (c and c[0] == "val_double" and "val_string" in c) else None)
+        for dt_id, c in raw_cols.items()
+    }
+    return _DT_COLUMN_SPECS_CACHE
+
+
+def _datatype_qualifier_columns(db: DatabaseConnection) -> dict[int, str | None]:
+    """datatype_id -> 'val_string' for FLAT measure datatypes that carry a
+    secondary val_string type qualifier (core:QualifiedArea / core:
+    QualifiedVolume -> typeOfArea / typeOfVolume), else None. Shares the
+    process-wide cache built by _datatype_column_specs()."""
+    _datatype_column_specs(db)
+    assert _DT_QUALIFIER_CACHE is not None
+    return _DT_QUALIFIER_CACHE
 
 
 # ============================================================
@@ -1076,9 +1181,62 @@ def resolve_properties(db: DatabaseConnection, objectclass_id: int, epsg_code: i
         key = (s["name"], s["namespace_id"])
         surviving_lookup[key] = (s["datatype_id"], s["namespace_id"])
 
+    # Datatype storage layout, derived from the datatype.schema JSON per the
+    # 3DCityDB metadata docs: a sub-property that carries a 'join'/'joinTable'
+    # marker is the authoritative NESTED signal (value stored in separate
+    # property rows via parent_id — con:Height, core:Occupancy, ...). Otherwise
+    # the value is stored FLAT on the property row itself, and the top-level
+    # plus per-property 'value.column' entries spell out the column mapping
+    # (Measure-analog, e.g. core:QualifiedArea / core:QualifiedVolume).
+    dt_layouts: dict[int, tuple[str | None, str | None]] = {}
+    column_specs = _datatype_column_specs(db)
+    used_dt_ids = {dt_id for dt_id, _ in surviving_lookup.values()}
+    if used_dt_ids:
+        dt_placeholders = ",".join(["%s"] * len(used_dt_ids))
+        for row in db.execute(
+            f"SELECT id, schema FROM datatype WHERE id IN ({dt_placeholders})",
+            tuple(used_dt_ids),
+        ):
+            dt_schema = row["schema"] if isinstance(row["schema"], dict) else (
+                json.loads(row["schema"]) if row["schema"] else {}
+            )
+            props = dt_schema.get("properties") or []
+            nested_props = [
+                p for p in props
+                if isinstance(p, dict) and ("join" in p or "joinTable" in p)
+            ]
+            if nested_props:
+                # Nested — children live in separate property rows via parent_id.
+                dt_layouts[row["id"]] = (
+                    "nested",
+                    ", ".join(p.get("name", "?") for p in nested_props),
+                )
+                continue
+            if dt_schema.get("join"):
+                # Relationship datatype — the value is an id column pointing at
+                # another table; rendered via the join_table info, not a flat
+                # column note.
+                continue
+            value = dt_schema.get("value")
+            value_column = value.get("column") if isinstance(value, dict) else None
+            if value_column:
+                dt_layouts[row["id"]] = ("flat", value_column)
+                continue
+            spec = column_specs.get(row["id"])
+            if spec:
+                # Flat complex type: either an explicit Measure-analog column
+                # mapping or 'type'-referenced sub-properties (core:
+                # QualifiedArea / core:QualifiedVolume in the upstream catalog
+                # style).
+                dt_layouts[row["id"]] = ("flat", spec)
+
     # Namespace alias map (needed for qualified codelist keys, e.g. 'bldg:Building.function')
     ns_aliases = {r["id"]: r["alias"] for r in db.execute("SELECT id, alias FROM namespace")}
     concrete_classname = class_map[objectclass_id]["classname"]
+
+    # Flat measure types with a secondary val_string type qualifier
+    # (e.g. core:QualifiedArea / core:QualifiedVolume) — datatype_id -> 'val_string'.
+    qualifier_cols = _datatype_qualifier_columns(db)
 
     # Step 4: Match schema properties to surviving properties
     resolved = []
@@ -1118,7 +1276,33 @@ def resolve_properties(db: DatabaseConnection, objectclass_id: int, epsg_code: i
             join_to_column=join_info["to"] if join_info else None,
             is_deprecated=sp["is_deprecated"],
             codelist=None,
+            storage_layout=dt_layouts.get(datatype_id, (None, None))[0],
+            storage_note=dt_layouts.get(datatype_id, (None, None))[1],
         )
+
+        # Flat measure types with a type qualifier (core:QualifiedArea's
+        # typeOfArea, core:QualifiedVolume's typeOfVolume): list the distinct
+        # qualifier values — a closed classification. The numeric measure value
+        # (val_double) is intentionally not listed.
+        if prop_def.storage_layout == "flat" and qualifier_cols.get(datatype_id):
+            qrows = db.execute(
+                """
+                SELECT DISTINCT p.val_string
+                FROM property p
+                JOIN feature f ON p.feature_id = f.id
+                WHERE f.objectclass_id = %s
+                  AND p.name = %s
+                  AND p.namespace_id = %s
+                  AND p.datatype_id = %s
+                  AND p.val_string IS NOT NULL
+                  AND p.val_string <> ''
+                ORDER BY p.val_string
+                """,
+                (objectclass_id, sp["name"], actual_namespace_id, datatype_id),
+            )
+            qvals = [r["val_string"] for r in qrows]
+            if 1 <= len(qvals) <= QUALIFIER_MAX_VALUES:
+                prop_def.qualifier_values = qvals
 
         # Step 5: For Code-type properties (datatype_id = 14), resolve codelist
         if datatype_id == 14:
@@ -2263,12 +2447,12 @@ WHERE f.objectclass_id = 610
 
 def get_datatypes_reference(db: DatabaseConnection) -> list:
     """Compact reference for every datatype_id actually used by `property`
-    rows in this database — id, qualified type name, the val_* column (or
-    join spec, or "nested" for multi-sub-property complex types) it uses,
-    and a one-sentence description. Sourced from datatype.schema (JSON),
-    which already carries this via 'identifier', 'value'/'column', 'join',
-    'properties' and 'description' — the same source resolve_properties()
-    reads for PropertyDefinition.type/description.
+    rows in this database — id, qualified type name, the val_* column
+    (or join spec, or "nested" when a sub-property carries a 'join' marker)
+    it uses, and a one-sentence description. Sourced from datatype.schema
+    (JSON), which already carries this via 'identifier', 'value'/'column',
+    'join', 'properties' and 'description' — the same source
+    resolve_properties() reads for PropertyDefinition.type/description.
     """
     rows = db.execute("""
         SELECT DISTINCT dt.id, dt.schema
@@ -2276,25 +2460,36 @@ def get_datatypes_reference(db: DatabaseConnection) -> list:
         JOIN datatype dt ON dt.id = p.datatype_id
         ORDER BY dt.id
     """)
+    column_specs = _datatype_column_specs(db)
     result = []
     for r in rows:
         schema_data = r["schema"] if isinstance(r["schema"], dict) else (
             json.loads(r["schema"]) if r["schema"] else {}
         )
-        properties = schema_data.get("properties")
+        properties = schema_data.get("properties") or []
         join = schema_data.get("join")
         value = schema_data.get("value")
-        if properties and len(properties) > 1:
-            # Multi-sub-property complex type (e.g. con:Height, core:ExternalReference)
-            # — the per-property ⚠️ NESTED TYPE guidance already expands these where
-            # they appear; no need to duplicate the sub-property list here.
+        nested_props = [
+            p for p in properties
+            if isinstance(p, dict) and ("join" in p or "joinTable" in p)
+        ]
+        if nested_props:
+            # Nested per 3DCityDB docs: a sub-property with a 'join' marker means
+            # the value lives in separate property rows via parent_id
+            # (con:Height, core:Occupancy, ...).
             column_or_join = "nested"
         elif join:
             column_or_join = f"{join.get('fromColumn')} → {join.get('table')}.{join.get('toColumn')}"
-        elif isinstance(value, dict):
-            column_or_join = value.get("column", "")
+        elif isinstance(value, dict) and value.get("column"):
+            # Flat storage with an explicit top-level value column; the
+            # datatype's column spec also covers 'type'-referenced
+            # sub-properties (e.g. core:QualifiedArea → val_double
+            # (+val_uom+val_string+val_codespace)).
+            column_or_join = column_specs.get(r["id"]) or value["column"]
         else:
-            column_or_join = ""
+            # Flat complex type without a top-level value column
+            # (e.g. core:ExternalReference — all columns on one row).
+            column_or_join = column_specs.get(r["id"], "")
         result.append({
             "id": r["id"],
             "identifier": schema_data.get("identifier", ""),

@@ -45,6 +45,24 @@ class PropertyDefinition:
     join_to_column: str | None
     is_deprecated: bool
     codelist: CodeListDefinition | None = None  # attached for core:Code properties
+    storage_layout: str | None = None  # derived from the datatype.schema JSON per the
+                                       # 3DCityDB metadata docs: "nested" when a sub-property
+                                       # carries a 'join'/'joinTable' marker (value in child
+                                       # property rows via parent_id), "flat" when the value
+                                       # is on the property row itself (Measure-analog column
+                                       # mapping, e.g. core:QualifiedArea), else None
+    storage_note: str | None = None     # flat: the column mapping derived from the
+                                       # datatype.schema — 'value.column' entries plus the
+                                       # value columns of 'type'-referenced sub-datatypes
+                                       # (e.g. "val_double
+                                       # (+val_uom+val_string+val_codespace)"); nested: the
+                                       # names of the child properties
+    qualifier_values: list[str] | None = None  # flat measure types with a secondary
+                                       # val_string type qualifier (core:QualifiedArea ->
+                                       # typeOfArea, core:QualifiedVolume -> typeOfVolume):
+                                       # the distinct qualifier values, a closed
+                                       # classification. The measure value (val_double)
+                                       # itself is NOT listed.
 
 
 @dataclass
