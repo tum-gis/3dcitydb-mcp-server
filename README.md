@@ -20,7 +20,7 @@ The evaluation of the MCP Server for the paper (link coming soon) was done using
 - **Read-only query execution** — `run_query` enforces SELECT-only; writes are blocked at the application layer *and* the database layer, where every pooled connection runs in a read-only transaction (`default_transaction_read_only = on`) so even a crafted CTE hiding a write is rejected by PostgreSQL
 - **Prompt assembly** — `assemble_prompt` orchestrates all tools into a complete system prompt in one call
 - **Gradio chat UI** — browser-based interface with multi-LLM support (Anthropic, OpenAI, Ollama), thinking-level control, live reasoning trace, mermaid/LaTeX rendering, and PDF export
-- **CityGML 1.0-3.0/CityJSON import** — one-click import via the Gradio UI (fullstack Docker mode only)
+- **CityGML 1.0-3.0/CityJSON/IFC import** — one-click import via the Gradio UI (fullstack Docker mode only); `.ifc` files are converted to CityGML 3.0 first
 
 ---
 
@@ -30,10 +30,10 @@ There are three ways to run the 3DCityDB MCP Server:
 
 | | Option 1: PyPI | Option 2: Docker BYOD | Option 3: Docker Fullstack |
 |---|---|---|---|
-| **Best for** | Claude Code / Claude Desktop power users | Existing 3DCityDB instances | Starting from a `.gml` file |
+| **Best for** | Claude Code / Claude Desktop power users | Existing 3DCityDB instances | Starting from a `.gml`/`.json`/`.ifc` file |
 | **Requires** | Python 3.10+, running 3DCityDB | Docker, running 3DCityDB | Docker only |
 | **Gradio UI** | No (uses your AI client directly) | Yes (`localhost:7860`) | Yes (`localhost:7860`) |
-| **CityGML/CityJSON import** | Manual | Manual | Via Gradio UI |
+| **CityGML/CityJSON/IFC import** | Manual | Manual | Via Gradio UI |
 | **Database** | Your own | Your own | Bundled (PostgreSQL + PostGIS + SFCGAL) |
 
 ---
@@ -295,7 +295,7 @@ Run everything — PostgreSQL (with PostGIS and SFCGAL), the 3DCityDB schema, th
 ### Prerequisites
 
 - Docker with Compose (V2)
-- A CityGML or CityJSON file to import (optional — the database starts empty)
+- A CityGML, CityJSON, or IFC file to import (optional — the database starts empty)
 
 ### Quick Start
 
@@ -338,6 +338,18 @@ docker compose -f docker-compose.fullstack.yml up -d
 
 Both images are pulled automatically from Docker Hub on first run. The first start takes ~60 seconds while PostgreSQL initialises.
 
+**Recommended:** pre-pull the importer's helper images so the *first* import doesn't silently block for several minutes:
+
+```bash
+# citydb-tool (~350 MB) — used for every CityGML/CityJSON import
+docker compose -f docker-compose.fullstack.yml --profile importer pull
+
+# ifc-to-citygml3 (~2 GB) — only needed if you plan to import .ifc files
+docker compose -f docker-compose.fullstack.yml --profile ifc pull
+```
+
+These are pulled on demand anyway on first use if you skip this step — it just moves the wait earlier and shows normal `docker pull` progress instead of Gradio's import log.
+
 ### Building locally (optional)
 
 ```bash
@@ -351,16 +363,26 @@ $env:DOCKER_BUILDKIT=0; docker compose -f docker-compose.fullstack.yml up -d --b
 > **Windows note:** Only needed when building locally with `--build`.
 > The default `docker compose up -d` (pull from Docker Hub) works on Windows without any workaround.
 
-### Import CityGML/CityJSON
+### Import CityGML/CityJSON/IFC
 
 Once the UI is open:
 
-1. Go to the **Import CityGML/CityJSON** tab
-2. Click **Refresh** to see files in `./production/data/`
+1. Go to the **Import CityGML / CityJSON / IFC** tab
+2. Click **Refresh** to see files in `./production/data/`, or use **Upload file** to add one from your computer
 3. Select your file and click **Import**
 4. Watch the live log — the import runs using the Docker container [`ghcr.io/3dcitydb/citydb-tool`](https://github.com/3dcitydb/citydb-tool). Note, this container is pulled automatically, if it is not available in your Docker environment so far. In this case, please be patient as it might take 30 seconds before the import process really starts.
 
 > The data directory is mounted at `./production/data/` on the host and `/app/data/` inside the container.
+
+**Importing IFC files:** selecting an `.ifc` file (or overriding the Format selector to `ifc`) reveals three conversion options before import:
+
+| Option | Effect |
+|---|---|
+| Georeference to Oktoberfest / Munich | Use when the IFC model carries no real-world georeferencing of its own |
+| Skip storeys | Don't create `Storey` features from the IFC building structure |
+| Group unrelated doors/windows into a dummy BuildingConstructiveElement | For IFC models where door/window openings aren't properly related to a wall |
+
+The file is first converted to CityGML 3.0 via [`ghcr.io/tum-gis/ifc-to-citygml3`](https://github.com/tum-gis/ifc-to-citygml3) (written next to the `.ifc` file as `<name>.gml`), then imported the same way as any other CityGML file. Like `citydb-tool`, this image (~2 GB) is pulled automatically on first use if not already present — see the pre-pull commands above to avoid that wait during the import itself.
 
 ### Coordinate reference system
 

@@ -59,6 +59,28 @@ services:
     restart: unless-stopped
     user: root
 
+  # ── Import helper images (pre-pull only) ────────────────────────────────────
+  # citydb-tool and ifc-to-citygml3 are launched on demand as sibling
+  # containers by production/webui/importer.py via the Docker socket — `docker
+  # compose up` never starts these two. They exist only so their (large)
+  # images can be pre-pulled ahead of time with a normal `docker pull`
+  # progress bar, instead of the first import/conversion silently blocking
+  # for several minutes inside the Gradio import log. See README's Quick
+  # Start for the two `--profile ... pull` commands.
+  citydb-tool:
+    image: ghcr.io/3dcitydb/citydb-tool:latest
+    profiles: ["importer"]
+    entrypoint: ["true"]
+    restart: "no"
+    pull_policy: missing
+
+  ifc-to-citygml3:
+    image: ghcr.io/tum-gis/ifc-to-citygml3:latest
+    profiles: ["ifc"]
+    entrypoint: ["true"]
+    restart: "no"
+    pull_policy: missing
+
 networks:
   citydb-net:
 
