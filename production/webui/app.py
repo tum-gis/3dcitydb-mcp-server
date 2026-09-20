@@ -678,13 +678,26 @@ def chat_stream(
             content = asst_msg
             if _replay_reasoning and idx < len(reasoning_history) and reasoning_history[idx]:
                 content = f"[Reasoning]\n{reasoning_history[idx]}\n\n[Answer]\n{asst_msg}"
-            if add_story and idx < len(story_history) and story_history[idx]:
-                content += (
-                    "\n\n[How I solved it (verified queries — adapt them for "
-                    "similar follow-ups; row counts are condition-bound)]\n"
-                    + story_history[idx]
-                )
             messages.append({"role": "assistant", "content": content})
+            if add_story and idx < len(story_history) and story_history[idx]:
+                # The distilled story goes in a SEPARATE system message
+                # directly after the assistant answer it belongs to:
+                # order-preserving (kept in the context of the question that
+                # produced it) but role-separated, so the model can never
+                # read it as the assistant's own past output and imitate it.
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "[AUTO-GENERATED SUMMARY — system context only. "
+                        "This block was appended automatically after the "
+                        "preceding assistant answer by a separate process; "
+                        "the user never saw it. It exists solely to help "
+                        "answer follow-up questions. Never quote, repeat, "
+                        "imitate, or reformat it in your answers. Note that "
+                        "row counts are condition-bound.]\n"
+                        + story_history[idx]
+                    ),
+                })
     messages.append({"role": "user", "content": user_message})
 
     # If we have a fresh cache from the previous turn, inject it as an extra
@@ -695,6 +708,18 @@ def chat_stream(
         print(
             f"[chat] injected cached tool result: {cache_out['row_count']} rows, "
             f"age={int((__import__('time').time() - cache_out.get('ts', 0)))}s",
+            flush=True,
+        )
+
+    # Distilled stories from earlier turns are injected as separate system
+    # messages right after the assistant answer that produced them (see the
+    # history loop above). _trim_messages keeps all system messages, so
+    # story notes survive context pruning of their originating turn — they
+    # simply outlive it as standalone reference notes.
+    _story_blocks = [s for s in story_history if s]
+    if _story_blocks:
+        print(
+            f"[chat] replaying {len(_story_blocks)} story note(s) behind their originating turns",
             flush=True,
         )
 
@@ -913,7 +938,19 @@ def chat_stream(
             story_history = story_history + [None]
 
     trace_md = log("✅ **Final answer delivered**")
-    history[-1][1] = accumulated
+    # Strip anything the model generated itself despite RULE 7 (a self-
+    # imitated "How I solved it" section) so it never re-enters the context
+    # as assistant output and reinforces the imitation. The UI shows the
+    # cleaned text as well.
+    _self_story = re.compile(
+        r"\[?(?:how i solved it|verified queries|auto-generated summary"
+        r"|so habe ich es gelöst)\b.*",
+        re.IGNORECASE | re.DOTALL,
+    )
+    clean = _self_story.split(accumulated, maxsplit=1)[0].rstrip()
+    if clean != accumulated:
+        print("[chat] stripped self-generated story section from history", flush=True)
+    history[-1][1] = clean
     updated_log_history = list(log_history) + [{"query": user_message, "trace": trace_md}]
     display_history = _history_with_duration(history, answer_started)
     _n = len(updated_log_history)
