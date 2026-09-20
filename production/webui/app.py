@@ -1123,7 +1123,7 @@ def build_import_tab(
             ifc_georef_checkbox = gr.Checkbox(
                 label="Georeference to Oktoberfest / Munich",
                 value=False,
-                info="Use when the IFC model carries no real-world georeferencing of its own.",
+                info="Use when the IFC model carries no real-world georeferencing of its own. This option will georeference it to the Theresienwiese area in Munich.",
             )
             ifc_no_storeys_checkbox = gr.Checkbox(
                 label="Skip storeys",
