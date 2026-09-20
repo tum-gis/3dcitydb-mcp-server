@@ -3,6 +3,7 @@
 import os
 import re
 import socket
+import threading
 from pathlib import Path
 from typing import Generator
 
@@ -13,10 +14,20 @@ DATA_DIR = Path(__file__).parent.parent / "data"
 CITYDB_TOOL_IMAGE = "ghcr.io/3dcitydb/citydb-tool"
 TILER_IMAGE = "ghcr.io/tum-gis/citydb-3dtiler:latest"
 TILER_OUTPUT_PATH = "/home/tester/citydb-3dtiler/shared"  # inside the tiler container
+# pg2b3dm inside the image is an x86-64 binary; the image's arm64 variant fails
+# with "rosetta error: failed to open elf" (Apple Silicon), so always run amd64.
+TILER_PLATFORM = os.environ.get("CITYDB_TILER_PLATFORM", "linux/amd64")
+# ghcr.io/tum-gis/citydb-3dtiler 0.9.4 ("latest") crashes at start with
+# "No module named 'cql2'": its requirements.txt lists cql2 but the Dockerfile
+# does not install it. Install it when missing (no-op once the image is fixed).
+_TILER_ENTRYPOINT_SCRIPT = (
+    "python3 -c 'import cql2' 2>/dev/null || pip install --user -q cql2==0.5.6 >&2; "
+    'exec python3 ./citydb-3dtiler.py "$@"'
+)
 IFC_TO_CITYGML_IMAGE = "ghcr.io/tum-gis/ifc-to-citygml3:latest"
 
 
-def _pull_image_with_progress(client, image: str) -> Generator[str, None, None]:
+def _pull_image_with_progress(client, image: str, platform: str | None = None) -> Generator[str, None, None]:
     """Pull `image` if not present locally, yielding progress lines.
 
     Factored out of run_tiler()'s original "check/pull with progress" logic
@@ -29,16 +40,17 @@ def _pull_image_with_progress(client, image: str) -> Generator[str, None, None]:
 
     yield f"Checking image {image}...\n"
     try:
-        client.images.get(image)
-        yield "  Image already present locally.\n"
-        return
+        local = client.images.get(image)
+        # A multi-arch tag can be present locally for the wrong platform.
+        if platform is None or local.attrs.get("Architecture") == platform.split("/")[-1]:
+            yield "  Image already present locally.\n"
+            return
+        yield f"  Local image is not {platform} — pulling that variant (layers already present are reused)...\n"
     except docker.errors.ImageNotFound:
-        pass
-
-    yield "  Image not found locally — pulling from registry (this may take a few minutes)...\n"
+        yield "  Image not found locally — pulling from registry (this may take a few minutes)...\n"
     try:
         seen_layers: set = set()
-        for event in client.api.pull(image, stream=True, decode=True):
+        for event in client.api.pull(image, stream=True, decode=True, platform=platform):
             status = event.get("status", "")
             layer = event.get("id", "")
             progress = event.get("progressDetail", {})
@@ -170,6 +182,64 @@ def list_gml_files() -> list[str]:
     )
 
 
+# One tiler run at a time: two overlapping containers would write the same
+# tiles volume. Covers both the Import tab's auto-tiling and the Chat tab's
+# "Refresh 3D tiles" button.
+_tiler_lock = threading.Lock()
+
+
+def _check_tiler_schema(db: dict) -> Generator[str, None, bool]:
+    """Verify {schema}.geometry_data exists; migrate geometry_properties to jsonb if needed.
+
+    The tiler uses jsonb subscript syntax on geometry_properties, which fails
+    if the column is `json`. Current 3DCityDB v5 images create it as jsonb, so
+    this is a no-op there; it only matters for databases initialised with an
+    older image. Returns False (after yielding why) if tiling cannot proceed.
+    Any failure of the check itself is non-fatal: the tiler is run regardless.
+    """
+    try:
+        import psycopg2
+        from psycopg2 import sql as pg_sql
+
+        schema = db.get("CITYDB_SCHEMA", "citydb")
+        conn = psycopg2.connect(
+            host=db["CITYDB_HOST"], port=int(db["CITYDB_PORT"]), dbname=db["CITYDB_NAME"],
+            user=db["CITYDB_USERNAME"], password=db["CITYDB_PASSWORD"],
+        )
+    except Exception as exc:
+        yield f"⚠ Schema check skipped: {exc}\n"
+        return True
+
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT data_type FROM information_schema.columns
+                   WHERE table_schema = %s AND table_name = 'geometry_data'
+                     AND column_name = 'geometry_properties'""",
+                (schema,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                yield f"⚠ {schema}.geometry_data not found — import data first.\n"
+                return False
+            if row[0] == "json":
+                yield "Migrating geometry_properties json → jsonb...\n"
+                cur.execute(
+                    pg_sql.SQL(
+                        "ALTER TABLE {}.geometry_data "
+                        "ALTER COLUMN geometry_properties TYPE jsonb "
+                        "USING geometry_properties::jsonb"
+                    ).format(pg_sql.Identifier(schema))
+                )
+                yield "✓ Migration complete.\n"
+    except Exception as exc:
+        yield f"⚠ Schema check skipped: {exc}\n"
+    finally:
+        conn.close()
+    return True
+
+
 def run_tiler() -> Generator[str, None, None]:
     """Run the citydb-3dtiler Docker container and stream its output.
 
@@ -177,6 +247,16 @@ def run_tiler() -> Generator[str, None, None]:
     progress output is flushed line-by-line. Writes tiles into the same
     'tiles_data' Docker volume that the agent serves at /tiles.
     """
+    if not _tiler_lock.acquire(blocking=False):
+        yield "ERROR: A tiling run is already in progress — wait for it to finish.\n"
+        return
+    try:
+        yield from _run_tiler_locked()
+    finally:
+        _tiler_lock.release()
+
+
+def _run_tiler_locked() -> Generator[str, None, None]:
     try:
         import docker
     except ImportError:
@@ -190,12 +270,16 @@ def run_tiler() -> Generator[str, None, None]:
         return
 
     # ── Pull image if not present locally ────────────────────────────────────
-    yield from _pull_image_with_progress(client, TILER_IMAGE)
+    yield from _pull_image_with_progress(client, TILER_IMAGE, platform=TILER_PLATFORM)
 
     # ── Resolve runtime params ────────────────────────────────────────────────
     volume_name = _tiles_volume_name(client)
     network = _network_name(client)
     db = _db_env()
+
+    schema_ok = yield from _check_tiler_schema(db)
+    if not schema_ok:
+        return
 
     yield (
         f"\nConfiguration:\n"
@@ -207,19 +291,23 @@ def run_tiler() -> Generator[str, None, None]:
         f"{'─' * 60}\n"
     )
 
-    cmd = (
-        f"--db-host {db['CITYDB_HOST']} "
-        f"--db-port {db['CITYDB_PORT']} "
-        f"--db-name {db['CITYDB_NAME']} "
-        f"--db-schema {db.get('CITYDB_SCHEMA', 'citydb')} "
-        f"--db-username {db['CITYDB_USERNAME']} "
-        f"--db-password {db['CITYDB_PASSWORD']} "
-        f"tile"
-    )
+    # A list, not a string: docker-py splits a string on whitespace, which would
+    # break on a password containing a space.
+    cmd = [
+        "--db-host", db["CITYDB_HOST"],
+        "--db-port", db["CITYDB_PORT"],
+        "--db-name", db["CITYDB_NAME"],
+        "--db-schema", db.get("CITYDB_SCHEMA", "citydb"),
+        "--db-username", db["CITYDB_USERNAME"],
+        "--db-password", db["CITYDB_PASSWORD"],
+        "tile",
+    ]
 
     try:
         container = client.containers.run(
             image=TILER_IMAGE,
+            platform=TILER_PLATFORM,
+            entrypoint=["sh", "-c", _TILER_ENTRYPOINT_SCRIPT, "citydb-3dtiler"],
             command=cmd,
             volumes={volume_name: {"bind": TILER_OUTPUT_PATH, "mode": "rw"}},
             network=network,

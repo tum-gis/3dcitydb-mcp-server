@@ -1003,7 +1003,7 @@ class _RobustReActParser(ReActSingleInputOutputParser):
 #   thinking    (False|None|"low"|"medium"|"high") → Thinking dropdown, UI default "off"
 #             (None = omit Ollama's top-level think field entirely; needed by
 #             gpt-oss, where think:false measurably degrades tool-calling)
-#   num_ctx     (int tokens)           → Context window dropdown, UI default 65536
+#   num_ctx     (int tokens)           → Context window dropdown, UI default 131072
 # (num_predict stays env-driven via LOCAL_MAX_TOKENS; reserved for future
 # entries but not part of _resolve_llm_kwargs yet.)
 #
@@ -1012,11 +1012,11 @@ class _RobustReActParser(ReActSingleInputOutputParser):
 
 # The Web UI control defaults — a control sitting at these values is treated
 # as "the user did not touch it". Keep in sync with app.py (temperature
-# slider value=0.1, thinking dropdown value="off", num_ctx "64K (65,536)").
+# slider value=0.1, thinking dropdown value="off", num_ctx "128K (131,072)").
 _UI_DEFAULTS = {
     "temperature": 0.1,
     "thinking": False,
-    "num_ctx": 65536,
+    "num_ctx": 131072,
 }
 
 _MODEL_KWARG_DEFAULTS: dict[str, dict] = {
@@ -1110,7 +1110,7 @@ def react_stream(
     from langchain_ollama import ChatOllama
     # num_ctx goes in model_kwargs (→ Ollama options field)
     # reasoning goes as a top-level ChatOllama kwarg (→ Ollama "think" field, not options)
-    _ctx = num_ctx if num_ctx is not None else int(os.environ.get("OLLAMA_NUM_CTX", "65536"))
+    _ctx = num_ctx if num_ctx is not None else int(os.environ.get("OLLAMA_NUM_CTX", "131072"))
     ollama_init: dict = dict(
         model=model,
         base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),

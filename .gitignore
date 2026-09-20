@@ -20,6 +20,8 @@ prompts/
 
 # Data files
 production/data/*.gml
+production/data/*.ifc
 production/data/*.xml
 production/data/*.zip
 production/data/*.json
+production/data/*.citygml

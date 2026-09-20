@@ -117,6 +117,7 @@ Once connected, your agent has access to:
 | `get_db_context_snapshot` | SRS, bounding box, feature counts, LoD |
 | `get_lod_config` | Available Levels of Detail |
 | `get_examples(objectclass_ids)` | Curated SQL examples for your object classes |
+| `resolve_highlight_targets(objectids)` | GML ids → highlightable geometry-owning features + camera target |
 | `get_database_schema` | Table structures, columns, foreign keys |
 | `get_query_guidelines` | SQL best practices and indexed columns |
 

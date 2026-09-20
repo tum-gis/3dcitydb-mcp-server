@@ -117,7 +117,7 @@ def _get_ollama_model_ctx(model: str) -> int:
             return int(ctx)
     except Exception:
         pass
-    configured = int(os.environ.get("OLLAMA_NUM_CTX", "65536"))
+    configured = int(os.environ.get("OLLAMA_NUM_CTX", "131072"))
     _ollama_ctx_cache[model] = configured
     return configured
 
@@ -248,7 +248,6 @@ The following **4** residential buildings are located in Röblingweg:
 | DEBY_LOD2_4965683  | residential  |
 | DEBY_LOD2_4965796  | residential  |
 | DEBY_LOD2_4965797  | residential  |
-| DEBY_LOD2_4965798  | residential  |
 
 **Error handling:**
 If a query fails, fix it silently and retry. Do not ask the user for help unless you've \
@@ -263,9 +262,6 @@ objectclass IDs, property names, or values — use only what's in the assembled 
 ANTHROPIC_MODELS = [
     "claude-opus-4-7",
     "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001",
-    "claude-3-5-sonnet-20241022",
-    "claude-3-5-haiku-20241022",
 ]
 
 OPENAI_MODELS = [
@@ -462,7 +458,7 @@ def _litellm_kwargs(
     if provider == "ollama":
         kw["max_tokens"] = int(os.environ.get("LOCAL_MAX_TOKENS", "16000"))
         kw["api_base"] = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        ctx = num_ctx if num_ctx is not None else int(os.environ.get("OLLAMA_NUM_CTX", "65536"))
+        ctx = num_ctx if num_ctx is not None else int(os.environ.get("OLLAMA_NUM_CTX", "131072"))
         kw["extra_body"] = {"options": {"num_ctx": ctx}}
     if provider == "openai":
         openai_base = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
@@ -670,13 +666,38 @@ def _is_all_null_result(result_data: dict) -> bool:
 
 
 # ── Viz: highlight payload extraction ─────────────────────────────────────────
+#
+# Payload sent to the 3D viewer (see webmap-overlay/highlight-bridge.js):
+#   {"buildings": [{"gmlid": str, "tile_ids": [str]}],   # name kept for the bridge contract
+#    "centroid":  {"lat": float, "long": float, "radius_m": float} | None,
+#    "missing": [str], "not_tileable": [str]}
+# `gmlid` is what the user/LLM asked about; `tile_ids` is what the tileset
+# actually contains for it (a Room's boundary surfaces, not the Room itself —
+# see citydb_mcp.tools.highlight).
 
 _VIZ_ID_KEYS = ["objectid", "gmlid", "GMLID", "gml_id", "building_id", "feature_id"]
-_GMLID_REGEX = re.compile(r'\b([A-Z]{2,5}_[A-Z0-9_-]{5,})\b')
+# Any other id-like column, e.g. `room_objectid`, `door_gmlid`.
+_VIZ_ID_COL_RE = re.compile(r"(^|_)(objectid|gmlid|gml_id)$", re.IGNORECASE)
+# Permissive on purpose: GML ids are not just `BLDG_...` — IFC-derived ones are
+# GUIDs or 22-char base64 strings. Tokens that aren't real objectids are dropped
+# by the database lookup, so false positives only cost one row in `missing`.
+_ID_TOKEN_REGEX = re.compile(r"(?<![\w$-])[\w$-]{8,}(?![\w$-])")
+_MAX_HIGHLIGHT_IDS = 200
+
+
+def _empty_highlight() -> dict:
+    return {"buildings": [], "centroid": None, "missing": [], "not_tileable": []}
+
+
+def _pick_id_key(row: dict) -> str | None:
+    key = next((k for k in _VIZ_ID_KEYS if k in row), None)
+    if key:
+        return key
+    return next((k for k in row if _VIZ_ID_COL_RE.search(str(k))), None)
 
 
 def extract_highlight_payload(events: list) -> dict:
-    """Build {buildings: [{gmlid}], centroid: [{lat, long}]|None} from event stream."""
+    """Build the viewer payload from the last successful tool result's rows."""
     last_result = None
     for ev_type, ev_data in reversed(events):
         if ev_type == "tool_result" and not ev_data.get("error"):
@@ -684,61 +705,65 @@ def extract_highlight_payload(events: list) -> dict:
             break
 
     if not last_result or not last_result.get("all_rows"):
-        return {"buildings": [], "centroid": None}
+        return _empty_highlight()
 
     rows = last_result["all_rows"]
-    found_key = next((k for k in _VIZ_ID_KEYS if k in rows[0]), None)
+    found_key = _pick_id_key(rows[0])
     if not found_key:
-        return {"buildings": [], "centroid": None}
+        return _empty_highlight()
 
-    gmlids = [str(row[found_key]) for row in rows if row.get(found_key)]
-    gmlids = list(dict.fromkeys(gmlids))[:200]
-    if not gmlids:
-        return {"buildings": [], "centroid": None}
-
-    centroid = _compute_centroid_wgs84(gmlids)
-    return {
-        "buildings": [{"gmlid": gid} for gid in gmlids],
-        "centroid": [{"lat": centroid[0], "long": centroid[1]}] if centroid else None,
-    }
+    return build_highlight_payload(
+        str(row[found_key]) for row in rows if row.get(found_key)
+    )
 
 
 def fallback_regex_extract(final_answer: str) -> list[str]:
-    """Regex fallback: extract GMLIDs from prose when no tool_result rows are available."""
-    return list(dict.fromkeys(_GMLID_REGEX.findall(final_answer)))[:200]
+    """Extract candidate GML ids from prose when no tool_result rows are available."""
+    candidates = [
+        tok for tok in _ID_TOKEN_REGEX.findall(final_answer or "")
+        if any(c.isdigit() or c in "_-$" for c in tok)
+    ]
+    return list(dict.fromkeys(candidates))[:_MAX_HIGHLIGHT_IDS]
 
 
-def _compute_centroid_wgs84(gmlids: list[str]) -> tuple[float, float] | None:
-    """Query PostGIS for the WGS84 centroid of the union of envelopes for these features."""
-    if not gmlids:
-        return None
+_resolver_db = None
+_resolver_db_lock = threading.Lock()
+
+
+def _get_resolver_db():
+    """One pooled read-only connection, shared by all sessions (reads CITYDB_* env)."""
+    global _resolver_db
+    with _resolver_db_lock:
+        if _resolver_db is None:
+            from citydb_mcp.db import DatabaseConnection
+            _resolver_db = DatabaseConnection()
+        return _resolver_db
+
+
+def build_highlight_payload(objectids) -> dict:
+    """Resolve objectids to what the viewer can highlight (see the module comment)."""
+    ids = list(dict.fromkeys(str(i) for i in objectids if i))[:_MAX_HIGHLIGHT_IDS]
+    if not ids:
+        return _empty_highlight()
+
     try:
-        import psycopg2
-        from psycopg2.extras import RealDictCursor
-
-        conn_params = {
-            "host": os.environ.get("CITYDB_HOST", "localhost"),
-            "port": int(os.environ.get("CITYDB_PORT", "5432")),
-            "dbname": os.environ.get("CITYDB_NAME", "citydb"),
-            "user": os.environ.get("CITYDB_USER", "citydb"),
-            "password": os.environ.get("CITYDB_PASSWORD", "citydb"),
-        }
-        schema = os.environ.get("CITYDB_SCHEMA", "citydb")
-        placeholders = ",".join(["%s"] * len(gmlids))
-        sql = f"""
-            SELECT
-              ST_Y(ST_Centroid(ST_Transform(ST_Union(envelope), 4326))) AS lat,
-              ST_X(ST_Centroid(ST_Transform(ST_Union(envelope), 4326))) AS lng
-            FROM {schema}.feature
-            WHERE objectid IN ({placeholders})
-              AND envelope IS NOT NULL;
-        """
-        with psycopg2.connect(**conn_params) as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(sql, gmlids)
-                row = cur.fetchone()
-                if row and row["lat"] is not None:
-                    return (float(row["lat"]), float(row["lng"]))
+        from citydb_mcp.tools.highlight import resolve_highlight_targets
+        result = resolve_highlight_targets(_get_resolver_db(), ids)
     except Exception as exc:
-        print(f"[viz] centroid computation failed: {exc}", flush=True)
-    return None
+        # Degrade to highlighting the ids as given (works for features that own
+        # geometry themselves); no camera target.
+        print(f"[viz] highlight resolution failed: {exc}", flush=True)
+        return {
+            "buildings": [{"gmlid": g, "tile_ids": [g]} for g in ids],
+            "centroid": None, "missing": [], "not_tileable": [],
+        }
+
+    return {
+        "buildings": [
+            {"gmlid": r["objectid"], "tile_ids": r["tile_ids"]}
+            for r in result["resolved"]
+        ],
+        "centroid": result["centroid"],
+        "missing": result["missing"],
+        "not_tileable": result["not_tileable"],
+    }

@@ -32,7 +32,7 @@ from webui.backends.local import (  # noqa: E402
 # UI defaults a user who never touched the controls produces.
 UI_T = 0.1
 UI_THINKING = False
-UI_CTX = 65536
+UI_CTX = 131072
 
 
 def test_registry_shape() -> None:

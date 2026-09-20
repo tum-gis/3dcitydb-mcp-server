@@ -241,7 +241,7 @@ While the agent is working, the chat bubble shows live status: *Thinking…* →
 | **Prompt mode** | `auto` / `compact` / `full` | `auto` picks compact for small local models; override for complex queries |
 | **Keep a distilled summary of how the answer was found** | on / off (default on; Ollama + OpenAI) | After each DB turn, distills the successful path (purpose + working SQL + short result) into a compact story carried into later turns. Adds one extra blocking generation per tool-using turn |
 | **Include all reasoning steps in context** | on / off (default on; Ollama + OpenAI) | Feeds each turn's full reasoning trace back into context on later turns; increases token usage |
-| **Context window (Ollama)** | 8K / 32K / 64K / 128K / 256K (default 64K) | Tokens available to the model; 128K recommended for complex queries |
+| **Context window (Ollama)** | 8K / 32K / 64K / 128K / 256K (default 128K) | Tokens available to the model; a smaller window uses less memory but is too small for complex queries |
 
 **Rendering and export:**
 
@@ -346,9 +346,20 @@ docker compose -f docker-compose.fullstack.yml --profile importer pull
 
 # ifc-to-citygml3 (~2 GB) — only needed if you plan to import .ifc files
 docker compose -f docker-compose.fullstack.yml --profile ifc pull
+
+# citydb-3dtiler (~1.7 GB) — generates the 3D tiles for the optional 3D view (see below)
+docker compose -f docker-compose.fullstack.yml -f docker-compose.fullstack.viz.yml --profile tiler pull
 ```
 
 These are pulled on demand anyway on first use if you skip this step — it just moves the wait earlier and shows normal `docker pull` progress instead of Gradio's import log.
+
+**Optional 3D view.** Add the viewer to the fullstack stack by layering `docker-compose.fullstack.viz.yml` on top of it:
+
+```bash
+docker compose -f docker-compose.fullstack.yml -f docker-compose.fullstack.viz.yml up -d
+```
+
+The Chat tab then shows the 3DCityDB Web Map Client next to the chat. After an import, tick *Generate 3D tiles after import*, or press **🔄 Refresh 3D tiles** above the viewer at any time (e.g. after editing the database directly). When an answer lists `objectid`s, those features are highlighted and the camera flies to them; features without geometry of their own, such as a `Room`, are expanded to the surfaces they contain (see `resolve_highlight_targets` below). The viewer is baked into the `citydb-mcp-agent` image, so until the published image is updated rebuild it locally with `docker compose -f docker-compose.fullstack.yml build citydb-agent`.
 
 ### Building locally (optional)
 
@@ -482,7 +493,7 @@ is a pure data change — no code changes required.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OLLAMA_NUM_CTX` | `65536` | Context window size (tokens) passed to the Ollama model |
+| `OLLAMA_NUM_CTX` | `131072` | Context window size (tokens) passed to the Ollama model |
 | `LOCAL_MAX_TOKENS` | `16000` | Maximum tokens the local model may generate per response |
 | `OLLAMA_TIMEOUT` | `300` | Timeout in seconds for Ollama requests |
 | `AGENT_MAX_ITERATIONS` | `10` | Maximum ReAct tool-call iterations per question |
@@ -520,6 +531,7 @@ call regardless of provider (Ollama or OpenAI-compatible).
 | `get_db_context_snapshot` | SRS, bounding box, feature counts, database statistics |
 | `get_lod_config` | Available Levels of Detail in the database |
 | `get_examples(objectclass_ids)` | SQL examples filtered to existing object classes |
+| `resolve_highlight_targets(objectids)` | Expands GML ids (e.g. a Room) to the geometry-owning features a 3D viewer can highlight, plus a WGS84 camera target |
 
 ### Runtime (per query)
 

@@ -28,6 +28,7 @@ from .tools.runtime_tools import (
     get_history, submit_feedback, add_to_history,
 )
 from .tools.assembly import assemble_prompt
+from .tools.highlight import resolve_highlight_targets
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("citydb-mcp")
@@ -212,6 +213,30 @@ async def list_tools() -> list[Tool]:
                     }
                 },
                 "required": ["sql"],
+            },
+        ),
+
+        # Viewer support
+        Tool(
+            name="resolve_highlight_targets",
+            description=(
+                "Resolves feature objectids (GML ids) to the ids a 3D viewer can "
+                "highlight, plus a WGS84 camera target. A feature without geometry "
+                "of its own (e.g. a Room) is expanded to the contained features "
+                "that own geometry (its boundary surfaces, doors, ...). Returns "
+                "resolved, missing, not_tileable, tile_ids and centroid "
+                "{lat, long, radius_m}. Read-only."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "objectids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "feature.objectid values (GML ids), at most 200",
+                    }
+                },
+                "required": ["objectids"],
             },
         ),
 
@@ -400,6 +425,11 @@ def _execute_tool(name: str, arguments: dict) -> str:
     if name == "run_query":
         result = run_query(db, arguments["sql"])
         return json.dumps(result, indent=2, default=str)
+
+    # --- Viewer support ---
+    if name == "resolve_highlight_targets":
+        result = resolve_highlight_targets(db, arguments["objectids"])
+        return _to_json(result)
 
     # --- User context ---
     if name == "get_session_context":

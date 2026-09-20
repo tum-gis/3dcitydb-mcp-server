@@ -117,6 +117,25 @@ Lists which LoD levels are present in `geometry_data`, grouped by object class.
 
 ---
 
+### `resolve_highlight_targets(objectids)`
+
+Resolves feature `objectid`s (GML ids) to the ids a 3D viewer can highlight. Used by the Gradio UI's 3D view, and available to any MCP client. Read-only.
+
+A 3D Tiles export contains only features that own geometry. A `Room` usually has none of its own — its geometry sits on contained features (`InteriorWallSurface`, `FloorSurface`, ...) linked via `property.val_feature_id` with `val_relation_type = 1` (containment) — so its `objectid` alone matches nothing in the tileset. For each requested id this tool returns the feature's own id (if it owns geometry) plus every contained descendant that does (depth ≤ 5).
+
+**Parameters:** `objectids` (list of strings, at most 200).
+
+**Returns:**
+
+- `resolved` — one entry per found feature: `objectid`, `classname`, `tile_ids`, `implicit_only` (geometry only via implicit geometry, which a tiler may not export)
+- `missing` — ids not present in the database
+- `not_tileable` — features that exist but have no geometry, neither own nor contained
+- `tile_ids` — union of all `tile_ids`
+- `centroid` — `{lat, long, radius_m}` in WGS84 from feature envelopes (falling back to geometry extents), or `null` if the SRID is unknown
+- `truncated` — `true` if the descendant walk hit its row cap
+
+---
+
 ### `get_examples(objectclass_ids)`
 
 Returns 8 curated SQL examples adapted to the object classes present in the database:

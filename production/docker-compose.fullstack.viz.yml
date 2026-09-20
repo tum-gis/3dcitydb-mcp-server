@@ -1,0 +1,39 @@
+# 3D viewer add-on for the fullstack stack.
+#
+# Layer it on top of docker-compose.fullstack.yml — it adds the viewer and
+# changes nothing else:
+#
+#   docker compose -f docker-compose.fullstack.yml -f docker-compose.fullstack.viz.yml up -d
+#
+# What it adds:
+#   * ENABLE_VIZ=true — the Chat tab shows the 3DCityDB Web Map Client next to
+#     the chat, highlights the objects an answer is about, and offers a
+#     "Refresh 3D tiles" button. (The client itself is baked into the agent
+#     image; rebuild with `... build citydb-agent` after updating.)
+#   * the tiles_data volume — where the citydb-3dtiler container writes the 3D
+#     tiles and the agent serves them at /tiles.
+#   * a citydb-3dtiler pre-pull stub (profile "tiler"):
+#       docker compose -f docker-compose.fullstack.yml -f docker-compose.fullstack.viz.yml --profile tiler pull
+
+services:
+  citydb-agent:
+    environment:
+      - ENABLE_VIZ=true
+      - TILES_DIR=/tiles
+      # Used to decide whether to offer the Bavarian DGM1 terrain (EPSG:25832 only).
+      - SRID=${SRID:-25832}
+    volumes:
+      - tiles_data:/tiles
+
+  # 3D tile generator (~1.7 GB on disk) — launched on demand as a sibling
+  # container by "Refresh 3D tiles" and the Import tab, never started by `up`.
+  # Pre-pull only, like citydb-tool / ifc-to-citygml3 in the base file.
+  citydb-3dtiler:
+    image: ghcr.io/tum-gis/citydb-3dtiler:latest
+    profiles: ["tiler"]
+    entrypoint: ["true"]
+    restart: "no"
+    pull_policy: missing
+
+volumes:
+  tiles_data:

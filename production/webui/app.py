@@ -42,8 +42,7 @@ from webui.llm_utils import (
     detect_default_provider, models_for_provider,
     get_ollama_models, get_openai_ollama_models,
     _rows_to_markdown_table,
-    extract_highlight_payload, fallback_regex_extract,
-    _compute_centroid_wgs84,
+    extract_highlight_payload, fallback_regex_extract, build_highlight_payload,
     request_stop, _clear_stop, _is_stopped,
     _get_provider_ctx_limit, _estimate_tokens, _log_context_usage,
     _ollama_reachable,
@@ -69,10 +68,23 @@ def _history_with_duration(history: list, started: float) -> list:
 
 _CTX_OPTIONS = ["8K (8,192)", "32K (32,768)",  "64K (65,536)","128K (131,072)", "256K (262,144)"]
 _CTX_VALUES = {"8K (8,192)": 8192, "32K (32,768)": 32768, "64K (65,536)": 65536, "128K (131,072)": 131072, "256K (262,144)": 262144}
-_CTX_DEFAULT = "64K (65,536)"
+_CTX_DEFAULT = "128K (131,072)"
 
 VARIANT = os.environ.get("CITYDB_MCP_VARIANT", "byod")
 ENABLE_VIZ = os.environ.get("ENABLE_VIZ", "false").lower() == "true"
+
+# The 3DCityDB Web Map Client is served at /webmap (WEBMAP_DIR, baked into the
+# image — see production/docker/Dockerfile) and shown in an iframe next to the
+# chat. The DGM1 terrain below is only valid in its native CRS, so it is only
+# offered as a default terrain layer when the database SRID matches.
+_WEBMAP_SRC = "/webmap/3dwebclient/index.html"
+if os.environ.get("SRID", "").strip() == "25832":
+    from urllib.parse import urlencode as _urlencode
+    _WEBMAP_SRC += "?" + _urlencode({
+        "terrain_url": "https://www.3dcitydb.org/3dcitydb/fileadmin/public/3dwebclientprojects/terrain_bay_geomassendaten",
+        "terrain_name": "DGM1",
+        "terrain_tooltip": "LDBV - DGM1",
+    })
 
 _MAX_CONTEXT_CHARS = 400_000
 
@@ -218,7 +230,8 @@ def _check_db_status() -> str:
             data = _json.loads(raw)
             if data.get("error"):
                 return "unreachable"
-            rows = data.get("preview_rows") or data.get("all_rows") or []
+            # run_query returns its rows under "results".
+            rows = data.get("results") or data.get("preview_rows") or data.get("all_rows") or []
             if rows and int(rows[0].get("n", 1)) == 0:
                 return "empty"
         except Exception:
@@ -289,11 +302,112 @@ def _dot_db(status: str) -> str:
 _DB_EMPTY_WARNING = (
     '<div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;'
     'padding:10px 14px;margin-bottom:8px;color:#9a3412;font-size:0.87rem;">'
-    "⚠️ <strong>The database is empty</strong> — please import CityGML data first, "
-    "or click <strong>Refresh assembled prompt</strong> in the MCP Inspector tab "
+    "⚠️ <strong style='color:#7c2d12;'>The database is empty</strong> — please import CityGML data first, "
+    "or click <strong style='color:#7c2d12;'>Refresh assembled prompt</strong> in the MCP Inspector tab "
     "if you are sure the CityGML was already imported."
     "</div>"
 )
+
+
+_IMPORT_FIRST_WARNING = (
+    '<div style="background:#fff7ed;border:1px solid #fb923c;border-radius:8px;'
+    'padding:12px 16px;margin-bottom:8px;color:#9a3412;font-size:0.92rem;">'
+    "📥 <strong style='color:#7c2d12;'>Import a file to start chatting.</strong> The database is empty — "
+    "open the <strong style='color:#7c2d12;'>Import</strong> tab, choose a CityGML, CityJSON or IFC file "
+    "and click <strong style='color:#7c2d12;'>Import</strong>."
+    "</div>"
+)
+
+
+_STAGE_ICONS = {"pending": "○", "running": "⏳", "done": "✓", "error": "✗", "skipped": "–"}
+_STAGE_COLORS = {"pending": "#64748b", "running": "#e2e8f0", "done": "#4ade80",
+                 "error": "#f87171", "skipped": "#64748b"}
+
+
+def _progress_html(stages: list[tuple[str, str]], elapsed: float | None = None) -> str:
+    """Stage-based progress bar for the importer.
+
+    `stages` is [(label, state)] with state in pending/running/done/error/skipped.
+    The bar counts finished stages (a running one counts half) — the tools give
+    no finer progress figure — and turns red on the first failed stage.
+    """
+    if not stages:
+        return ""
+    total = len(stages)
+    finished = sum(1 for _, st in stages if st in ("done", "skipped"))
+    running = any(st == "running" for _, st in stages)
+    failed = any(st == "error" for _, st in stages)
+    pct = round(100 * (finished + (0.5 if running else 0)) / total)
+    if failed:
+        color, title = "#ef4444", "Failed"
+    elif finished == total:
+        color, title = "#22c55e", "Done — opening the chat…"
+    else:
+        color, title = "#3b82f6", f"{pct}%"
+    clock = ""
+    if elapsed is not None:
+        clock = f' &nbsp;·&nbsp; {int(elapsed) // 60}:{int(elapsed) % 60:02d}'
+    steps = "".join(
+        f'<span style="color:{_STAGE_COLORS[st]};white-space:nowrap;">{_STAGE_ICONS[st]} {label}</span>'
+        for label, st in stages
+    )
+    return (
+        '<div style="margin:6px 0 10px;">'
+        f'<div style="font-size:0.85rem;color:#cbd5e1;margin-bottom:4px;">{title}{clock}</div>'
+        '<div style="background:#1e293b;border-radius:6px;height:10px;overflow:hidden;">'
+        f'<div style="width:{pct}%;height:100%;background:{color};border-radius:6px;'
+        'transition:width 0.4s ease;"></div></div>'
+        f'<div style="display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:8px;font-size:0.85rem;">{steps}</div>'
+        '</div>'
+    )
+
+
+def _viewer_html(started: bool) -> str:
+    """The 3D view's iframe, or a placeholder until there is data to show.
+
+    The web map client is only started once the database has content, so it
+    never loads an empty globe (and never asks for tiles that cannot exist yet).
+    """
+    if started:
+        return (
+            f'<iframe id="cesium-iframe" src="{_WEBMAP_SRC}" '
+            'sandbox="allow-scripts allow-same-origin" '
+            'style="width:100%;height:540px;border:none;border-radius:6px;"></iframe>'
+        )
+    return (
+        '<div id="viewer-placeholder" style="height:540px;display:flex;align-items:center;'
+        "justify-content:center;text-align:center;padding:24px;border-radius:6px;"
+        'border:1px dashed #475569;color:#94a3b8;font-size:0.92rem;">'
+        "🗺️ The 3D view starts once the database contains data —<br>"
+        "import a file in the Import tab first."
+        "</div>"
+    )
+
+
+def _gate_state(db_status: str) -> dict:
+    """UI state that depends on whether the database has data yet.
+
+    In the fullstack variant an empty database locks the chat and sends the
+    user to the Import tab; in BYOD there is no Import tab, so only the
+    existing warning is shown. The 3D view starts only when the database is
+    reachable and non-empty.
+    """
+    locked = VARIANT == "fullstack" and db_status == "empty"
+    if db_status == "empty":
+        warning = _IMPORT_FIRST_WARNING if VARIANT == "fullstack" else _DB_EMPTY_WARNING
+    else:
+        warning = ""
+    return {
+        "locked": locked,
+        "warning": warning,
+        "go_import": gr.update(visible=locked),
+        "msg": gr.update(
+            interactive=not locked,
+            placeholder="Import a file to start chatting…" if locked else "Ask about your city model…",
+        ),
+        "send": gr.update(interactive=not locked),
+        "viewer": _viewer_html(db_status == "ok"),
+    }
 
 
 def _make_ctx_bar(n_tok: int, ctx_limit: int) -> str:
@@ -503,7 +617,7 @@ def _summarize_story_ollama(transcript: str, question: str, model: str, num_ctx:
             timeout=float(os.environ.get("OLLAMA_TIMEOUT", "300")),
             num_predict=700,
             reasoning=False,
-            model_kwargs={"num_ctx": num_ctx or 65536},
+            model_kwargs={"num_ctx": num_ctx or 131072},
         )
         result = llm.invoke([{"role": "user", "content": prompt}])
         text = (result.content or "").strip()
@@ -629,7 +743,7 @@ def chat_stream(
     print(f"[chat] prompt_mode={prompt_mode!r}  effective_compact={effective_compact}  ({mode_label})", flush=True)
 
     # Resolve num_ctx (only meaningful for local providers)
-    num_ctx = _CTX_VALUES.get(num_ctx_label, 65536) if provider in _LOCAL_PROVIDERS else None
+    num_ctx = _CTX_VALUES.get(num_ctx_label, 131072) if provider in _LOCAL_PROVIDERS else None
 
     # UI sends "off"|"low"|"medium"|"high" (+"max" for OpenAI-compatible
     # endpoints) from the thinking dropdown; backends expect False (disabled)
@@ -896,13 +1010,9 @@ def chat_stream(
     if ENABLE_VIZ:
         highlight_payload = extract_highlight_payload(collected_events)
         if not highlight_payload["buildings"]:
-            ids = fallback_regex_extract(accumulated)
-            if ids:
-                centroid = _compute_centroid_wgs84(ids)
-                highlight_payload = {
-                    "buildings": [{"gmlid": g} for g in ids],
-                    "centroid": [{"lat": centroid[0], "long": centroid[1]}] if centroid else None,
-                }
+            # No id column in the last result: look for ids in the answer text.
+            # The resolver drops anything that is not a real objectid.
+            highlight_payload = build_highlight_payload(fallback_regex_extract(accumulated))
     else:
         highlight_payload = _NO_HL
 
@@ -1067,6 +1177,9 @@ def build_import_tab(
     reload_tiles_state: gr.State | None = None,
     msg_input: gr.Textbox | None = None,
     send_btn: gr.Button | None = None,
+    db_warning: gr.HTML | None = None,
+    go_import_btn: gr.Button | None = None,
+    viewer_html: gr.HTML | None = None,
 ) -> None:
     from webui.importer import (
         DATA_DIR, convert_ifc_to_citygml, import_city_file, list_gml_files, run_tiler,
@@ -1123,7 +1236,7 @@ def build_import_tab(
             ifc_georef_checkbox = gr.Checkbox(
                 label="Georeference to Oktoberfest / Munich",
                 value=False,
-                info="Use when the IFC model carries no real-world georeferencing of its own. This option will georeference it to the Theresienwiese area in Munich.",
+                info="Use when the IFC model carries no real-world georeferencing of its own.",
             )
             ifc_no_storeys_checkbox = gr.Checkbox(
                 label="Skip storeys",
@@ -1145,6 +1258,9 @@ def build_import_tab(
         )
 
         import_btn = gr.Button("Import", variant="primary")
+        import_progress = gr.HTML(value=_progress_html([]))
+        # Set to "ok" only when every step succeeded; the page then jumps to the chat.
+        nav_flag = gr.Textbox(value="", visible=False)
         import_log = gr.Textbox(
             label="Import log",
             lines=20,
@@ -1285,23 +1401,38 @@ def build_import_tab(
         def run_import_and_tile(filename: str, fmt_override: str, auto_tile: bool,
                                  ifc_georef: bool = False, ifc_no_storeys: bool = False,
                                  ifc_unrelated_bce: bool = False, current_reload: int = 0):
-            def _pack(log_val: str, reload_val: int, finished: bool, dropdown_update=None):
-                out = [log_val]
+            do_ifc = _is_ifc_selection(filename, fmt_override)
+            do_tiles = bool(auto_tile) and ENABLE_VIZ
+            labels = {
+                "ifc": "Convert IFC → CityGML 3.0",
+                "import": "Import into 3DCityDB",
+                "prompt": "Assemble the agent prompt",
+                "tiles": "Generate 3D tiles",
+            }
+            keys = (["ifc"] if do_ifc else []) + ["import", "prompt"] + (["tiles"] if do_tiles else [])
+            state = {k: "pending" for k in keys}
+            t0 = time.time()
+
+            def _pack(log_val: str, reload_val: int, finished: bool, dropdown_update=None, nav: str = ""):
+                out = [log_val, _progress_html([(labels[k], state[k]) for k in keys], time.time() - t0)]
                 if tiling_done:
                     out.append(reload_val)
                 out.append(dropdown_update if dropdown_update is not None else gr.update())
                 if lock_chat:
                     chat_update = gr.update(interactive=finished)
                     out.extend([chat_update, chat_update])
-                return tuple(out) if len(out) > 1 else out[0]
+                out.append(nav)
+                return tuple(out)
 
             log = ""
             no_change = current_reload
             import_filename = filename
             import_fmt = fmt_override
+            yield _pack(log, no_change, False)
 
             # ── Stage 0: IFC → CityGML 3.0 conversion (only when selected) ─────────
-            if _is_ifc_selection(filename, fmt_override):
+            if do_ifc:
+                state["ifc"] = "running"
                 log += "Stage 0/2: Converting IFC to CityGML 3.0...\n"
                 yield _pack(log, no_change, False)
 
@@ -1315,9 +1446,11 @@ def build_import_tab(
                     yield _pack(log, no_change, False)
 
                 if not conversion_succeeded:
+                    state["ifc"] = "error"
                     log += "\nSkipping database import because IFC conversion did not succeed.\n"
                     yield _pack(log, no_change, True)
                     return
+                state["ifc"] = "done"
 
                 # citydb-tool imports the generated CityGML file, not the .ifc.
                 import_filename = Path(filename).stem + ".gml"
@@ -1325,44 +1458,67 @@ def build_import_tab(
                 log += f"\nContinuing with generated file: {import_filename}\n"
                 yield _pack(log, no_change, False, gr.update(choices=list_gml_files(), value=import_filename))
 
+            # ── Import into 3DCityDB ───────────────────────────────────────────────
+            state["import"] = "running"
+            yield _pack(log, no_change, False)
             import_succeeded = False
-
             for line in import_city_file(import_filename, import_fmt):
                 log += line
                 if "Import finished successfully" in line:
                     import_succeeded = True
                 yield _pack(log, no_change, False)
 
-            if not import_succeeded and ENABLE_VIZ:
-                log += "\nSkipping tile generation because import did not succeed.\n"
+            if not import_succeeded:
+                state["import"] = "error"
+                log += "\nImport did not succeed — skipping the remaining steps.\n"
                 yield _pack(log, no_change, True)
                 return
+            state["import"] = "done"
 
+            # ── Agent prompt ───────────────────────────────────────────────────────
+            state["prompt"] = "running"
+            log += "\nRefreshing the agent knowledge base (this can take a while)...\n"
+            yield _pack(log, no_change, False)
             try:
                 _refresh_system_prompt()
-                log += "\n✓ Agent knowledge base refreshed.\n"
-                yield _pack(log, no_change, False)
+                state["prompt"] = "done"
+                log += "✓ Agent knowledge base refreshed.\n"
             except Exception as exc:
+                state["prompt"] = "error"
                 log += f"\n⚠ Could not refresh agent knowledge base: {exc}\n"
                 yield _pack(log, no_change, True)
                 return
 
-            if not auto_tile or not ENABLE_VIZ:
-                yield _pack(log, no_change, True)
+            if not do_tiles:
+                yield _pack(log, no_change, True, nav="ok")
                 return
 
+            # ── 3D tiles ───────────────────────────────────────────────────────────
+            state["tiles"] = "running"
             log += "\n" + "═" * 60 + "\n"
             log += "Starting 3D tile generation...\n"
             log += "═" * 60 + "\n"
             yield _pack(log, no_change, False)
 
+            tiler_ok = False
             for line in run_tiler():
                 log += line
+                if "3D tile generation finished successfully" in line:
+                    tiler_ok = True
                 yield _pack(log, no_change, False)
 
+            if not tiler_ok:
+                state["tiles"] = "error"
+                log += (
+                    "\n⚠ Tile generation did not finish. The chat works, but the 3D view has no "
+                    "new tiles — use “Refresh 3D tiles” in the Chat tab to retry.\n"
+                )
+                yield _pack(log, no_change, True)
+                return
+
+            state["tiles"] = "done"
             log += "\n✓ 3D tiles ready — the 3D viewer is reloading the tileset.\n"
-            new_reload = current_reload + 1
-            yield _pack(log, new_reload, True)
+            yield _pack(log, current_reload + 1, True, nav="ok")
 
         _import_event = import_btn.click
         if lock_chat:
@@ -1371,13 +1527,38 @@ def build_import_tab(
                 outputs=[msg_input, send_btn],
             ).then
 
-        _import_event(
+        _import_done = _import_event(
             fn=run_import_and_tile,
             inputs=[file_dropdown, format_radio, auto_tile_checkbox,
                     ifc_georef_checkbox, ifc_no_storeys_checkbox, ifc_unrelated_checkbox]
                    + ([reload_tiles_state] if tiling_done else []),
-            outputs=[import_log] + extra_outputs + [file_dropdown]
-                    + ([msg_input, send_btn] if lock_chat else []),
+            outputs=[import_log, import_progress] + extra_outputs + [file_dropdown]
+                    + ([msg_input, send_btn] if lock_chat else []) + [nav_flag],
+        )
+
+        if lock_chat and db_warning is not None and go_import_btn is not None:
+            def _sync_after_import():
+                # Re-check the database: a successful import unlocks the chat and
+                # starts the 3D view (now with tiles); a failed one on an empty
+                # database keeps them locked.
+                g = _gate_state(_check_db_status())
+                out = [g["warning"], g["go_import"], g["msg"], g["send"]]
+                if viewer_html is not None:
+                    out.append(g["viewer"])
+                return tuple(out)
+
+            _import_done = _import_done.then(
+                fn=_sync_after_import,
+                outputs=[db_warning, go_import_btn, msg_input, send_btn]
+                        + ([viewer_html] if viewer_html is not None else []),
+            )
+
+        # Everything (conversion, import, prompt, tiles) succeeded: go to the chat.
+        _import_done.then(
+            fn=None, inputs=[nav_flag], outputs=[],
+            js="(ok) => { if (ok !== 'ok') return; const t = "
+               "[...document.querySelectorAll('button[role=\"tab\"]')]"
+               ".find(b => /^Chat/.test(b.textContent.trim())); if (t) t.click(); }",
         )
 
 
@@ -2387,6 +2568,32 @@ async (_win, _event_data) => {
     document.title = "3DCityDB-MCP";
     document.body.removeAttribute("data-print-title");
   });
+
+  // ── 3D viewer bridge (used when ENABLE_VIZ is on) ─────────────────────────
+  // Lives here and not in a gr.HTML <script>: Gradio strips those, which
+  // left window._sendHighlight undefined. The viewer iframe is served from
+  // this same origin, so messages are addressed to it explicitly.
+  function vizWindow() {
+    var iframe = document.getElementById("cesium-iframe");
+    return iframe && iframe.contentWindow ? iframe.contentWindow : null;
+  }
+  window._sendHighlight = function (payload) {
+    var target = vizWindow();
+    if (!target) return;
+    var buildings = (payload && payload.buildings) || [];
+    target.postMessage(
+      { type: buildings.length > 0 ? "highlight" : "clear",
+        buildings: buildings,
+        centroid: (payload && payload.centroid) || null,
+        missing: (payload && payload.missing) || [],
+        not_tileable: (payload && payload.not_tileable) || [] },
+      window.location.origin
+    );
+  };
+  window._reloadTiles = function () {
+    var target = vizWindow();
+    if (target) target.postMessage({ type: "reload_tiles" }, window.location.origin);
+  };
 }
 """.replace("__PRINT_CSS__", json.dumps(_PRINT_CSS)).replace(
     "__VERSIONS__",
@@ -2707,10 +2914,14 @@ def build_ui() -> gr.Blocks:
             with gr.Column(scale=4):
 
                 with gr.Tab("Chat"):
+                    viewer_html = None
                     if ENABLE_VIZ:
                         with gr.Row(equal_height=True, elem_classes="resizable-row", elem_id="chat-row"):
                             with gr.Column(scale=1, min_width=360):
                                 db_warning = gr.HTML(value="")
+                                go_import_btn = gr.Button(
+                                    "📥 Go to the Import tab", variant="primary", visible=False,
+                                )
                                 chatbot = gr.Chatbot(
                                     height=460,
                                     type="tuples",
@@ -2733,9 +2944,39 @@ def build_ui() -> gr.Blocks:
                                     export_pdf_btn = gr.Button("🖨", variant="secondary", scale=0, min_width=48, elem_id="export-pdf-btn")
 
                             with gr.Column(scale=1, min_width=360):
-                                gr.HTML(
-                                    '<iframe id="cesium-iframe" src="/cesium-viewer/index.html" '
-                                    'style="width:100%;height:540px;border:none;border-radius:6px;"></iframe>'
+                                with gr.Row():
+                                    gr.Markdown("**3D view**")
+                                    refresh_tiles_btn = gr.Button(
+                                        "🔄 Refresh 3D tiles", size="sm", scale=0, min_width=160,
+                                    )
+                                tiles_status = gr.Markdown("", elem_id="tiles-status")
+                                # Filled with the iframe by _on_load / after an import,
+                                # once the database has data.
+                                viewer_html = gr.HTML(value=_viewer_html(False))
+
+                                def _refresh_tiles(current_reload: int):
+                                    # Re-tile on demand, e.g. after editing the database
+                                    # directly. Bumping reload_tiles_state makes the viewer
+                                    # reload (see reload_tiles_state.change below).
+                                    from webui.importer import run_tiler
+                                    busy = gr.update(value="⏳ Tiling…", interactive=False)
+                                    idle = gr.update(value="🔄 Refresh 3D tiles", interactive=True)
+                                    log = ""
+                                    yield busy, "*Generating 3D tiles…*", current_reload
+                                    for chunk in run_tiler():
+                                        log += chunk
+                                        tail = "\n".join(log.replace("\r", "\n").splitlines()[-12:])
+                                        yield busy, f"```\n{tail}\n```", current_reload
+                                    if "3D tile generation finished successfully" in log:
+                                        yield idle, "✓ 3D tiles refreshed — reloading the viewer.", current_reload + 1
+                                    else:
+                                        tail = "\n".join(log.replace("\r", "\n").splitlines()[-12:])
+                                        yield idle, f"⚠ Tiling did not finish.\n\n```\n{tail}\n```", current_reload
+
+                                refresh_tiles_btn.click(
+                                    fn=_refresh_tiles,
+                                    inputs=[reload_tiles_state],
+                                    outputs=[refresh_tiles_btn, tiles_status, reload_tiles_state],
                                 )
 
                         with gr.Row():
@@ -2759,6 +3000,9 @@ def build_ui() -> gr.Blocks:
                         with gr.Row(equal_height=False, elem_classes="resizable-row", elem_id="chat-row"):
                             with gr.Column(scale=3, min_width=380):
                                 db_warning = gr.HTML(value="")
+                                go_import_btn = gr.Button(
+                                    "📥 Go to the Import tab", variant="primary", visible=False,
+                                )
                                 chatbot = gr.Chatbot(
                                     height=500,
                                     type="tuples",
@@ -2801,6 +3045,9 @@ def build_ui() -> gr.Blocks:
                         reload_tiles_state if ENABLE_VIZ else None,
                         msg_input=msg_input,
                         send_btn=send_btn,
+                        db_warning=db_warning,
+                        go_import_btn=go_import_btn,
+                        viewer_html=viewer_html,
                     )
 
                 with gr.Tab("MCP Inspector"):
@@ -2817,6 +3064,7 @@ def build_ui() -> gr.Blocks:
                         "| `get_db_context_snapshot` | SRS, bbox, feature counts |\n"
                         "| `get_lod_config` | Available LoD levels |\n"
                         "| `get_examples` | Curated SQL examples |\n"
+                        "| `resolve_highlight_targets` | GML ids → highlightable features for the 3D view |\n"
                         "| `get_database_schema` | Table/column definitions |\n"
                         "| `get_query_guidelines` | Indexed columns & best practices |"
                     )
@@ -2886,28 +3134,6 @@ def build_ui() -> gr.Blocks:
         story_state = gr.State([])
 
         if ENABLE_VIZ:
-            gr.HTML("""
-<script>
-window._sendHighlight = function(payload) {
-  var iframe = document.getElementById('cesium-iframe');
-  if (iframe && iframe.contentWindow) {
-    iframe.contentWindow.postMessage(
-      { type: payload && payload.buildings && payload.buildings.length > 0
-          ? 'highlight' : 'clear',
-        buildings: (payload && payload.buildings) || [],
-        centroid:  (payload && payload.centroid)  || null },
-      '*'
-    );
-  }
-};
-window._reloadTiles = function() {
-  var iframe = document.getElementById('cesium-iframe');
-  if (iframe && iframe.contentWindow) {
-    iframe.contentWindow.postMessage({ type: 'reload_tiles' }, '*');
-  }
-};
-</script>
-""")
             highlight_state.change(
                 fn=None,
                 inputs=[highlight_state],
@@ -3038,8 +3264,8 @@ window._reloadTiles = function() {
             sp = _get_system_prompt(compact=effective_compact)
             base_msgs = [{"role": "system", "content": CHAT_INSTRUCTIONS + "\n\n" + sp}]
             base_tok = _estimate_tokens(base_msgs)
-            num_ctx = _CTX_VALUES.get(num_ctx_label, 65536) if provider in _LOCAL_PROVIDERS else None
-            ctx_limit_reset = num_ctx if num_ctx else (_get_provider_ctx_limit(provider, model) if provider else 65536)
+            num_ctx = _CTX_VALUES.get(num_ctx_label, 131072) if provider in _LOCAL_PROVIDERS else None
+            ctx_limit_reset = num_ctx if num_ctx else (_get_provider_ctx_limit(provider, model) if provider else 131072)
             reset_bar = _make_ctx_bar(base_tok, ctx_limit_reset)
             return (
                 [],
@@ -3086,6 +3312,12 @@ window._reloadTiles = function() {
             outputs=[agent_trace, log_page_label, log_prev_btn, log_next_btn, log_page_state],
         )
 
+        go_import_btn.click(
+            fn=None, inputs=[], outputs=[],
+            js="() => { const t = [...document.querySelectorAll('button[role=\"tab\"]')]"
+               ".find(b => /Import/.test(b.textContent)); if (t) t.click(); }",
+        )
+
         _ASSEMBLING_HTML = (
             '<div style="display:flex;gap:16px;font-size:0.85rem;padding:6px 0;color:#94a3b8;">'
             "⏳ The context is being assembled, please wait…</div>"
@@ -3103,7 +3335,8 @@ window._reloadTiles = function() {
                 gr.update(interactive=False),
                 gr.update(),
                 gr.update(),
-            )
+                gr.update(),  # go_import_btn
+            ) + ((gr.update(),) if viewer_html is not None else ())  # viewer_html
 
             # Re-discover models now that a browser has connected. Model discovery
             # also runs at build time, but on a freshly started container the local
@@ -3129,22 +3362,26 @@ window._reloadTiles = function() {
             # context — so by the time we get here it is safe to unlock input.
             context_bar_html = clear_chat(provider, model, prompt_mode, num_ctx_label)[5]
             status_html = get_status_html(provider, model, prompt_mode_label=label, db_status=db_status)
-            warning_html = _DB_EMPTY_WARNING if db_status == "empty" else ""
+            gate = _gate_state(db_status)
+            if gate["locked"]:
+                gr.Warning("Import a file to start chatting — open the Import tab.")
             yield (
                 status_html,
                 context_bar_html,
-                warning_html,
-                gr.update(interactive=True, placeholder="Ask about your city model…"),
-                gr.update(interactive=True),
+                gate["warning"],
+                gate["msg"],
+                gate["send"],
                 dropdown_upd,
                 refresh_upd,
-            )
+                gate["go_import"],
+            ) + ((gate["viewer"],) if viewer_html is not None else ())
 
         demo.load(
             fn=_on_load,
             inputs=[provider_radio, model_dropdown, prompt_mode_radio, num_ctx_dropdown],
             outputs=[status_bar, context_bar, db_warning, msg_input, send_btn,
-                     model_dropdown, refresh_ollama_btn],
+                     model_dropdown, refresh_ollama_btn, go_import_btn]
+                    + ([viewer_html] if viewer_html is not None else []),
         )
 
     return demo
@@ -3164,15 +3401,44 @@ if __name__ == "__main__":
         from fastapi import FastAPI
         from fastapi.staticfiles import StaticFiles
 
+        class _NoCacheStaticFiles(StaticFiles):
+            # Tiles are regenerated in place (same file names, new content), so
+            # the browser must revalidate instead of serving a stale tileset.
+            async def get_response(self, path, scope):
+                response = await super().get_response(path, scope)
+                response.headers["Cache-Control"] = "no-cache"
+                return response
+
         _tiles_dir = os.environ.get("TILES_DIR", "/tiles")
-        _viewer_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cesium_viewer")
+        _webmap_dir = os.environ.get("WEBMAP_DIR", "/app/webmap")
 
         fastapi_app = FastAPI()
+
+        @fastapi_app.get("/viz/extent")
+        def _viz_extent():
+            """WGS84 bounding box of the whole dataset — the viewer's start view.
+
+            Same ST_Extent(envelope) as the prompt's "Bounding Box". Read live so it
+            is right after an import or a manual database edit; {} when unavailable.
+            """
+            from fastapi.responses import JSONResponse
+            from citydb_mcp.tools.highlight import get_dataset_extent
+            from webui.llm_utils import _get_resolver_db
+            try:
+                extent = get_dataset_extent(_get_resolver_db())
+            except Exception as exc:
+                print(f"[viz] dataset extent failed: {exc}", flush=True)
+                extent = None
+            return JSONResponse(extent or {}, headers={"Cache-Control": "no-store"})
+
         if os.path.isdir(_tiles_dir):
-            fastapi_app.mount("/tiles", StaticFiles(directory=_tiles_dir), name="tiles")
+            fastapi_app.mount("/tiles", _NoCacheStaticFiles(directory=_tiles_dir), name="tiles")
         else:
             print(f"[viz] WARNING: tiles directory not found at {_tiles_dir} — /tiles will 404", flush=True)
-        fastapi_app.mount("/cesium-viewer", StaticFiles(directory=_viewer_dir, html=True), name="cesium-viewer")
+        if os.path.isdir(_webmap_dir):
+            fastapi_app.mount("/webmap", StaticFiles(directory=_webmap_dir, html=True), name="webmap")
+        else:
+            print(f"[viz] WARNING: web map client not found at {_webmap_dir} — /webmap will 404", flush=True)
         demo.queue()
         fastapi_app = gr.mount_gradio_app(fastapi_app, demo, path="/")
 
