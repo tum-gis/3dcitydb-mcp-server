@@ -137,7 +137,6 @@ class SpatialContext:
     coverage_area_km2: float
     spatial_index_type: str
     coordinate_system: str
-    supported_spatial_ops: list[str] = field(default_factory=list)
     typical_query_extent: str = ""
     coord_dim: int = 0          # actual geometry coordinate dimension (2 or 3)
     srid_is_2d: bool = False    # True when the SRID is a 2D CRS

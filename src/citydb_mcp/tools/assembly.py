@@ -375,7 +375,14 @@ def _render_synthesized_examples(examples: list) -> str:
 def _render_spatial_capabilities(caps: dict) -> str:
     lines = ["## Spatial Functions", ""]
     lines.append("### PostGIS")
-    lines.append(", ".join(caps["postgis_functions"]))
+    lines.append(", ".join(caps["postgis_general_functions"]))
+    lines.append("")
+    lines.append(
+        "The following functions only take into account the 2D aspects of "
+        "the geometries; when applied to 3D geometries they likely will give "
+        "wrong results."
+    )
+    lines.append(", ".join(caps["postgis_2D_functions"]))
 
     if caps["sfcgal"]:
         lines.append("")

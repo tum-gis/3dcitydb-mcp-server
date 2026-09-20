@@ -2003,11 +2003,6 @@ def get_db_context_snapshot(db: DatabaseConnection) -> DBContextSnapshot:
             coverage_area_km2=0.0,
             spatial_index_type="GiST",
             coordinate_system=coord_system,
-            supported_spatial_ops=[
-                "ST_Intersects", "ST_Contains", "ST_Within",
-                "ST_DWithin", "ST_Distance", "ST_Area",
-                "ST_Buffer", "ST_Centroid"
-            ],
             coord_dim=coord_dim,
             srid_is_2d=srid_is_2d,
             z_reference=z_reference,
@@ -2841,13 +2836,26 @@ def get_spatial_capabilities(db: DatabaseConnection) -> dict:
     capabilities = {
         "postgis": True,
         "sfcgal": False,
-        "postgis_functions": [
+        # Functions whose behaviour is independent of the geometry's
+        # dimensionality (type, SRID, text, envelope access, closure checks).
+        "postgis_general_functions": [
+            "ST_Transform", "ST_Envelope", "ST_AsText", 
+            "ST_GeomFromText", "ST_Dump", "ST_Points",
+            "ST_SetSRID", "ST_MakePoint", "ST_IsClosed", 
+            "ST_GeometryType", "ST_Force3D", "ST_Force2D", 
+            "ST_XMin", "ST_XMax", "ST_YMin", "ST_YMax", "ST_ZMin", "ST_ZMax",
+            "ST_3DDWithin", "ST_3DDFullyWithin", "ST_3DDistance",
+            "ST_3DIntersects", "ST_3DExtent", "ST_3DLength",
+            "&&&", "<<->>",
+        ],
+        # Functions that operate on the XY footprint only — applying them
+        # to 3D (PolyhedralSurface Z) geometries likely gives wrong results.
+        "postgis_2D_functions": [
             "ST_Intersects", "ST_Contains", "ST_Within",
-            "ST_DWithin", "ST_Distance", "ST_Area",
-            "ST_Buffer", "ST_Centroid", "ST_Transform",
-            "ST_Envelope", "ST_AsText", "ST_MakeEnvelope",
-            "ST_SetSRID", "ST_MakePoint", "ST_IsClosed",
-            "ST_GeometryType",
+            "ST_DWithin", "ST_Distance", "ST_Area", "ST_Length",
+            "ST_Buffer", "ST_Centroid", "ST_IsValid",
+            "ST_Difference", "ST_Intersection", "ST_Union",
+            "ST_AsSVG",
         ],
         "sfcgal_functions": [],
     }
@@ -2871,6 +2879,7 @@ def get_spatial_capabilities(db: DatabaseConnection) -> dict:
                 "CG_Extrude(geom, x float, y float, z float) — extrudes a line to a surface or a surface to a volume",
                 "CG_3DBuffer(geom, radius float8, segments integer, buffer_type integer) — generates a 3D buffer around the input geometry; buffer_type: 0=rounded (default), 1=flat, 2=square; minimum 4 segments",
                 "CG_3DTranslate(geom, deltaX, deltaY, deltaZ) — translates (moves) a geometry by given offsets in 3D space",
+                "CG_3DAlphaWrapping(geom, relative_alpha int, relative_offset int) - computes the 3D alpha wrapping of a geometry; relative_alpha: 0-100 (default 10), relative_offset: 0-100 (default 10)",
             ]
     except Exception:
         pass
