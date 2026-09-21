@@ -24,10 +24,12 @@
     var GHOST_COLOR = "color('white', 0.15)";
     var POLL_INTERVAL_MS = 500;
     var MAX_POLL_ATTEMPTS = 60;
-    var STORAGE_KEY = "citydb.lastHighlight";
 
     var mode = "ghost"; // "ghost" | "isolate"
-    var last = null;    // last highlight message, re-applied on mode toggle / reload
+    // Last highlight message, re-applied on mode toggle only — never persisted or restored
+    // across a reload: the only reload trigger in this app is "the data just changed", so a
+    // stale highlight (wrong ids, wrong camera target) must never survive it.
+    var last = null;
     var pollTimer = null;
 
     // ── tileset access ───────────────────────────────────────────────────────
@@ -104,8 +106,6 @@
             duration: o.duration != null ? o.duration : 2.0,
         });
     }
-    // Also used by auto-load-tileset.js for the start view.
-    window.citydbCamera = { flyToSphere: flyToSphere };
 
     // Camera heading that looks at the target from *outside* its building: the
     // camera sits on the far side of the feature from the building's centre
@@ -190,13 +190,6 @@
     }
 
     // ── actions ──────────────────────────────────────────────────────────────
-    function remember(message) {
-        try {
-            if (message) sessionStorage.setItem(STORAGE_KEY, JSON.stringify(message));
-            else sessionStorage.removeItem(STORAGE_KEY);
-        } catch (e) { /* storage may be blocked */ }
-    }
-
     function applyHighlight(message, fly) {
         var tilesets = getTilesets();
         if (!tilesets.length) {
@@ -217,7 +210,6 @@
             return;
         }
         last = message;
-        remember(message);
         try {
             var style = buildStyle(ids);
             tilesets.forEach(function (ts) {
@@ -244,14 +236,13 @@
             ts.colorBlendMode = Cesium.Cesium3DTileColorBlendMode.HIGHLIGHT;
         });
         last = null;
-        remember(null);
         if (panel) panel.style.display = "none";
     }
 
     // Reload = reload this page. auto-load-tileset.js re-fetches the tileset,
     // and the server sends `Cache-Control: no-cache` for /tiles so a refreshed
-    // tileset is never served stale. The last highlight is restored from
-    // sessionStorage.
+    // tileset is never served stale. The reload always means new/changed data,
+    // so nothing is carried across it — `last` starts null on every fresh load.
     function applyReload() {
         window.location.reload();
     }
@@ -298,10 +289,4 @@
             }
         } catch (e) { console.warn("[highlight-bridge] could not close the splash window:", e); }
     }
-
-    // Restore the highlight that was active before a reload.
-    try {
-        var saved = sessionStorage.getItem(STORAGE_KEY);
-        if (saved) { last = JSON.parse(saved); startPoll(); }
-    } catch (e) { /* ignore */ }
 })();

@@ -3414,23 +3414,6 @@ if __name__ == "__main__":
 
         fastapi_app = FastAPI()
 
-        @fastapi_app.get("/viz/extent")
-        def _viz_extent():
-            """WGS84 bounding box of the whole dataset — the viewer's start view.
-
-            Same ST_Extent(envelope) as the prompt's "Bounding Box". Read live so it
-            is right after an import or a manual database edit; {} when unavailable.
-            """
-            from fastapi.responses import JSONResponse
-            from citydb_mcp.tools.highlight import get_dataset_extent
-            from webui.llm_utils import _get_resolver_db
-            try:
-                extent = get_dataset_extent(_get_resolver_db())
-            except Exception as exc:
-                print(f"[viz] dataset extent failed: {exc}", flush=True)
-                extent = None
-            return JSONResponse(extent or {}, headers={"Cache-Control": "no-store"})
-
         if os.path.isdir(_tiles_dir):
             fastapi_app.mount("/tiles", _NoCacheStaticFiles(directory=_tiles_dir), name="tiles")
         else:

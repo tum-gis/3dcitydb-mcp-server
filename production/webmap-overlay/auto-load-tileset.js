@@ -25,41 +25,6 @@
         document.body.appendChild(el);
     }
 
-    // Start view: an oblique overview of the dataset's bounding box (the same
-    // ST_Extent(envelope) as the prompt's "Bounding Box"), backed off far enough
-    // that all of it is in frame with a margin. Viewer.flyTo(tileset) is only the
-    // fallback: it aims at the tileset's bounding-sphere centre, which misses
-    // data that is spread over several clusters.
-    async function zoomToDataExtent(fallbackTileset) {
-        // A shared link carries its own camera — keep it.
-        if (params.has("latitude") || params.has("longitude")) return;
-        try {
-            var resp = await fetch("/viz/extent", { cache: "no-store" });
-            var e = resp.ok ? await resp.json() : null;
-            if (e && e.west != null && e.south != null && e.east != null && e.north != null &&
-                    window.citydbCamera) {
-                var rect = Cesium.Rectangle.fromDegrees(e.west, e.south, e.east, e.north);
-                var mid = (e.height_min != null && e.height_max != null)
-                    ? (e.height_min + e.height_max) / 2 : 0;
-                var sphere = Cesium.BoundingSphere.fromRectangle3D(rect, Cesium.Ellipsoid.WGS84, mid);
-                window.citydbCamera.flyToSphere(sphere.center, sphere.radius, {
-                    pitch: Cesium.Math.toRadians(-45),
-                    margin: 1.25,
-                    minRange: 80,
-                    duration: 2.0,
-                });
-                return;
-            }
-        } catch (err) {
-            console.warn("[auto-load-tileset] could not read the dataset extent:", err);
-        }
-        if (fallbackTileset) {
-            cesiumViewer.flyTo(fallbackTileset, { duration: 2.0 }).catch(function (err) {
-                console.warn("[auto-load-tileset] flyTo did not complete:", err);
-            });
-        }
-    }
-
     async function autoLoad() {
         try {
             var resp = await fetch(TILESET_URL, { method: "HEAD" });
@@ -96,12 +61,19 @@
             console.log("[auto-load-tileset] tileset loaded OK");
             // Fire-and-forget: flyTo promises have been observed to never settle,
             // so the loading indicator must not wait on them.
-            zoomToDataExtent(addedLayer._tileset);
-            // The toolbar's Home button returns to the same overview.
+            // Same "zoom to this layer" effect as double-clicking City Model in the
+            // layer list (Cesium3DTilesDataLayer.zoomToStartPosition ->
+            // flyToBoundingSphere(tileset.boundingSphere)) — the tileset's own bounding
+            // sphere is exactly what's on screen, no separate query needed. A shared
+            // link carries its own camera, so don't override it.
+            if (!params.has("latitude") && !params.has("longitude")) {
+                addedLayer.zoomToStartPosition();
+            }
+            // The toolbar's Home button returns to the same view.
             try {
                 cesiumViewer.homeButton.viewModel.command.beforeExecute.addEventListener(function (ev) {
                     ev.cancel = true;
-                    zoomToDataExtent(addedLayer._tileset);
+                    addedLayer.zoomToStartPosition();
                 });
             } catch (err) {
                 console.warn("[auto-load-tileset] could not hook the Home button:", err);
