@@ -188,14 +188,30 @@ def list_gml_files() -> list[str]:
 _tiler_lock = threading.Lock()
 
 
-def _check_tiler_schema(db: dict) -> Generator[str, None, bool]:
-    """Verify {schema}.geometry_data exists; migrate geometry_properties to jsonb if needed.
+# (table, column) pairs the tiler touches with jsonb subscript/operator syntax
+# (e.g. jsonb_object_keys(), ->>), which fails if the column is still `json`.
+# geometry_data.geometry_properties is required — its absence means "import
+# data first". The three surface_data_mapping columns are optional: the tiler
+# only reads material_mapping directly, but texture_mapping and the two
+# georeferenced/world-to-texture columns are the same json/jsonb mismatch
+# waiting to happen the moment a textured dataset exercises them, so they are
+# migrated preemptively alongside it.
+_TILER_JSONB_COLUMNS = [
+    ("geometry_data", "geometry_properties", True),
+    ("surface_data_mapping", "material_mapping", False),
+    ("surface_data_mapping", "texture_mapping", False),
+    ("surface_data_mapping", "world_to_texture_mapping", False),
+    ("surface_data_mapping", "georeferenced_texture_mapping", False),
+]
 
-    The tiler uses jsonb subscript syntax on geometry_properties, which fails
-    if the column is `json`. Current 3DCityDB v5 images create it as jsonb, so
-    this is a no-op there; it only matters for databases initialised with an
-    older image. Returns False (after yielding why) if tiling cannot proceed.
-    Any failure of the check itself is non-fatal: the tiler is run regardless.
+
+def _check_tiler_schema(db: dict) -> Generator[str, None, bool]:
+    """Verify {schema}.geometry_data exists; migrate json columns to jsonb if needed.
+
+    Current 3DCityDB v5 images create these columns as jsonb, so this is a
+    no-op there; it only matters for databases initialised with an older
+    image. Returns False (after yielding why) if tiling cannot proceed. Any
+    failure of the check itself is non-fatal: the tiler is run regardless.
     """
     try:
         import psycopg2
@@ -213,26 +229,30 @@ def _check_tiler_schema(db: dict) -> Generator[str, None, bool]:
     try:
         conn.autocommit = True
         with conn.cursor() as cur:
-            cur.execute(
-                """SELECT data_type FROM information_schema.columns
-                   WHERE table_schema = %s AND table_name = 'geometry_data'
-                     AND column_name = 'geometry_properties'""",
-                (schema,),
-            )
-            row = cur.fetchone()
-            if row is None:
-                yield f"⚠ {schema}.geometry_data not found — import data first.\n"
-                return False
-            if row[0] == "json":
-                yield "Migrating geometry_properties json → jsonb...\n"
+            for table, column, required in _TILER_JSONB_COLUMNS:
                 cur.execute(
-                    pg_sql.SQL(
-                        "ALTER TABLE {}.geometry_data "
-                        "ALTER COLUMN geometry_properties TYPE jsonb "
-                        "USING geometry_properties::jsonb"
-                    ).format(pg_sql.Identifier(schema))
+                    """SELECT data_type FROM information_schema.columns
+                       WHERE table_schema = %s AND table_name = %s
+                         AND column_name = %s""",
+                    (schema, table, column),
                 )
-                yield "✓ Migration complete.\n"
+                row = cur.fetchone()
+                if row is None:
+                    if required:
+                        yield f"⚠ {schema}.{table} not found — import data first.\n"
+                        return False
+                    continue  # optional table/column not present — nothing to migrate
+                if row[0] == "json":
+                    yield f"Migrating {table}.{column} json → jsonb...\n"
+                    cur.execute(
+                        pg_sql.SQL(
+                            "ALTER TABLE {}.{} ALTER COLUMN {} TYPE jsonb USING {}::jsonb"
+                        ).format(
+                            pg_sql.Identifier(schema), pg_sql.Identifier(table),
+                            pg_sql.Identifier(column), pg_sql.Identifier(column),
+                        )
+                    )
+                    yield "✓ Migration complete.\n"
     except Exception as exc:
         yield f"⚠ Schema check skipped: {exc}\n"
     finally:

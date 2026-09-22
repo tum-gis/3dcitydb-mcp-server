@@ -11,6 +11,12 @@
 // While a highlight is active every other feature is either ghosted (default)
 // or hidden ("isolate"), because an interior room is otherwise hidden inside
 // the building shell.
+//
+// The viewer -> parent direction (a user's click selection, sent up to the
+// chat) is handled by select-bridge.js, loaded after this file; it drives
+// the selection styling (cyan) through window._citydbBridge below, kept
+// independent of the highlight (orange) so an agent answer never clears a
+// selection and vice versa.
 (function () {
     "use strict";
 
@@ -21,6 +27,7 @@
     // undefined (it does not throw), so all are tried.
     var ID_PROPERTIES = ["objectid", "id", "GMLID", "gmlid"];
     var HIGHLIGHT_COLOR = "color('#ff5a00', 1.0)";
+    var SELECTION_COLOR = "color('#e11d48', 1.0)";
     var GHOST_COLOR = "color('white', 0.15)";
     var POLL_INTERVAL_MS = 500;
     var MAX_POLL_ATTEMPTS = 60;
@@ -31,6 +38,10 @@
     // stale highlight (wrong ids, wrong camera target) must never survive it.
     var last = null;
     var pollTimer = null;
+    // The current viewer selection (select-bridge.js), kept separately from
+    // `last`: an agent answer highlights in orange without touching a
+    // selection the user made in cyan, and vice versa.
+    var selectionIds = [];
 
     // ── tileset access ───────────────────────────────────────────────────────
     // Look in the Cesium scene rather than the client's private layer fields:
@@ -61,14 +72,55 @@
         }).join(" || ");
     }
 
-    function buildStyle(ids) {
-        var match = buildMatchExpression(ids);
+    // Single style owner for both the agent's highlight (orange) and the
+    // user's viewer selection (cyan) — they must be able to coexist and stay
+    // visually distinct. Selection wins where a feature is in both sets.
+    function buildStyle(highlightIds, selIds) {
+        var selMatch = selIds.length ? buildMatchExpression(selIds) : null;
+        var hlMatch = highlightIds.length ? buildMatchExpression(highlightIds) : null;
         if (mode === "isolate") {
-            return new Cesium.Cesium3DTileStyle({ show: match, color: HIGHLIGHT_COLOR });
+            var anyIds = (selIds || []).concat(highlightIds || []);
+            var show = anyIds.length ? buildMatchExpression(anyIds) : "false";
+            var isolateConditions = [];
+            if (selMatch) isolateConditions.push([selMatch, SELECTION_COLOR]);
+            isolateConditions.push(["true", HIGHLIGHT_COLOR]);
+            return new Cesium.Cesium3DTileStyle({
+                show: show,
+                color: selMatch ? { conditions: isolateConditions } : HIGHLIGHT_COLOR,
+            });
         }
-        return new Cesium.Cesium3DTileStyle({
-            color: { conditions: [[match, HIGHLIGHT_COLOR], ["true", GHOST_COLOR]] },
-        });
+        var ghostConditions = [];
+        if (selMatch) ghostConditions.push([selMatch, SELECTION_COLOR]);
+        if (hlMatch) ghostConditions.push([hlMatch, HIGHLIGHT_COLOR]);
+        ghostConditions.push(["true", GHOST_COLOR]);
+        return new Cesium.Cesium3DTileStyle({ color: { conditions: ghostConditions } });
+    }
+
+    // Re-applies the combined style from whatever highlight/selection ids are
+    // currently known. Never touches the camera.
+    function applyCombinedStyle() {
+        var tilesets = getTilesets();
+        if (!tilesets.length) return;
+        var highlightIds = last ? collectIds(last) : [];
+        if (!highlightIds.length && !selectionIds.length) {
+            tilesets.forEach(function (ts) {
+                ts.style = undefined;
+                ts.colorBlendMode = Cesium.Cesium3DTileColorBlendMode.HIGHLIGHT;
+            });
+            return;
+        }
+        try {
+            var style = buildStyle(highlightIds, selectionIds);
+            tilesets.forEach(function (ts) {
+                // By default Cesium multiplies the style colour with the model's own
+                // colour (orange x a blue window = green). Replace it instead, so a
+                // highlight/selection colour is always exact.
+                ts.colorBlendMode = Cesium.Cesium3DTileColorBlendMode.REPLACE;
+                ts.style = style;
+            });
+        } catch (err) {
+            console.error("[highlight-bridge] could not build tile style:", err);
+        }
     }
 
     function collectIds(message) {
@@ -161,7 +213,7 @@
         clearBtn.textContent = "Clear";
         modeBtn.onclick = function () {
             mode = mode === "ghost" ? "isolate" : "ghost";
-            if (last) applyHighlight(last, false);
+            applyCombinedStyle();
         };
         clearBtn.onclick = function () { applyClear(); };
         panel.appendChild(badge);
@@ -198,27 +250,9 @@
             return;
         }
         var ids = collectIds(message);
-        if (!ids.length) {
-            // Nothing tileable to show: drop any previous highlight but still
-            // tell the user why.
-            tilesets.forEach(function (ts) {
-                ts.style = undefined;
-                ts.colorBlendMode = Cesium.Cesium3DTileColorBlendMode.HIGHLIGHT;
-            });
-            last = message;
-            showPanel(message, ids);
-            return;
-        }
         last = message;
         try {
-            var style = buildStyle(ids);
-            tilesets.forEach(function (ts) {
-                // By default Cesium multiplies the style colour with the model's own
-                // colour (orange x a blue window = green). Replace it instead, so a
-                // highlight is always the same orange.
-                ts.colorBlendMode = Cesium.Cesium3DTileColorBlendMode.REPLACE;
-                ts.style = style;
-            });
+            applyCombinedStyle();
         } catch (err) {
             console.error("[highlight-bridge] could not build tile style:", err);
             warn("Highlight failed: " + err);
@@ -227,15 +261,14 @@
         console.log("[highlight-bridge] highlighting", ids.length, "features, e.g.", ids[0]);
         modeBtn && (modeBtn.style.display = "");
         showPanel(message, ids);
-        if (fly !== false) flyToTarget(message.centroid, tilesets);
+        if (ids.length && fly !== false) flyToTarget(message.centroid, tilesets);
     }
 
+    // Clears the agent's highlight only — a viewer selection (cyan) survives
+    // an answer, and Clear here never touches selectionIds.
     function applyClear() {
-        getTilesets().forEach(function (ts) {
-            ts.style = undefined;
-            ts.colorBlendMode = Cesium.Cesium3DTileColorBlendMode.HIGHLIGHT;
-        });
         last = null;
+        applyCombinedStyle();
         if (panel) panel.style.display = "none";
     }
 
@@ -261,7 +294,7 @@
                 clearInterval(pollTimer);
                 pollTimer = null;
                 console.error("[highlight-bridge] gave up waiting for a tileset");
-                warn("3D tileset not loaded — generate tiles first (Import tab or Refresh 3D Tiles).");
+                warn("3D tileset not loaded — generate tiles first (Import tab or Recreate 3D Tiles).");
             }
         }, POLL_INTERVAL_MS);
     }
@@ -275,6 +308,22 @@
         else if (data.type === "clear") applyClear();
         else if (data.type === "highlight") applyHighlight(data, true);
     });
+
+    // ── shared bridge (used by select-bridge.js) ────────────────────────────
+    // Sets the viewer selection (cyan) independently of the agent's highlight
+    // (orange) — never flies the camera, since the user is already looking
+    // at whatever they selected.
+    function setSelection(ids) {
+        selectionIds = (ids || []).map(String);
+        applyCombinedStyle();
+    }
+
+    window._citydbBridge = {
+        getTilesets: getTilesets,
+        buildMatchExpression: buildMatchExpression,
+        ID_PROPERTIES: ID_PROPERTIES,
+        setSelection: setSelection,
+    };
 
     // Embedded in the chat page, the client's "Introduction" splash window would
     // cover the whole map. script.js builds it synchronously before this file

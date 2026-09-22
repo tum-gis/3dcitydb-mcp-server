@@ -21,7 +21,7 @@
             "background:rgba(30,41,59,.9);color:#f8fafc;padding:8px 14px;border-radius:6px;" +
             "font:13px/1.4 sans-serif;text-align:center;max-width:80%;";
         el.textContent =
-            "No 3D tiles yet — press “Refresh 3D tiles” above the viewer to generate them.";
+            "No 3D tiles yet — press Recreate 3D tiles” above the viewer to generate them.";
         document.body.appendChild(el);
     }
 

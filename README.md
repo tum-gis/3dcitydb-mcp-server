@@ -449,6 +449,21 @@ All options are set via environment variables (`.env` file or Docker Compose `en
 | `SRID` | `25832` | EPSG code for the 3DCityDB spatial reference |
 | `POSTGIS_SFCGAL` | `true` | Enable SFCGAL extension (required for, e.g., `CG_Volume`, `CG_3DArea`) |
 
+### 3D viewer (only used when `ENABLE_VIZ=true`)
+
+Default terrain and base map for the 3D view. Both default to Germany-wide, freely licensed sources ([basemap.de](https://basemap.de)) and are applied unconditionally — not gated to one region's SRID. Set a `*_URL` to an empty string to disable that layer, or override all of these for another country.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VIEWER_TERRAIN_URL` | `https://web3d.basemap.de/cesium/dgm5-mesh/` | Cesium quantized-mesh terrain endpoint |
+| `VIEWER_TERRAIN_NAME` | `DGM5 (basemap.de)` | Shown in the terrain picker |
+| `VIEWER_TERRAIN_TOOLTIP` | `basemap.de - DGM5 (Germany)` | Tooltip for the terrain picker entry |
+| `VIEWER_WMS_URL` | `https://sgx.geodatenzentrum.de/wms_basemapde?` | OGC WMS endpoint added as a selectable base map |
+| `VIEWER_WMS_LAYER` | `de_basemapde_web_raster_farbe` | WMS layer name |
+| `VIEWER_WMS_NAME` | `WMS basemap.de` | Shown in the base-layer picker |
+| `VIEWER_WMS_TOOLTIP` | `(C) basemap.de` | Tooltip for the base-layer picker entry |
+| `VIEWER_WMS_PROXY_URL` | *(empty)* | Only needed for a WMS without CORS — this image does not ship the vendored client's own `/proxy/` endpoint; basemap.de sends `Access-Control-Allow-Origin: *` so the default (no proxy) works |
+
 ### LLM providers
 
 At least one must be configured for the Docker variants. The Gradio UI auto-selects the provider based on what is available (Anthropic → OpenAI → Ollama, in that priority order).
@@ -532,6 +547,8 @@ call regardless of provider (Ollama or OpenAI-compatible).
 | `get_lod_config` | Available Levels of Detail in the database |
 | `get_examples(objectclass_ids)` | SQL examples filtered to existing object classes |
 | `resolve_highlight_targets(objectids)` | Expands GML ids (e.g. a Room) to the geometry-owning features a 3D viewer can highlight, plus a WGS84 camera target |
+| `get_feature_tree(objectid)` | Containment tree around one picked feature: its ancestors, children, and siblings |
+| `describe_selection(objectids)` | Summarizes a multi-feature viewer selection: resolved features, per-class counts, tileable ids |
 
 ### Runtime (per query)
 

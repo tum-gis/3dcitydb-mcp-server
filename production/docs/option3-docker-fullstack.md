@@ -130,6 +130,8 @@ docker compose -f production/docker-compose.fullstack.yml down -v
 | `POSTGRES_USER` | ❌ | Database user (default: `citydb`) |
 | `POSTGRES_PASSWORD` | ❌ | Database password (default: `citydb`) |
 | `SRID` | ❌ | Spatial reference ID (default: `25832`) |
+| `VIEWER_TERRAIN_URL` / `VIEWER_TERRAIN_NAME` / `VIEWER_TERRAIN_TOOLTIP` | ❌ | 3D view's default terrain (viz overlay only; default: basemap.de's Germany-wide DGM5) |
+| `VIEWER_WMS_URL` / `VIEWER_WMS_LAYER` / `VIEWER_WMS_NAME` / `VIEWER_WMS_TOOLTIP` / `VIEWER_WMS_PROXY_URL` | ❌ | 3D view's default WMS base map (viz overlay only; default: basemap.de's WMS) |
 
 ---
 

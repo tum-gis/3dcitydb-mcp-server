@@ -29,6 +29,7 @@ from .tools.runtime_tools import (
 )
 from .tools.assembly import assemble_prompt
 from .tools.highlight import resolve_highlight_targets
+from .tools.selection import get_feature_tree, describe_selection
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("citydb-mcp")
@@ -71,7 +72,15 @@ server = Server(
         "execute it with run_query. The remaining tools (get_database_schema, "
         "get_query_guidelines, get_generic_attributes, get_lod_config, "
         "get_examples, ...) provide supporting details and are also used "
-        "internally by assemble_prompt."
+        "internally by assemble_prompt.\n\n"
+        "3D viewer support: resolve_highlight_targets expands feature "
+        "objectids into the ids a 3D Tiles viewer can style plus a camera "
+        "target; get_feature_tree walks the containment tree around one "
+        "picked feature (its ancestors, children, and siblings) so a client "
+        "can let a user pick the right level (e.g. a clicked wall vs. the "
+        "building it belongs to); describe_selection summarizes a finished "
+        "multi-feature selection (per-class counts, tileable ids) for use "
+        "when scoping a query to it."
     ),
 )
 db = DatabaseConnection()
@@ -226,6 +235,49 @@ async def list_tools() -> list[Tool]:
                 "that own geometry (its boundary surfaces, doors, ...). Returns "
                 "resolved, missing, not_tileable, tile_ids and centroid "
                 "{lat, long, radius_m}. Read-only."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "objectids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "feature.objectid values (GML ids), at most 200",
+                    }
+                },
+                "required": ["objectids"],
+            },
+        ),
+        Tool(
+            name="get_feature_tree",
+            description=(
+                "Returns the containment neighbourhood of one picked feature: "
+                "its ancestors (nearest parent first, walking up to the "
+                "top-level feature), its own children one level down, and its "
+                "siblings (the other children of its immediate parent). Use "
+                "this to let a user who clicked a boundary surface in a 3D "
+                "viewer navigate to the right level (e.g. from a WallSurface "
+                "up to its Building, or down to its Windows). Read-only."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "objectid": {
+                        "type": "string",
+                        "description": "The picked feature's objectid (GML id)",
+                    }
+                },
+                "required": ["objectid"],
+            },
+        ),
+        Tool(
+            name="describe_selection",
+            description=(
+                "Summarizes a finished multi-feature viewer selection for use "
+                "when scoping a query to it: resolved features with their "
+                "classname and tileable ids, a per-classname count, and any "
+                "objectids that were not found. Unlike resolve_highlight_targets, "
+                "this never returns a camera target. Read-only."
             ),
             inputSchema={
                 "type": "object",
@@ -429,6 +481,14 @@ def _execute_tool(name: str, arguments: dict) -> str:
     # --- Viewer support ---
     if name == "resolve_highlight_targets":
         result = resolve_highlight_targets(db, arguments["objectids"])
+        return _to_json(result)
+
+    if name == "get_feature_tree":
+        result = get_feature_tree(db, arguments["objectid"])
+        return _to_json(result)
+
+    if name == "describe_selection":
+        result = describe_selection(db, arguments["objectids"])
         return _to_json(result)
 
     # --- User context ---

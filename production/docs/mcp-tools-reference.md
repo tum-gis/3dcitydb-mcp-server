@@ -136,6 +136,39 @@ A 3D Tiles export contains only features that own geometry. A `Room` usually has
 
 ---
 
+### `get_feature_tree(objectid)`
+
+Returns the containment neighbourhood of one picked feature: its ancestors, its own children one level down, and its siblings. Meant for a 3D viewer that lets a user navigate from a clicked boundary surface (e.g. a `WallSurface`) up to the feature it belongs to (e.g. its `Building`) or down to what it contains (e.g. its `Window`s). Read-only.
+
+**Parameters:** `objectid` (string).
+
+**Returns:**
+
+- `picked` — `{objectid, classname}`, or `null` if not found
+- `ancestors` — `[{objectid, classname, depth}, ...]`, nearest parent first, walking up to the top-level feature (depth ≤ 5)
+- `children` — `[{objectid, classname, has_geometry}, ...]`, one level of features directly contained in the picked feature
+- `children_truncated` — `true` if the children list hit its cap (200)
+- `siblings` — `[{objectid, classname, has_geometry}, ...]`, the other children of the picked feature's immediate parent
+- `siblings_truncated` — `true` if the siblings list hit its cap (200)
+
+---
+
+### `describe_selection(objectids)`
+
+Summarizes a finished multi-feature viewer selection, for scoping a subsequent query to it. Delegates to `resolve_highlight_targets` for the containment-tree expansion and tileability logic, but never returns a camera target — selecting a feature the user is already looking at must never move the camera. Read-only.
+
+**Parameters:** `objectids` (list of strings, at most 200).
+
+**Returns:**
+
+- `features` — `[{objectid, classname, tile_ids}, ...]`
+- `count` — number of resolved features
+- `by_classname` — `{classname: count, ...}`
+- `missing` — ids not present in the database
+- `truncated` — `true` if the descendant walk hit its row cap
+
+---
+
 ### `get_examples(objectclass_ids)`
 
 Returns 8 curated SQL examples adapted to the object classes present in the database:

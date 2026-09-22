@@ -66,6 +66,52 @@ def _history_with_duration(history: list, started: float) -> list:
     )
   return display_history
 
+_MAX_SELECTION_FEATURES = 200  # matches citydb_mcp.tools.highlight.MAX_OBJECTIDS
+
+
+def _on_selection_sink(raw: str):
+  """Parse the viewer's postMessage payload into a clean selection state.
+
+  `raw` is untrusted browser input (relayed verbatim from select-bridge.js
+  through the hidden textbox) — reject anything that doesn't match the
+  expected shape instead of trusting it.
+  """
+  try:
+    data = json.loads(raw) if raw else {}
+  except (TypeError, ValueError):
+    data = {}
+  if not isinstance(data, dict):
+    data = {}
+
+  features = []
+  for f in data.get("features") or []:
+    if not isinstance(f, dict):
+      continue
+    oid = f.get("objectid")
+    if not oid:
+      continue
+    classname = f.get("classname")
+    features.append({
+      "objectid": str(oid)[:200],
+      "classname": str(classname)[:100] if classname else None,
+    })
+  features = features[:_MAX_SELECTION_FEATURES]
+
+  badge = ""
+  if features:
+    # Which features, not just how many — a bare count doesn't say whether
+    # this is one building or several once there's more than one selected.
+    _max_shown = 6
+    parts = [
+      (f["classname"] + " " if f["classname"] else "") + f["objectid"]
+      for f in features[:_max_shown]
+    ]
+    if len(features) > _max_shown:
+      parts.append(f"… +{len(features) - _max_shown} more")
+    badge = f"🖱 {len(features)} feature" + ("" if len(features) == 1 else "s") + " selected: " + "; ".join(parts)
+  return {"features": features, "count": len(features)}, badge
+
+
 _CTX_OPTIONS = ["8K (8,192)", "32K (32,768)",  "64K (65,536)","128K (131,072)", "256K (262,144)"]
 _CTX_VALUES = {"8K (8,192)": 8192, "32K (32,768)": 32768, "64K (65,536)": 65536, "128K (131,072)": 131072, "256K (262,144)": 262144}
 _CTX_DEFAULT = "128K (131,072)"
@@ -75,16 +121,45 @@ ENABLE_VIZ = os.environ.get("ENABLE_VIZ", "false").lower() == "true"
 
 # The 3DCityDB Web Map Client is served at /webmap (WEBMAP_DIR, baked into the
 # image — see production/docker/Dockerfile) and shown in an iframe next to the
-# chat. The DGM1 terrain below is only valid in its native CRS, so it is only
-# offered as a default terrain layer when the database SRID matches.
+# chat.
+#
+# Default terrain (auto-load-terrain.js) and base map (auto-load-basemap.js)
+# are read from these env vars, defaulting to Germany-wide, freely licensed
+# sources (basemap.de) — applied unconditionally, not just for one region's
+# SRID. Set the *_URL to "" to disable a layer, or override all of these in
+# .env for another country (see .env.example).
+_TERRAIN_URL = os.environ.get("VIEWER_TERRAIN_URL", "https://web3d.basemap.de/cesium/dgm5-mesh/")
+_TERRAIN_NAME = os.environ.get("VIEWER_TERRAIN_NAME", "DGM5 (basemap.de)")
+_TERRAIN_TOOLTIP = os.environ.get("VIEWER_TERRAIN_TOOLTIP", "basemap.de - DGM5 (Germany)")
+
+_WMS_URL = os.environ.get("VIEWER_WMS_URL", "https://sgx.geodatenzentrum.de/wms_basemapde?")
+_WMS_LAYER = os.environ.get("VIEWER_WMS_LAYER", "de_basemapde_web_raster_farbe")
+_WMS_NAME = os.environ.get("VIEWER_WMS_NAME", "WMS basemap.de")
+_WMS_TOOLTIP = os.environ.get("VIEWER_WMS_TOOLTIP", "(C) basemap.de")
+# basemap.de's WMS sends Access-Control-Allow-Origin: *, so no proxy is needed
+# by default; this image does not ship the vendored client's own /proxy/
+# endpoint. Only set this for a WMS that needs one.
+_WMS_PROXY_URL = os.environ.get("VIEWER_WMS_PROXY_URL", "")
+
 _WEBMAP_SRC = "/webmap/3dwebclient/index.html"
-if os.environ.get("SRID", "").strip() == "25832":
-    from urllib.parse import urlencode as _urlencode
-    _WEBMAP_SRC += "?" + _urlencode({
-        "terrain_url": "https://www.3dcitydb.org/3dcitydb/fileadmin/public/3dwebclientprojects/terrain_bay_geomassendaten",
-        "terrain_name": "DGM1",
-        "terrain_tooltip": "LDBV - DGM1",
+_webmap_params: dict = {}
+if _TERRAIN_URL.strip():
+    _webmap_params.update({
+        "terrain_url": _TERRAIN_URL,
+        "terrain_name": _TERRAIN_NAME,
+        "terrain_tooltip": _TERRAIN_TOOLTIP,
     })
+if _WMS_URL.strip() and _WMS_LAYER.strip():
+    _webmap_params.update({
+        "wms_url": _WMS_URL,
+        "wms_layer": _WMS_LAYER,
+        "wms_name": _WMS_NAME,
+        "wms_tooltip": _WMS_TOOLTIP,
+        "wms_proxy_url": _WMS_PROXY_URL,
+    })
+if _webmap_params:
+    from urllib.parse import urlencode as _urlencode
+    _WEBMAP_SRC += "?" + _urlencode(_webmap_params)
 
 _MAX_CONTEXT_CHARS = 400_000
 
@@ -143,6 +218,35 @@ def _format_tool_cache_note(cache: dict) -> str:
         rows=rows_json,
     )
     return note
+
+
+def _format_selection_note(features: list[dict]) -> str:
+    """Render the viewer's current selection as a system-side scoping hint.
+
+    `features` is the [{"objectid", "classname"}, ...] list from
+    `selection_state` (already sanitized by `_on_selection_sink`).
+    """
+    truncated = len(features) > _MAX_SELECTION_FEATURES
+    shown = features[:_MAX_SELECTION_FEATURES]
+    lines = "\n".join(
+        f["objectid"] + ("  " + f["classname"] if f.get("classname") else "")
+        for f in shown
+    )
+    trunc_note = (
+        f"\n(truncated to the first {_MAX_SELECTION_FEATURES} of {len(features)} selected features)"
+        if truncated else ""
+    )
+    ids_literal = ", ".join(f"'{f['objectid']}'" for f in shown)
+    return (
+        f"[VIEWER SELECTION — {len(shown)} feature(s) the user has selected in the 3D view]\n"
+        f"{lines}{trunc_note}\n\n"
+        "When the user writes \"these\", \"the selected ones\", \"diese Gebäude\" or "
+        "anything else demonstrative, they mean exactly these features and no "
+        "others. Scope your SQL with  WHERE f.objectid IN (" + ids_literal + ")  "
+        "and never widen beyond this list. If the user's question is clearly "
+        "about the whole dataset instead, answer globally but say in one "
+        "sentence that the selection was not applied."
+    )
 
 
 def _cache_is_fresh(cache: dict | None) -> bool:
@@ -721,6 +825,7 @@ def chat_stream(
     add_story: bool = False,
     reasoning_history: list | None = None,
     story_history: list | None = None,
+    selection: dict | None = None,
 ) -> Generator[tuple, None, None]:
     if log_history is None:
         log_history = []
@@ -824,6 +929,14 @@ def chat_stream(
             f"age={int((__import__('time').time() - cache_out.get('ts', 0)))}s",
             flush=True,
         )
+
+    # Viewer-only: inject the user's current 3D-view selection as a system
+    # note right after the main system prompt (same position as the tool
+    # cache above). Gated on ENABLE_VIZ so a selection can only ever exist,
+    # and only ever be injected, when the 3D viewer is actually in use.
+    if ENABLE_VIZ and selection and selection.get("features"):
+        messages.insert(1, {"role": "system", "content": _format_selection_note(selection["features"])})
+        print(f"[chat] injected viewer selection: {len(selection['features'])} feature(s)", flush=True)
 
     # Distilled stories from earlier turns are injected as separate system
     # messages right after the assistant answer that produced them (see the
@@ -1511,7 +1624,7 @@ def build_import_tab(
                 state["tiles"] = "error"
                 log += (
                     "\n⚠ Tile generation did not finish. The chat works, but the 3D view has no "
-                    "new tiles — use “Refresh 3D tiles” in the Chat tab to retry.\n"
+                    "new tiles — use Recreate 3D tiles” in the Chat tab to retry.\n"
                 )
                 yield _pack(log, no_change, True)
                 return
@@ -2594,6 +2707,29 @@ async (_win, _event_data) => {
     var target = vizWindow();
     if (target) target.postMessage({ type: "reload_tiles" }, window.location.origin);
   };
+
+  // Viewer -> parent: a selection made in the 3D view (select-bridge.js),
+  // relayed into the hidden `selection_sink` textbox so Gradio's Python side
+  // can react to it. Only accepted from the viewer iframe itself, same origin.
+  window.addEventListener("message", function (event) {
+    if (event.origin !== window.location.origin) return;
+    var iframe = document.getElementById("cesium-iframe");
+    if (!iframe || event.source !== iframe.contentWindow) return;
+    var data = event.data;
+    if (!data) return;
+    if (data.type === "selection") {
+      var ta = document.querySelector("#selection-sink textarea");
+      if (!ta) return;
+      ta.value = JSON.stringify(data);
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+    } else if (data.type === "selection_done") {
+      // "Finish" in the viewer's selection panel: the selection itself was
+      // already synced (every add/remove posts immediately), this is just
+      // "I'm done, take me to the chat" — move focus to the message box.
+      var input = document.querySelector("#msg-input textarea");
+      if (input) input.focus();
+    }
+  });
 }
 """.replace("__PRINT_CSS__", json.dumps(_PRINT_CSS)).replace(
     "__VERSIONS__",
@@ -2628,8 +2764,28 @@ def build_ui() -> gr.Blocks:
             font=[gr.themes.GoogleFont("Open Sans"), "ui-sans-serif", "sans-serif"],
             font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "ui-monospace", "monospace"],
         ),
+        # Gradio's default centers content in a ~1280px column, leaving wide
+        # side margins — a real loss with ENABLE_VIZ, where that space is
+        # split between chat and an already-small 3D view. fill_width alone
+        # doesn't override the theme's own inner max-width on
+        # .gradio-container/.contain, hence the explicit rule via `head=`
+        # below: selectors passed through `css=` get rewritten by Gradio to
+        # nest under `.gradio-container .contain`, which would turn a rule
+        # targeting `.gradio-container` itself into a non-matching, wrongly
+        # nested selector (see the _PRINT_CSS comment above for the same
+        # issue) — `head=` injects into <head> unscoped, so it isn't rewritten.
+        fill_width=True,
+        head="<style>.gradio-container, .contain { max-width: 100% !important; } "
+             "#top-row, #chat-row { max-width: 100% !important; }</style>",
         js=_RESIZE_JS,
         css="""
+        /* gr.Textbox(visible=False) is not just CSS-hidden by Gradio 5 — the
+           whole component (including its <textarea>) is never mounted in the
+           DOM. select-bridge.js's reverse channel needs a real, queryable
+           textarea to write into, so selection-sink is visible=True and
+           hidden this way instead: present in the DOM, invisible to the eye. */
+        #selection-sink { position: absolute !important; width: 1px !important; height: 1px !important;
+          padding: 0 !important; margin: -1px !important; overflow: hidden !important; opacity: 0 !important; }
         .header-bar { background: #1e293b; padding: 16px 24px; border-radius: 8px; margin-bottom: 8px; }
         .header-bar h1 { color: #f8fafc; margin: 0; font-size: 1.4rem; }
         .header-bar p  { color: #94a3b8; margin: 4px 0 0; font-size: 0.85rem; }
@@ -2933,11 +3089,16 @@ def build_ui() -> gr.Blocks:
                                         {"left": "$", "right": "$", "display": False},
                                     ],
                                 )
+                                # Set by select-bridge.js (in the viewer) via the
+                                # selection_sink textbox below. Empty when nothing
+                                # is selected.
+                                selection_badge = gr.Markdown("", elem_id="selection-badge")
                                 with gr.Row():
                                     msg_input = gr.Textbox(
                                         placeholder="Assembling agent context, please wait…",
                                         label="", scale=8, lines=1,
                                         interactive=False,
+                                        elem_id="msg-input",
                                     )
                                     send_btn = gr.Button("➤", variant="primary", scale=0, min_width=48, elem_id="send-btn", interactive=False)
                                     stop_btn = gr.Button("⏹", variant="stop", scale=0, min_width=48, elem_id="stop-btn", visible=False)
@@ -2947,7 +3108,7 @@ def build_ui() -> gr.Blocks:
                                 with gr.Row():
                                     gr.Markdown("**3D view**")
                                     refresh_tiles_btn = gr.Button(
-                                        "🔄 Refresh 3D tiles", size="sm", scale=0, min_width=160,
+                                        "🔄 Recreate 3D tiles", size="sm", scale=0, min_width=160,
                                     )
                                 tiles_status = gr.Markdown("", elem_id="tiles-status")
                                 # Filled with the iframe by _on_load / after an import,
@@ -2960,7 +3121,7 @@ def build_ui() -> gr.Blocks:
                                     # reload (see reload_tiles_state.change below).
                                     from webui.importer import run_tiler
                                     busy = gr.update(value="⏳ Tiling…", interactive=False)
-                                    idle = gr.update(value="🔄 Refresh 3D tiles", interactive=True)
+                                    idle = gr.update(value="🔄 Recreate 3D tiles", interactive=True)
                                     log = ""
                                     yield busy, "*Generating 3D tiles…*", current_reload
                                     for chunk in run_tiler():
@@ -2968,7 +3129,7 @@ def build_ui() -> gr.Blocks:
                                         tail = "\n".join(log.replace("\r", "\n").splitlines()[-12:])
                                         yield busy, f"```\n{tail}\n```", current_reload
                                     if "3D tile generation finished successfully" in log:
-                                        yield idle, "✓ 3D tiles refreshed — reloading the viewer.", current_reload + 1
+                                        yield idle, "✓ 3D tiles recreated — reloading the viewer.", current_reload + 1
                                     else:
                                         tail = "\n".join(log.replace("\r", "\n").splitlines()[-12:])
                                         yield idle, f"⚠ Tiling did not finish.\n\n```\n{tail}\n```", current_reload
@@ -3019,6 +3180,7 @@ def build_ui() -> gr.Blocks:
                                         placeholder="Assembling agent context, please wait…",
                                         label="", scale=8, lines=1,
                                         interactive=False,
+                                        elem_id="msg-input",
                                     )
                                     send_btn = gr.Button("➤", variant="primary", scale=0, min_width=48, elem_id="send-btn", interactive=False)
                                     stop_btn = gr.Button("⏹", variant="stop", scale=0, min_width=48, elem_id="stop-btn", visible=False)
@@ -3065,6 +3227,8 @@ def build_ui() -> gr.Blocks:
                         "| `get_lod_config` | Available LoD levels |\n"
                         "| `get_examples` | Curated SQL examples |\n"
                         "| `resolve_highlight_targets` | GML ids → highlightable features for the 3D view |\n"
+                        "| `get_feature_tree` | Containment tree around one picked feature |\n"
+                        "| `describe_selection` | Summary of a multi-feature viewer selection |\n"
                         "| `get_database_schema` | Table/column definitions |\n"
                         "| `get_query_guidelines` | Indexed columns & best practices |"
                     )
@@ -3132,6 +3296,11 @@ def build_ui() -> gr.Blocks:
         # Per-turn distilled "how the answer was found" story (index-aligned
         # with history_state). See _summarize_story_ollama.
         story_state = gr.State([])
+        # The user's current 3D-viewer selection: {"features": [{"objectid",
+        # "classname"}, ...], "count": int}. Defined unconditionally so
+        # send_inputs has the same arity whether or not ENABLE_VIZ is on;
+        # stays empty (never touched) when there is no viewer.
+        selection_state = gr.State({"features": [], "count": 0})
 
         if ENABLE_VIZ:
             highlight_state.change(
@@ -3146,6 +3315,19 @@ def build_ui() -> gr.Blocks:
                 outputs=[],
                 js="(_) => { window._reloadTiles(); }"
             )
+            # Sink the viewer's postMessage listener (in the js= block above)
+            # writes into; its .change runs on the Python side to parse the
+            # (untrusted, browser-supplied) payload defensively. visible=True
+            # + CSS (not visible=False) — see the #selection-sink rule above:
+            # Gradio does not mount an invisible component's <textarea> at
+            # all, and outside JS needs a real element to write into.
+            selection_sink = gr.Textbox(visible=True, elem_id="selection-sink", label="")
+            selection_sink.change(
+                fn=_on_selection_sink,
+                inputs=[selection_sink],
+                outputs=[selection_state, selection_badge],
+                queue=False,
+            )
 
         send_inputs = [
             msg_input, history_state, provider_radio, model_dropdown,
@@ -3153,7 +3335,7 @@ def build_ui() -> gr.Blocks:
             thinking_dropdown, prompt_mode_radio, num_ctx_dropdown,
             log_history_state, tool_cache_state,
             reasoning_replay_checkbox, story_checkbox,
-            reasoning_state, story_state,
+            reasoning_state, story_state, selection_state,
         ]
         send_outputs = [chatbot, history_state, agent_trace, msg_input, stop_btn, highlight_state, context_bar, log_history_state, log_page_state, log_page_label, log_prev_btn, log_next_btn, tool_cache_state, reasoning_state, story_state]
 
@@ -3422,6 +3604,33 @@ if __name__ == "__main__":
             fastapi_app.mount("/webmap", StaticFiles(directory=_webmap_dir, html=True), name="webmap")
         else:
             print(f"[viz] WARNING: web map client not found at {_webmap_dir} — /webmap will 404", flush=True)
+
+        # ── selection API for the viewer's tree panel (select-bridge.js) ─────
+        # Read-only; same-origin as the iframe, so no CORS setup is needed.
+        # Errors come back as {"error": ...} with a 200 status, so the panel
+        # can show a message instead of a dead fetch.
+        from fastapi import Query
+        from fastapi.responses import JSONResponse
+        from citydb_mcp.tools.highlight import MAX_OBJECTIDS
+        from citydb_mcp.tools.selection import get_feature_tree, describe_selection
+        from webui.llm_utils import _get_resolver_db
+
+        @fastapi_app.get("/api/feature-tree")
+        def _api_feature_tree(objectid: str = ""):
+            try:
+                return get_feature_tree(_get_resolver_db(), objectid)
+            except Exception as exc:
+                print(f"[viz] /api/feature-tree failed: {exc}", flush=True)
+                return JSONResponse({"error": str(exc)})
+
+        @fastapi_app.get("/api/selection-info")
+        def _api_selection_info(objectid: list[str] = Query(default=[])):
+            try:
+                return describe_selection(_get_resolver_db(), objectid[:MAX_OBJECTIDS])
+            except Exception as exc:
+                print(f"[viz] /api/selection-info failed: {exc}", flush=True)
+                return JSONResponse({"error": str(exc)})
+
         demo.queue()
         fastapi_app = gr.mount_gradio_app(fastapi_app, demo, path="/")
 
