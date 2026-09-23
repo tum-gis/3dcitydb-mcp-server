@@ -1,6 +1,7 @@
 """Query execution and user context tools."""
 
 import os
+import re
 import threading
 import time
 import uuid
@@ -10,6 +11,25 @@ from ..models import (
     UserSessionContext, UserModuleSelection,
     HistoryContext, Message, QueryFeedback
 )
+
+# Matches SQL comments so they can be stripped before run_query's own checks.
+# The LLM sometimes prefixes its SQL with an explanatory `-- comment` line, or
+# leaves a trailing one after the last clause; unstripped, a leading comment
+# made the "starts with SELECT/WITH" check below reject a perfectly valid
+# query, and a trailing one would swallow an appended " LIMIT n" into itself
+# (commented out, so the cap silently never applied). Comments carry no
+# meaning to Postgres, so it's safe to just drop them rather than special-case
+# each check around them.
+_SQL_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_SQL_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """Best-effort SQL comment removal (does not special-case string literals —
+    generated SQL practically never has `--` or `/*` inside a quoted string;
+    if it ever does, this only makes the checks below slightly more permissive,
+    never less safe: the read-only DB session is still the real boundary)."""
+    return _SQL_LINE_COMMENT_RE.sub("", _SQL_BLOCK_COMMENT_RE.sub(" ", sql))
 
 # Bounded in-memory session store. Sessions expire after _SESSION_TTL_SECONDS
 # of inactivity; if the store exceeds _SESSION_MAX, the oldest are evicted.
@@ -28,12 +48,17 @@ def run_query(db: DatabaseConnection, sql: str, row_limit: int = 500) -> dict:
     Returns results as JSON with column names, rows, execution time.
     Maps to: QueryFeedback (execution_time_ms, result_count, error_message)
     """
+    # Strip comments before any of our own checks (never before execution's
+    # security-relevant checks, since Postgres itself is unaffected by them —
+    # see the module-level comment on _strip_sql_comments for why).
+    sql = _strip_sql_comments(sql).strip()
+
     # Safety: fast-fail guard for the common case (plain SELECT/WITH).
     # This is NOT the security boundary — DatabaseConnection configures every
     # pooled session with `default_transaction_read_only = on`, so the database
     # itself rejects any data-modifying statement (e.g. a CTE hiding a
     # DELETE/UPDATE) even if it slips past this prefix check.
-    sql_stripped = sql.strip().upper()
+    sql_stripped = sql.upper()
     if not sql_stripped.startswith("SELECT") and not sql_stripped.startswith("WITH"):
         return {
             "success": False,

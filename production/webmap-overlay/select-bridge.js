@@ -202,7 +202,17 @@
     // hidden once the tree panel appeared, which left no visible way to
     // tell selection mode was on, or to turn it off. Everything now lives
     // in this one panel so there is always a single, obvious place to look.
-    var panel = null, toggleBtn = null, treeBody = null, nextBtn = null, finishBtn = null, summaryEl = null;
+    //
+    // Collapsed by default: the full tree/summary/action body takes real
+    // screen space, and most users won't want to select anything the
+    // instant the viewer loads. Collapsed, only the compact header row
+    // shows (title, selecting on/off, a count badge, the expand arrow) at
+    // the same bottom-left spot — selecting stays fully usable while
+    // collapsed, so someone can turn it on, click around in the 3D view,
+    // and only expand later to see what they picked.
+    var panel = null, toggleBtn = null, treeBody = null, nextBtn = null, finishBtn = null,
+        summaryEl = null, countBadge = null, collapseBtn = null, actionsRow = null;
+    var collapsed = true;
 
     function ensurePanel() {
         if (panel) return;
@@ -217,7 +227,7 @@
             "box-shadow:0 1px 6px rgba(0,0,0,.5);";
 
         var header = document.createElement("div");
-        header.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:6px;";
+        header.style.cssText = "display:flex;align-items:center;gap:6px;flex-shrink:0;";
         var title = document.createElement("div");
         title.textContent = "Selection";
         title.style.cssText = "font-weight:600;";
@@ -225,9 +235,21 @@
         toggleBtn.style.cssText =
             "cursor:pointer;font:11px sans-serif;font-weight:600;padding:3px 8px;border-radius:5px;border:none;";
         toggleBtn.onclick = function () { if (tilesetReady) setSelecting(!selecting); };
+        countBadge = document.createElement("span");
+        countBadge.style.cssText = "font-size:11px;opacity:.8;margin-left:auto;";
+        collapseBtn = document.createElement("button");
+        collapseBtn.title = "Show/hide the selection panel";
+        collapseBtn.style.cssText =
+            "cursor:pointer;font:12px sans-serif;padding:2px 7px;border-radius:5px;border:none;" +
+            "background:#64748b;color:#f8fafc;";
+        collapseBtn.onclick = function () {
+            collapsed = !collapsed;
+            renderPanel(lastTree);
+        };
         header.appendChild(title);
         header.appendChild(toggleBtn);
-        header.style.flexShrink = "0";
+        header.appendChild(countBadge);
+        header.appendChild(collapseBtn);
         panel.appendChild(header);
 
         // Its own scroll region, sized to whatever the panel has left — a
@@ -251,8 +273,8 @@
         // that. "Next" is a different, simpler action: done looking at this
         // one, clear the browsed tree so the panel is obviously ready for
         // the next pick. It never touches the selection.
-        var actions = document.createElement("div");
-        actions.style.cssText = "display:flex;gap:6px;flex-shrink:0;";
+        actionsRow = document.createElement("div");
+        actionsRow.style.cssText = "display:flex;gap:6px;flex-shrink:0;";
         nextBtn = document.createElement("button");
         nextBtn.textContent = "Next selection →";
         nextBtn.style.cssText =
@@ -262,13 +284,13 @@
             lastTree = null;
             renderPanel(null); // browsing view only — leaves the selection untouched
         };
-        actions.appendChild(nextBtn);
+        actionsRow.appendChild(nextBtn);
         var clearBtn = document.createElement("button");
         clearBtn.textContent = "Clear selection";
         clearBtn.style.cssText = "cursor:pointer;font:12px sans-serif;padding:2px 8px;flex-shrink:0;";
         clearBtn.onclick = clearSelection; // already posts the (now empty) selection
-        actions.appendChild(clearBtn);
-        panel.appendChild(actions);
+        actionsRow.appendChild(clearBtn);
+        panel.appendChild(actionsRow);
 
         // Explicit "I'm done" step: the selection itself is already synced
         // to the chat (every add/remove posts immediately) — this just
@@ -293,14 +315,20 @@
 
     function renderToggle() {
         if (!toggleBtn) return;
+        // Short label — this sits in the always-visible header row alongside
+        // the title, count badge and collapse arrow, so there isn't room for
+        // a sentence; the full explanation is the title attribute (tooltip)
+        // and, when expanded, the hint text in the tree body.
         if (!tilesetReady) {
-            toggleBtn.textContent = "waiting for tiles…";
+            toggleBtn.textContent = "…";
+            toggleBtn.title = "Waiting for the 3D tileset to load.";
             toggleBtn.style.background = "#475569";
             toggleBtn.style.cursor = "default";
         } else {
             // Bright teal while active — the affordance that tells the user
             // clicking the 3D view does something; easy to miss otherwise.
-            toggleBtn.textContent = selecting ? "ON (click to turn off)" : "OFF (click to enable)";
+            toggleBtn.textContent = selecting ? "ON" : "OFF";
+            toggleBtn.title = selecting ? "Selecting is on — click to turn off." : "Click to turn selecting on.";
             toggleBtn.style.background = selecting ? "#0d9488" : "#64748b";
             toggleBtn.style.cursor = "pointer";
         }
@@ -394,12 +422,12 @@
         }
 
         // "Next selection" only makes sense once there's something browsed
-        // to move on from.
-        nextBtn.style.display = tree && tree.picked ? "" : "none";
+        // to move on from — and, like the rest of the body, only while expanded.
+        nextBtn.style.display = (!collapsed && tree && tree.picked) ? "" : "none";
 
         var ids = Object.keys(selection);
         // Only worth showing once there's actually something to finish with.
-        finishBtn.style.display = ids.length ? "" : "none";
+        finishBtn.style.display = (!collapsed && ids.length) ? "" : "none";
         summaryEl.innerHTML = "";
         var summaryTitle = document.createElement("div");
         summaryTitle.style.cssText = "font-weight:600;margin-bottom:2px;";
@@ -419,6 +447,15 @@
         if (ids.length > _selMax) {
             summaryEl.appendChild(sectionLabel("… and " + (ids.length - _selMax) + " more"));
         }
+
+        // Collapsed: only the header row (title, on/off, count, arrow) shows,
+        // at the same spot — selecting itself keeps working while collapsed.
+        treeBody.style.display = collapsed ? "none" : "";
+        summaryEl.style.display = collapsed ? "none" : "";
+        actionsRow.style.display = collapsed ? "none" : "flex";
+        countBadge.textContent = ids.length ? "(" + ids.length + ")" : "";
+        collapseBtn.textContent = collapsed ? "▸" : "▾";
+        panel.style.maxHeight = collapsed ? "" : "60%";
     }
 
     // Off by default — the user turns it on when they actually want to
