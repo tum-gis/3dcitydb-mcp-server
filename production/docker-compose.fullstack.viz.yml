@@ -20,7 +20,7 @@ services:
     environment:
       - ENABLE_VIZ=true
       - TILES_DIR=/tiles
-      # Used to decide whether to offer the Bavarian DGM1 terrain (EPSG:25832 only).
+      # Used to decide whether to offer the German DGM1 terrain (EPSG:25832 only).
       - SRID=${SRID:-25832}
     volumes:
       - tiles_data:/tiles
