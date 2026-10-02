@@ -20,6 +20,7 @@ The evaluation of the MCP Server for the [accompanying paper](https://isprs-anna
 - **Read-only query execution** — `run_query` enforces SELECT-only; writes are blocked at the application layer *and* the database layer, where every pooled connection runs in a read-only transaction (`default_transaction_read_only = on`) so even a crafted CTE hiding a write is rejected by PostgreSQL
 - **Prompt assembly** — `assemble_prompt` orchestrates all tools into a complete system prompt in one call
 - **Gradio chat UI** — browser-based interface with multi-LLM support (Anthropic, OpenAI, Ollama), thinking-level control, live reasoning trace, mermaid/LaTeX rendering, and PDF export
+- **Integrated 3D viewer (optional)** — embeds the 3DCityDB Web Map Client into the chat UI (fullstack Docker mode, see [Option 3b](#option-3b-add-the-3d-viewer-optional)); features from an answer are highlighted in 3D and the camera flies to them, and selected viewer objects are passed to the chatbot so questions can refer to them ("these buildings", "the selected ones")
 - **CityGML 1.0-3.0/CityJSON/IFC import** — one-click import via the Gradio UI (fullstack Docker mode only); `.ifc` files are converted to CityGML 3.0 first
 
 ---
@@ -361,7 +362,11 @@ Add the viewer to the fullstack stack by layering `docker-compose.fullstack.viz.
 docker compose -f docker-compose.fullstack.yml -f docker-compose.fullstack.viz.yml up -d
 ```
 
-The Chat tab then shows the 3DCityDB Web Map Client next to the chat. After an import, tick *Generate 3D tiles after import*, or press **🔄 Refresh 3D tiles** above the viewer at any time (e.g. after editing the database directly). When an answer lists `objectid`s, those features are highlighted and the camera flies to them; features without geometry of their own, such as a `Room`, are expanded to the surfaces they contain (see `resolve_highlight_targets` below). The viewer is baked into the `citydb-mcp-agent` image, so until the published image is updated rebuild it locally with `docker compose -f docker-compose.fullstack.yml build citydb-agent`.
+The Chat tab then shows the 3DCityDB Web Map Client next to the chat. After an import, tick *Generate 3D tiles after import*, or press **🔄 Refresh 3D tiles** above the viewer at any time (e.g. after editing the database directly). When an answer lists `objectid`s, those features are highlighted and the camera flies to them; features without geometry of their own, such as a `Room`, are expanded to the surfaces they contain (see `resolve_highlight_targets` below).
+
+**Selecting objects for the chatbot.** The viewer also supports selection: turn on the *ON/OFF* toggle in the viewer's selection panel and click features in the 3D scene — a click on a boundary surface, e.g. a wall, opens a small panel offering the picked surface, its containing feature such as the building, and its siblings, so you can add the level you actually mean (*Add to selection*). The selected features are listed in the panel (removable with *−*) and appear live as a *🖱 … features selected* badge in the chat UI. Press **✓ Finish selecting** when done. The chatbot receives the selection as a `[VIEWER SELECTION]` context block, so questions like "What is the total floor area of **these** buildings?" or "Wie alt sind **die ausgewählten** Objekte?" are scoped to exactly the selected `objectid`s — no coordinate or address filtering needed.
+
+The viewer is baked into the `citydb-mcp-agent` image, so until the published image is updated rebuild it locally with `docker compose -f docker-compose.fullstack.yml build citydb-agent`.
 
 ### Building locally (optional)
 
