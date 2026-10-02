@@ -7,7 +7,7 @@ By including the MCP server in agentic coding environments, it becomes easy to c
 
 Furthermore, a **Chat Assistant** is included offering a simple GUI for interactive query asking, reasoning, and answering. It is an agentic AI tool based on [LangChain](https://github.com/langchain-ai) utilising the [ReAct pattern](https://reference.langchain.com/javascript/langchain-react) for carrying out multi-step reasoning and automated error corrections. The Chat Assistant currently can be configured to work with OpenAI and Anthropic commercial LLMs, any OpenAI-compatible endpoint, as well as with locally running [Ollama](https://github.com/ollama/ollama) LLMs. For example, when using the [`qwen3.8:27b`](https://ollama.com/library/qwen3.8:27b) LLM running in Ollama, the Chat Assistant is capable of performing very complex analyses on any kind of stored 3D city model, including multi-step SQL workflows with live reasoning traces, rendered diagrams, and PDF export.
 
-The evaluation of the MCP Server for the paper (link coming soon) was done using 100 queries of 4 different complexity levels. The complete list of the queries can be found [`here`](https://handy-porpoise-645.notion.site/Evaluation-Questions-31b3fb8cb4358084bfcdc6b4023c4c15).
+The evaluation of the MCP Server for the [accompanying paper](https://isprs-annals.copernicus.org/articles/XII-4-W1-2026/211/2026/isprs-annals-XII-4-W1-2026-211-2026.html) was done using 100 queries of 4 different complexity levels. The complete list of the queries can be found [`here`](https://handy-porpoise-645.notion.site/Evaluation-Questions-31b3fb8cb4358084bfcdc6b4023c4c15).
 
 ---
 
@@ -26,15 +26,15 @@ The evaluation of the MCP Server for the paper (link coming soon) was done using
 
 ## Deployment Options
 
-There are three ways to run the 3DCityDB MCP Server:
+There are four ways to run the 3DCityDB MCP Server (Option 3b is a 3D-viewer variant of Option 3):
 
-| | Option 1: PyPI | Option 2: Docker BYOD | Option 3: Docker Fullstack |
-|---|---|---|---|
-| **Best for** | Claude Code / Claude Desktop power users | Existing 3DCityDB instances | Starting from a `.gml`/`.json`/`.ifc` file |
-| **Requires** | Python 3.10+, running 3DCityDB | Docker, running 3DCityDB | Docker only |
-| **Gradio UI** | No (uses your AI client directly) | Yes (`localhost:7860`) | Yes (`localhost:7860`) |
-| **CityGML/CityJSON/IFC import** | Manual | Manual | Via Gradio UI |
-| **Database** | Your own | Your own | Bundled (PostgreSQL + PostGIS + SFCGAL) |
+| | [Option 1: PyPI](#option-1-pypi-package) | [Option 2: Docker BYOD](#option-2-docker-byod-bring-your-own-database) | [Option 3: Docker Fullstack](#option-3-docker-fullstack-bundled-postgresql) | [Option 3b: Fullstack + 3D Viewer](#option-3b-add-the-3d-viewer-optional) |
+|---|---|---|---|---|
+| **Best for** | Claude Code / Claude Desktop power users | Existing 3DCityDB instances | Starting from a `.gml`/`.json`/`.ifc` file | 3D exploration & highlighting of query results |
+| **Requires** | Python 3.10+, running 3DCityDB | Docker, running 3DCityDB | Docker only | Docker only (same as Option 3) |
+| **Gradio UI** | No (uses your AI client directly) | Yes (`localhost:7860`) | Yes (`localhost:7860`) | Yes (`localhost:7860`) with embedded 3D viewer |
+| **CityGML/CityJSON/IFC import** | Manual | Manual | Via Gradio UI | Via Gradio UI |
+| **Database** | Your own | Your own | Bundled (PostgreSQL + PostGIS + SFCGAL) | Bundled (same as Option 3) |
 
 ---
 
@@ -290,7 +290,7 @@ docker compose -f docker-compose.byod.yml down
 
 ## Option 3: Docker — Fullstack (Bundled PostgreSQL)
 
-Run everything — PostgreSQL (with PostGIS and SFCGAL), the 3DCityDB schema, the MCP server, and the Gradio UI — in a single Docker Compose stack. No pre-existing database needed.
+Run everything — PostgreSQL (with PostGIS and SFCGAL), the 3DCityDB schema, the MCP server, and the Gradio UI — in a single Docker Compose stack. No pre-existing database needed. If you also want to see the model in 3D, continue with **[Option 3b — the 3D viewer](#option-3b-add-the-3d-viewer-optional)** after the quick start below.
 
 ### Prerequisites
 
@@ -353,7 +353,9 @@ docker compose -f docker-compose.fullstack.yml -f docker-compose.fullstack.viz.y
 
 These are pulled on demand anyway on first use if you skip this step — it just moves the wait earlier and shows normal `docker pull` progress instead of Gradio's import log.
 
-**Optional 3D view.** Add the viewer to the fullstack stack by layering `docker-compose.fullstack.viz.yml` on top of it:
+### Option 3b: add the 3D viewer (optional)
+
+Add the viewer to the fullstack stack by layering `docker-compose.fullstack.viz.yml` on top of it:
 
 ```bash
 docker compose -f docker-compose.fullstack.yml -f docker-compose.fullstack.viz.yml up -d
@@ -610,14 +612,18 @@ call regardless of provider (Ollama or OpenAI-compatible).
 
 This work was developed at the [Chair of Geoinformatics](https://www.asg.ed.tum.de/gis/startseite/), Technical University of Munich (TUM). Main developer: Khaoula Kanna; additional testing and programming: Thomas H. Kolbe.
 
-The accompanying paper (to be published by end of September 2026) can be cited as:
+The accompanying paper, [Enabling AI Agents for Semantic 3D City Models through Automated Domain Context Generation](https://isprs-annals.copernicus.org/articles/XII-4-W1-2026/211/2026/isprs-annals-XII-4-W1-2026-211-2026.html), was published in the ISPRS Annals of the Photogrammetry, Remote Sensing and Spatial Information Sciences (Volume XII-4/W1-2026, 21st ISPRS 3D GeoInfo Conference) and can be cited as:
 
 ```bibtex
 @inproceedings{kanna2026enabling,
     author    = {Kanna, Khaoula and Kolbe, Thomas H.},
     title     = {Enabling AI Agents for Semantic 3D City Models through Automated Domain Context Generation},
-    booktitle = {ISPRS 21st 3D GeoInfo Conference},
+    booktitle = {ISPRS 21st 3D GeoInfo Conference, ISPRS Ann. Photogramm. Remote Sens. Spatial Inf. Sci.},
+    volume    = {XII-4/W1-2026},
+    pages     = {211--218},
     year      = {2026},
+    doi       = {10.5194/isprs-annals-XII-4-W1-2026-211-2026},
+    url       = {https://isprs-annals.copernicus.org/articles/XII-4-W1-2026/211/2026/isprs-annals-XII-4-W1-2026-211-2026.html},
 }
 ```
 
