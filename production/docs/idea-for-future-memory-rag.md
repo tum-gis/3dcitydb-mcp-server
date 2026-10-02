@@ -289,7 +289,21 @@ source of truth and the index never diverge.
 - Postgres-side init (pgvector install + `mcp_memory` DDL) belongs to the
   fullstack compose setup, not to the app image.
 
-## 10. Future extensions (out of scope for the initial implementation)
+## 10. Estimated effort
+
+| Piece | Effort |
+|-------|--------|
+| `memory.py`: JSONL store + `mcp_memory.turns` upsert (write path, lock, `MEMORY_SAVE_ANSWER`) | ~1 day |
+| Embedding client (Ollama `/api/embed`, base-URL fallback, error handling) | ~half a day |
+| Boot init: pgvector self-healing (compose hook) + idempotent DDL + parallel import task | ~1 day |
+| Retrieval pipeline (top-k, floor + relative rule, session dedup, token cap) | ~half a day |
+| Prompt injection block + system instruction, wired into the existing message assembly | ~half a day |
+| `.env` plumbing (`ENABLE_MEMORY`, `MEMORY_*`) + doctor/status reporting | ~half a day |
+| Optional `ollama-embedder` compose service + documentation | ~half a day |
+| **Base total (feature, off by default)** | **~4 days** |
+| Testing: unit tests for store/import/retrieval + live end-to-end pass on the fullstack stack | +1–2 days |
+
+## 11. Future extensions (out of scope for the initial implementation)
 
 - **Cap / rotation:** the JSONL grows unbounded; a rotation policy (keep
   the most recent N turns, e.g. 5000) keeps imports and retrieval fast.
