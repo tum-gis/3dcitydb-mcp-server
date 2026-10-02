@@ -28,7 +28,7 @@ The evaluation of the MCP Server for the [accompanying paper](https://isprs-anna
 
 There are four ways to run the 3DCityDB MCP Server (Option 3b is a 3D-viewer variant of Option 3):
 
-| | [Option 1: PyPI](#option-1-pypi-package) | [Option 2: Docker BYOD](#option-2-docker-byod-bring-your-own-database) | [Option 3: Docker Fullstack](#option-3-docker-fullstack-bundled-postgresql) | [Option 3b: Fullstack + 3D Viewer](#option-3b-add-the-3d-viewer-optional) |
+| | [Option 1: PyPI](#option-1-pypi-package) | [Option 2: Docker BYOD](#option-2-docker--byod-bring-your-own-database) | [Option 3: Docker Fullstack](#option-3-docker--fullstack-bundled-postgresql) | [Option 3b: Fullstack + 3D Viewer](#option-3b-add-the-3d-viewer-optional) |
 |---|---|---|---|---|
 | **Best for** | Claude Code / Claude Desktop power users | Existing 3DCityDB instances | Starting from a `.gml`/`.json`/`.ifc` file | 3D exploration & highlighting of query results |
 | **Requires** | Python 3.10+, running 3DCityDB | Docker, running 3DCityDB | Docker only | Docker only (same as Option 3) |
