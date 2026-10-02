@@ -633,6 +633,7 @@ documents:
 - [`idea-for-future-websearch.md`](production/docs/idea-for-future-websearch.md) — giving the ChatBot the ability to do web searches and to download & inspect files (e.g. specifications) using a self-hosted SearXNG metasearch engine.
 - [`idea-for-future-Openstreetmap-interface.md`](production/docs/idea-for-future-Openstreetmap-interface.md) — querying OpenStreetMap geodata (Nominatim / Overpass) to enrich 3DCityDB queries with real-world context.
 - [`idea-for-future-write-access.md`](production/docs/idea-for-future-write-access.md) — opt-in write access (DML / DDL) to the database for experimentation, off by default.
+- [`idea-for-future-memory-rag.md`](production/docs/idea-for-future-memory-rag.md) — persistent chat memory (question / answer / distilled story) with RAG retrieval of similar past turns via pgvector, off by default.
 
 ---
 
