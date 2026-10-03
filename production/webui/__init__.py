@@ -1,3 +1,3 @@
 """Gradio web UI for citydb-mcp."""
 
-__version__ = "0.3.4"
+__version__ = "0.4.0"

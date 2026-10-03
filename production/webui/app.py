@@ -50,7 +50,10 @@ from webui.llm_utils import (
 )
 from webui.backends import stream as agent_stream
 from webui.model_profiles import profile_for_model
-from webui.mcp_client import assemble_system_prompt_sync, run_tool_sync
+from webui.mcp_client import (
+    assemble_system_prompt_sync, run_tool_sync, list_tools_sync,
+    get_server_instructions_sync,
+)
 
 _LOCAL_PROVIDERS = ("ollama",)
 
@@ -375,6 +378,47 @@ def get_mcp_version() -> str:
             except Exception:
                 _mcp_version_cache = "unknown"
     return _mcp_version_cache
+
+
+def _mcp_instructions_markdown() -> str:
+    """Render the server's self-introduction text for the top of the MCP Inspector tab.
+
+    The text is read live from the MCP server's ``instructions`` field (the one
+    it sends to an AI agent during the initialize handshake), not copied here,
+    so it always matches exactly what a client's agent reads.
+    """
+    try:
+        instructions = get_server_instructions_sync()
+    except Exception as exc:
+        return f"Could not load the server description from the MCP server: {exc}"
+    if not instructions:
+        return "The MCP server sent no description."
+    return instructions
+
+
+def _mcp_tools_table_markdown() -> str:
+    """Render the live MCP tool list as a markdown table for the MCP Inspector tab.
+
+    The rows are read from the server's own list_tools, not from a static
+    copy, so the user sees exactly the tools and descriptions an AI agent
+    sees — and new/removed tools appear without any code change here.
+    """
+    try:
+        tools = list_tools_sync()
+    except Exception as exc:
+        return f"Could not load the tool list from the MCP server: {exc}"
+    if not tools:
+        return "The MCP server returned no tools."
+    lines = [
+        f"The MCP server exposes {len(tools)} tools to the agent:",
+        "",
+        "| Tool | Description |",
+        "|---|---|",
+    ]
+    for t in tools:
+        desc = " ".join((t["description"] or "(no description)").split()).replace("|", "\\|")
+        lines.append(f"| `{t['name']}` | {desc} |")
+    return "\n".join(lines)
 
 
 def _check_provider_status(provider: str, model: str) -> bool:
@@ -3213,27 +3257,22 @@ def build_ui() -> gr.Blocks:
                     )
 
                 with gr.Tab("MCP Inspector"):
-                    gr.Markdown("### Active MCP tools")
+                    gr.Markdown("### MCP server description")
                     gr.Markdown(
-                        "The MCP server exposes these tools to the agent:\n\n"
-                        "| Tool | Description |\n"
-                        "|---|---|\n"
-                        "| `assemble_prompt` | Builds the full system prompt |\n"
-                        "| `run_query` | Read-only SELECT (500 row cap) |\n"
-                        "| `scan_objectclasses` | Object class hierarchy |\n"
-                        "| `resolve_properties` | Properties per object class |\n"
-                        "| `get_generic_attributes` | User-defined attributes |\n"
-                        "| `get_db_context_snapshot` | SRS, bbox, feature counts |\n"
-                        "| `get_lod_config` | Available LoD levels |\n"
-                        "| `get_examples` | Curated SQL examples |\n"
-                        "| `resolve_highlight_targets` | GML ids → highlightable features for the 3D view |\n"
-                        "| `get_feature_tree` | Containment tree around one picked feature |\n"
-                        "| `describe_selection` | Summary of a multi-feature viewer selection |\n"
-                        "| `get_database_schema` | Table/column definitions |\n"
-                        "| `get_query_guidelines` | Indexed columns & best practices |"
+                        "The text the server sends to an AI agent when it is "
+                        "attached — shown here verbatim, read live from the server:"
                     )
-                    with gr.Accordion("Refresh system prompt", open=False):
-                        refresh_prompt_btn = gr.Button("Re-assemble system prompt")
+                    mcp_instructions_md = gr.Markdown(_mcp_instructions_markdown())
+                    gr.Markdown("### Active MCP tools")
+                    # Filled via _mcp_tools_table_markdown on page load (see the
+                    # demo.load() below) — Gradio's gr.Markdown has no .load() in
+                    # this version.
+                    mcp_tools_md = gr.Markdown(_mcp_tools_table_markdown())
+                    with gr.Accordion("Refresh system prompt", open=True):
+                        refresh_prompt_btn = gr.Button(
+                            "Re-assemble system prompt "
+                            "(can take a while depending on DB size)"
+                        )
                         prompt_status = gr.Textbox(
                             label="Status", interactive=False, lines=1
                         )
@@ -3518,6 +3557,8 @@ def build_ui() -> gr.Blocks:
                 gr.update(),
                 gr.update(),
                 gr.update(),  # go_import_btn
+                gr.update(),  # mcp_instructions_md (already filled at build time)
+                gr.update(),  # mcp_tools_md (already filled at build time)
             ) + ((gr.update(),) if viewer_html is not None else ())  # viewer_html
 
             # Re-discover models now that a browser has connected. Model discovery
@@ -3556,13 +3597,16 @@ def build_ui() -> gr.Blocks:
                 dropdown_upd,
                 refresh_upd,
                 gate["go_import"],
+                _mcp_instructions_markdown(),
+                _mcp_tools_table_markdown(),
             ) + ((gate["viewer"],) if viewer_html is not None else ())
 
         demo.load(
             fn=_on_load,
             inputs=[provider_radio, model_dropdown, prompt_mode_radio, num_ctx_dropdown],
             outputs=[status_bar, context_bar, db_warning, msg_input, send_btn,
-                     model_dropdown, refresh_ollama_btn, go_import_btn]
+                     model_dropdown, refresh_ollama_btn, go_import_btn,
+                     mcp_instructions_md, mcp_tools_md]
                     + ([viewer_html] if viewer_html is not None else []),
         )
 

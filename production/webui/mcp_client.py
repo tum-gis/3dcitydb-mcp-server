@@ -82,6 +82,28 @@ async def run_tool(tool_name: str, arguments: dict) -> str:
     return raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
 
 
+async def list_tools() -> list[dict]:
+    """Returns the tools the MCP server exposes, as [{"name", "description"}, ...].
+
+    Reads the live server tool definitions (list_tools), not a static copy, so
+    clients always see exactly what an AI agent sees."""
+    async with mcp_session() as session:
+        result = await session.list_tools()
+    return [
+        {"name": t.name, "description": (t.description or "").strip()}
+        for t in result.tools
+    ]
+
+
+async def get_server_instructions() -> str:
+    """Returns the server's self-introduction text — the ``instructions`` field
+    sent during the initialize handshake. This is exactly the text an AI agent
+    reads when the server is attached, so the user sees what the agent sees."""
+    async with mcp_session() as session:
+        init = await session.initialize()
+    return (getattr(init, "instructions", None) or "").strip()
+
+
 def _run_sync(coro):
     """Submit a coroutine to the persistent background loop and block."""
     loop = _get_loop()
@@ -103,3 +125,11 @@ def assemble_system_prompt_sync(
 
 def run_tool_sync(tool_name: str, arguments: dict) -> str:
     return _run_sync(run_tool(tool_name, arguments))
+
+
+def list_tools_sync() -> list[dict]:
+    return _run_sync(list_tools())
+
+
+def get_server_instructions_sync() -> str:
+    return _run_sync(get_server_instructions())
