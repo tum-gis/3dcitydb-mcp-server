@@ -331,13 +331,21 @@ def _refresh_system_prompt() -> None:
 
 
 _MAX_PROGRESS_LINES = 30
+_REASSEMBLE_BTN_LABEL = (
+    "Re-assemble system prompt (can take a while depending on DB size)"
+)
 
 
 def _refresh_system_prompt_stream() -> Generator[tuple, None, None]:
     """Re-assemble the full system prompt, streaming per-step progress.
 
-    Yields a 3-tuple (status_text, msg_input, send_btn) on each update so the
-    chat input stays locked while the rebuild runs and is unlocked at the end.
+    Yields a 4-tuple (button, status_text, msg_input, send_btn) on each
+    update. Only the button and the status box actually change: the button
+    and the chat controls were locked once up front (see the button wiring
+    in build_ui) and are re-enabled on the final yield. The chat widgets at
+    the top of the page are therefore never re-rendered during the stream —
+    re-rendering them on every yield made the browser jump back to the top
+    of the page with each new progress line.
 
     The assembly runs in the MCP server subprocess (a blocking call), so
     progress crosses the process boundary via a side file: the server appends
@@ -392,7 +400,8 @@ def _refresh_system_prompt_stream() -> Generator[tuple, None, None]:
     t.start()
 
     def _snap() -> tuple:
-        return "\n".join(lines), gr.update(interactive=False), gr.update(interactive=False)
+        # gr.update() no-ops for the locked controls — nothing to re-render.
+        return gr.update(), "\n".join(lines), gr.update(), gr.update()
 
     yield _snap()
 
@@ -438,7 +447,12 @@ def _refresh_system_prompt_stream() -> Generator[tuple, None, None]:
             f"✅ Rebuild complete — {n_done} step(s), {elapsed:.1f}s{size_note}"
         )
     lines_final = "\n".join(lines)
-    yield (lines_final, gr.update(interactive=True), gr.update(interactive=True))
+    yield (
+        gr.update(interactive=True, value=_REASSEMBLE_BTN_LABEL),
+        lines_final,
+        gr.update(interactive=True),
+        gr.update(interactive=True),
+    )
 
 
 def _parse_progress_records(chunk: str, state: dict, lines: deque) -> None:
@@ -2308,6 +2322,29 @@ async (_win, _event_data) => {
     document.head.appendChild(st);
   }
 
+  // ── Keep the scroll position when focus falls back to <body> ─────────
+  // When a focused control is disabled or removed from the DOM (the
+  // "Re-assemble system prompt" button is disabled the moment it is
+  // clicked), the browser moves focus to <body> and auto-scrolls so the
+  // focused element is visible — i.e. it scrolls the page back to the
+  // very top. With the assembly progress status box far down the page
+  // that makes the log disappear with every update. Track the last real
+  // scroll position and restore it whenever focus lands on body/html.
+  var lastScrollY = 0;
+  window.addEventListener("scroll", function () {
+    lastScrollY = window.scrollY;
+  }, { passive: true });
+  document.addEventListener("focusin", function (e) {
+    var t = e.target;
+    if (t === document.body || t === document.documentElement) {
+      if (lastScrollY > 0) {
+        requestAnimationFrame(function () {
+          window.scrollTo(0, lastScrollY);
+        });
+      }
+    }
+  });
+
   // ── No math rendering in the "Agent activity" trace panel ────────────
   // Gradio's markdown renderer applies KaTeX page-wide, which would mangle
   // TeX snippets inside SQL / agent output. Keep formulas there as raw
@@ -3417,19 +3454,25 @@ def build_ui() -> gr.Blocks:
                     # this version.
                     mcp_tools_md = gr.Markdown(_mcp_tools_table_markdown())
                     with gr.Accordion("Refresh system prompt", open=True):
-                        refresh_prompt_btn = gr.Button(
-                            "Re-assemble system prompt "
-                            "(can take a while depending on DB size)"
-                        )
+                        refresh_prompt_btn = gr.Button(_REASSEMBLE_BTN_LABEL)
                         prompt_status = gr.Textbox(
                             label="Status", interactive=False, lines=4
                         )
+                        # Lock button + chat input immediately (a double-click
+                        # must not start a second assembly); the generator
+                        # re-enables everything on its final yield. The button
+                        # itself is locked here (not in the generator) so its
+                        # label can switch to "Re-assembling…" while running.
                         refresh_prompt_btn.click(
-                            fn=lambda: (gr.update(interactive=False), gr.update(interactive=False)),
-                            outputs=[msg_input, send_btn],
+                            fn=lambda: (
+                                gr.update(interactive=False, value="Re-assembling system prompt…"),
+                                gr.update(interactive=False),
+                                gr.update(interactive=False),
+                            ),
+                            outputs=[refresh_prompt_btn, msg_input, send_btn],
                         ).then(
                             fn=_refresh_system_prompt_stream,
-                            outputs=[prompt_status, msg_input, send_btn],
+                            outputs=[refresh_prompt_btn, prompt_status, msg_input, send_btn],
                         )
 
                 with gr.Tab("System Prompt"):
