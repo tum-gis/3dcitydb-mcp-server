@@ -342,11 +342,13 @@ def _refresh_system_prompt_stream() -> Generator[tuple, None, None]:
     The assembly runs in the MCP server subprocess (a blocking call), so
     progress crosses the process boundary via a side file: the server appends
     one JSON record per step (start, then done) to the file passed through
-    ``progress_path``, and this generator tails it, yielding one line per
-    finished step, e.g.
+    ``progress_path``, and this generator tails it. A step's line appears the
+    moment it STARTS (so you always see what is currently running) and is
+    completed in place when it finishes, e.g.
 
         Step 1/12: Retrieving database schema (table & column definitions) — finished in 1.2s
         Step 2/12: Retrieving SQL query guidelines — finished in 0.3s
+        Step 3/12: Scanning object classes (CityGML hierarchy) —
         ...
         ✅ Rebuild complete — 12 step(s), 48.7s — prompt: 58,312 chars
 
@@ -403,11 +405,24 @@ def _refresh_system_prompt_stream() -> Generator[tuple, None, None]:
                         f.seek(state["offset"])
                         chunk = f.read()
                         state["offset"] = f.tell()
-                    for record in _parse_progress_records(chunk, state):
-                        lines.append(record)
+                    _parse_progress_records(chunk, state, lines)
             except OSError:
                 pass
         yield _snap()
+
+    # Final drain: the last "done" record may land in the same instant as the
+    # stop signal — make sure every step line is closed before the summary.
+    p = state["path"]
+    if p is not None:
+        try:
+            if os.path.exists(p) and os.path.getsize(p) > state["offset"]:
+                with open(p, "r", encoding="utf-8") as f:
+                    f.seek(state["offset"])
+                    chunk = f.read()
+                    state["offset"] = f.tell()
+                _parse_progress_records(chunk, state, lines)
+        except OSError:
+            pass
 
     if state["error"]:
         lines.append(f"⚠ Error: {state['error']}")
@@ -426,13 +441,14 @@ def _refresh_system_prompt_stream() -> Generator[tuple, None, None]:
     yield (lines_final, gr.update(interactive=True), gr.update(interactive=True))
 
 
-def _parse_progress_records(chunk: str, state: dict) -> list[str]:
-    """Parse JSONL progress records from a freshly read file chunk into lines.
+def _parse_progress_records(chunk: str, state: dict, lines: deque) -> None:
+    """Apply JSONL progress records from a freshly read file chunk to `lines`.
 
-    A "start" record opens a step (remembering its timestamp); the matching
-    "done" record closes it, producing one line:  Step n/total: Label — finished in Xs
+    A "start" record immediately appends the step's line (still open, ending
+    in " — ") so the status box shows what is running *right now*; the
+    matching "done" record completes that line in place with the duration and
+    a newline:  Step n/total: Label — finished in Xs
     """
-    out: list[str] = []
     for raw in chunk.splitlines():
         raw = raw.strip()
         if not raw:
@@ -445,11 +461,17 @@ def _parse_progress_records(chunk: str, state: dict) -> list[str]:
         label = rec.get("label", "").strip()
         if rec.get("state") == "start":
             state["started"][n] = time.monotonic()
+            lines.append(f"Step {n}/{total}: {label} —")
         elif rec.get("state") == "done":
             t0 = state["started"].pop(n, None)
             dt = f" in {time.monotonic() - t0:.1f}s" if t0 else ""
-            out.append(f"Step {n}/{total}: {label} — finished{dt}")
-    return out
+            suffix = f" finished{dt}"
+            for i in range(len(lines) - 1, -1, -1):
+                if lines[i].endswith(" —"):
+                    lines[i] += suffix
+                    break
+            else:  # open line already evicted by the deque cap — append fresh
+                lines.append(f"Step {n}/{total}: {label} — finished{dt}")
 
 
 # ── Status checks ──────────────────────────────────────────────────────────────
