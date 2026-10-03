@@ -1,7 +1,10 @@
 """Prompt assembly - orchestrates all tools into a system prompt."""
 
 import json
+import os
 import threading
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from ..db import DatabaseConnection
 from ..models import (
@@ -120,6 +123,63 @@ def invalidate_prompt_cache() -> None:
         _prompt_cache.clear()
 
 
+# ── Optional assembly progress logging ───────────────────────────────────────
+# When the env var below points at a writable path, each assembly step appends
+# a JSON record to that file (one per step: "start", then "done", with the step
+# number, total and a human-readable label). The WebUI tails that file to show
+# live progress next to its "Re-assemble system prompt" button.
+#
+# This is a SIDE channel: the file is neither stdout (the MCP protocol) nor the
+# prompt return value, so an agent calling the `assemble_prompt` tool never
+# sees any of it. When the variable is unset (every standalone MCP client),
+# assembly logs nothing and adds no overhead.
+PROGRESS_FILE_ENV = "CITYDB_ASSEMBLY_PROGRESS_FILE"
+
+
+@dataclass
+class _AssemblyProgress:
+    path: str
+    total: int
+    index: int  # 1-based step counter
+    labels: list  # per-step labels, length == total
+
+    @contextmanager
+    def step(self, label: str):
+        """Context manager — run a step inside the `with` block.
+
+        Emits a "start" record on entry and a "done" record on exit (even if
+        the step raises), so the WebUI sees both the beginning and end."""
+        self._emit("start", label)
+        try:
+            yield
+        finally:
+            self.index += 1
+            self._emit("done", label)
+
+    def _emit(self, state: str, label: str) -> None:
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "step": self.index, "total": self.total, "label": label,
+                    "state": state,
+                }) + "\n")
+        except OSError:
+            pass  # progress is best-effort; never break the assembly
+
+
+def _get_progress() -> _AssemblyProgress | None:
+    """Returns the progress context for this assembly, or None when disabled."""
+    path = os.environ.get(PROGRESS_FILE_ENV)
+    if not path:
+        return None
+    return _current_progress
+
+
+# Module-level handle for the in-flight assembly's progress (single assembly
+# runs at a time in practice; guarded by the prompt cache lock upstream).
+_current_progress: _AssemblyProgress | None = None
+
+
 def assemble_prompt(
     db: DatabaseConnection,
     include_query_agent_extras: bool = True,
@@ -164,35 +224,64 @@ def _assemble_prompt_uncached(
                  Skips full property trees and verbose schema (~200 lines vs 600-1000).
     """
     # ── Gather components ────────────────────────────────────────────────────
-    schema = get_database_schema(db) if not compact else None
-    guidelines = get_query_guidelines(db) if include_query_agent_extras else None
+    # Each DB-backed step is wrapped so the WebUI can show live status. The
+    # ordered step-label list (and therefore the numbering) is built per mode —
+    # see _assembly_steps() — and consumed in execution order below, so the
+    # number shown ("Step 4/9", "Step 4/12", …) is always correct for the mode.
+    step_labels = [label for _, label in _assembly_steps(compact, include_query_agent_extras)]
+    step_iter = iter(step_labels)
+    global _current_progress
+    if os.environ.get(PROGRESS_FILE_ENV):
+        _current_progress = _AssemblyProgress(
+            path=os.environ[PROGRESS_FILE_ENV],
+            total=len(step_labels),
+            index=1,
+            labels=step_labels,
+        )
 
-    catalog = scan_objectclasses(db)
-    db_context = get_db_context_snapshot(db)
-    spatial_caps = get_spatial_capabilities(db)
-    lod_config = get_lod_config(db)
-    geom_types = get_geometry_types_per_class(db)
-    datatypes = get_datatypes_reference(db)
+    def _run(fn, *args, **kwargs):
+        """Run fn, reporting its start/finish as the next assembly step.
+
+        Each call consumes the next label from the per-mode step list, which was
+        built in the same execution order as these calls."""
+        progress = _get_progress()
+        if progress is not None:
+            label = next(step_iter)
+            with progress.step(label):
+                return fn(*args, **kwargs)
+        return fn(*args, **kwargs)
+
+    schema = _run(get_database_schema, db) if not compact else None
+    guidelines = _run(get_query_guidelines, db) if include_query_agent_extras else None
+
+    catalog = _run(scan_objectclasses, db)
+    db_context = _run(get_db_context_snapshot, db)
+    spatial_caps = _run(get_spatial_capabilities, db)
+    lod_config = _run(get_lod_config, db)
+    geom_types = _run(get_geometry_types_per_class, db) if not compact else None
+    datatypes = _run(get_datatypes_reference, db)
 
     toplevel_ids = {oc.id for oc in catalog.object_classes if oc.is_toplevel}
     epsg_code = db_context.epsg_code
-    generic_attrs = get_generic_attributes(db, epsg_code=epsg_code)
+    generic_attrs = _run(get_generic_attributes, db, epsg_code=epsg_code)
 
-    # Resolve full property trees only in full mode
+    # Resolve full property trees only in full mode (the most expensive step)
     if not compact:
-        for oc in catalog.object_classes:
-            if oc.is_toplevel:
-                oc.resolved_properties = resolve_properties(db, oc.id, epsg_code=epsg_code)
+        def _resolve_all():
+            for oc in catalog.object_classes:
+                if oc.is_toplevel:
+                    oc.resolved_properties = resolve_properties(db, oc.id, epsg_code=epsg_code)
+        _run(_resolve_all)
 
     # Vocabulary: street names + generic attr values (TTL-cached)
-    vocab = get_vocabulary(db)
+    vocab = _run(get_vocabulary, db)
 
     # Static codelists for quick-ref and example synthesizer
     static_cl = get_static_codelists(epsg_code)
 
     available_ids = [oc.id for oc in catalog.object_classes]
     available_classnames = {oc.classname for oc in catalog.object_classes}
-    examples = get_examples(available_ids, classnames=available_classnames) if include_query_agent_extras else None
+    examples = _run(get_examples, available_ids, classnames=available_classnames) if include_query_agent_extras else None
 
     # Concrete synthesized examples using real DB values
     synth_examples = synthesize_examples(db, catalog, static_cl, vocab)
@@ -260,7 +349,39 @@ def _assemble_prompt_uncached(
     if not compact and examples:
         sections.append(_render_examples(examples))
 
+    _current_progress = None  # done — release the in-flight progress handle
     return "\n\n".join(sections)
+
+
+def _assembly_steps(compact: bool, include_query_agent_extras: bool) -> list:
+    """The ordered (step_index, label) pairs actually executed for this mode.
+
+    Only DB-backed work is counted as a step — cheap in-memory rendering and the
+    synthesized-example pass are not. The list is built per mode so the numbering
+    shown to the user ("Step 4/9", "Step 4/12", …) is always correct.
+    """
+    steps = []
+    def add(label: str):
+        steps.append((len(steps) + 1, label))
+
+    if not compact:
+        add("Retrieving database schema (table & column definitions)")
+    if include_query_agent_extras:
+        add("Retrieving SQL query guidelines")
+    add("Scanning object classes (CityGML hierarchy)")
+    add("Reading database context (SRS, bounding box, feature counts)")
+    add("Checking spatial function support (PostGIS / SFCGAL)")
+    add("Reading Levels of Detail (LoD) configuration")
+    if not compact:
+        add("Scanning geometry types per object class")
+    add("Resolving datatype reference")
+    add("Resolving generic attributes")
+    if not compact:
+        add("Resolving property trees for all top-level classes")
+    add("Building vocabulary (street names & attribute values)")
+    if include_query_agent_extras:
+        add("Gathering curated SQL examples")
+    return steps
 
 
 # ============================================================

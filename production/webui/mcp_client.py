@@ -40,11 +40,18 @@ def _get_loop() -> asyncio.AbstractEventLoop:
 
 
 @asynccontextmanager
-async def mcp_session():
+async def mcp_session(progress_path: str | None = None):
+    env = os.environ.copy()
+    # When a progress file is supplied, hand its path to the server subprocess
+    # via env var so the assembly can append live step records there. This is a
+    # side channel — it never touches the MCP stdout protocol or the prompt
+    # return value, so an agent's `assemble_prompt` result stays pristine.
+    if progress_path:
+        env["CITYDB_ASSEMBLY_PROGRESS_FILE"] = progress_path
     params = StdioServerParameters(
         command="3dcitydb-mcp",
         args=[],
-        env=os.environ.copy(),
+        env=env,
     )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
@@ -63,8 +70,9 @@ async def assemble_system_prompt(
     include_query_agent_extras: bool = True,
     compact: bool = False,
     force_refresh: bool = False,
+    progress_path: str | None = None,
 ) -> str:
-    async with mcp_session() as session:
+    async with mcp_session(progress_path=progress_path) as session:
         raw = await call_tool(
             session, "assemble_prompt",
             {
@@ -115,10 +123,12 @@ def assemble_system_prompt_sync(
     include_query_agent_extras: bool = True,
     compact: bool = False,
     force_refresh: bool = False,
+    progress_path: str | None = None,
 ) -> str:
     return _run_sync(
         assemble_system_prompt(
-            include_query_agent_extras, compact=compact, force_refresh=force_refresh
+            include_query_agent_extras, compact=compact, force_refresh=force_refresh,
+            progress_path=progress_path,
         )
     )
 

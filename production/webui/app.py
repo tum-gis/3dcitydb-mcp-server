@@ -54,6 +54,8 @@ from webui.mcp_client import (
     assemble_system_prompt_sync, run_tool_sync, list_tools_sync,
     get_server_instructions_sync,
 )
+import tempfile
+from collections import deque
 
 _LOCAL_PROVIDERS = ("ollama",)
 
@@ -299,7 +301,8 @@ _system_prompt_cache: dict = {}
 _sp_lock = threading.Lock()
 
 
-def _get_system_prompt(compact: bool = False, force_refresh: bool = False) -> str:
+def _get_system_prompt(compact: bool = False, force_refresh: bool = False,
+                       progress_path: str | None = None) -> str:
     cache_key = "compact" if compact else "full"
     with _sp_lock:
         if cache_key not in _system_prompt_cache:
@@ -308,6 +311,7 @@ def _get_system_prompt(compact: bool = False, force_refresh: bool = False) -> st
                     include_query_agent_extras=True,
                     compact=compact,
                     force_refresh=force_refresh,
+                    progress_path=progress_path,
                 )
                 size = len(_system_prompt_cache[cache_key])
                 print(f"[prompt] compact={compact}, size={size} chars", flush=True)
@@ -324,6 +328,128 @@ def _refresh_system_prompt() -> None:
     # The DB just changed (e.g. after an import) — force the server to bypass
     # its own cache and rebuild from scratch.
     _get_system_prompt(compact=False, force_refresh=True)
+
+
+_MAX_PROGRESS_LINES = 30
+
+
+def _refresh_system_prompt_stream() -> Generator[tuple, None, None]:
+    """Re-assemble the full system prompt, streaming per-step progress.
+
+    Yields a 3-tuple (status_text, msg_input, send_btn) on each update so the
+    chat input stays locked while the rebuild runs and is unlocked at the end.
+
+    The assembly runs in the MCP server subprocess (a blocking call), so
+    progress crosses the process boundary via a side file: the server appends
+    one JSON record per step (start, then done) to the file passed through
+    ``progress_path``, and this generator tails it, yielding one line per
+    finished step, e.g.
+
+        Step 1/12: Retrieving database schema (table & column definitions) — finished in 1.2s
+        Step 2/12: Retrieving SQL query guidelines — finished in 0.3s
+        ...
+        ✅ Rebuild complete — 12 step(s), 48.7s — prompt: 58,312 chars
+
+    The side file is never part of the MCP stdout protocol or the prompt return
+    value, so an agent calling the ``assemble_prompt`` tool sees nothing of it.
+    """
+    with _sp_lock:
+        _system_prompt_cache.clear()
+
+    started = time.time()
+    lines: deque[str] = deque(maxlen=_MAX_PROGRESS_LINES)
+    state: dict = {
+        "offset": 0, "error": None, "path": None,
+        "started": {},  # step number -> monotonic start time
+    }
+    stop_evt = threading.Event()
+
+    def _worker():
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="citydb-assembly-progress-", suffix=".jsonl",
+                delete=False,
+            ) as pf:
+                p = pf.name
+            state["path"] = p  # publish before the assembly can write to it
+            try:
+                _get_system_prompt(
+                    compact=False, force_refresh=True, progress_path=p,
+                )
+            finally:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+        except Exception as exc:
+            state["error"] = str(exc)
+        finally:
+            stop_evt.set()
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+    def _snap() -> tuple:
+        return "\n".join(lines), gr.update(interactive=False), gr.update(interactive=False)
+
+    yield _snap()
+
+    while not stop_evt.wait(0.4):
+        p = state["path"]
+        if p is not None:
+            try:
+                if os.path.exists(p) and os.path.getsize(p) > state["offset"]:
+                    with open(p, "r", encoding="utf-8") as f:
+                        f.seek(state["offset"])
+                        chunk = f.read()
+                        state["offset"] = f.tell()
+                    for record in _parse_progress_records(chunk, state):
+                        lines.append(record)
+            except OSError:
+                pass
+        yield _snap()
+
+    if state["error"]:
+        lines.append(f"⚠ Error: {state['error']}")
+    else:
+        elapsed = time.time() - started
+        try:
+            size = len(_system_prompt_cache.get("full", ""))
+            size_note = f" — prompt: {size:,} chars" if size else ""
+        except Exception:
+            size_note = ""
+        n_done = sum(1 for l in lines if "— finished" in l)
+        lines.append(
+            f"✅ Rebuild complete — {n_done} step(s), {elapsed:.1f}s{size_note}"
+        )
+    lines_final = "\n".join(lines)
+    yield (lines_final, gr.update(interactive=True), gr.update(interactive=True))
+
+
+def _parse_progress_records(chunk: str, state: dict) -> list[str]:
+    """Parse JSONL progress records from a freshly read file chunk into lines.
+
+    A "start" record opens a step (remembering its timestamp); the matching
+    "done" record closes it, producing one line:  Step n/total: Label — finished in Xs
+    """
+    out: list[str] = []
+    for raw in chunk.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        n, total = rec.get("step"), rec.get("total")
+        label = rec.get("label", "").strip()
+        if rec.get("state") == "start":
+            state["started"][n] = time.monotonic()
+        elif rec.get("state") == "done":
+            t0 = state["started"].pop(n, None)
+            dt = f" in {time.monotonic() - t0:.1f}s" if t0 else ""
+            out.append(f"Step {n}/{total}: {label} — finished{dt}")
+    return out
 
 
 # ── Status checks ──────────────────────────────────────────────────────────────
@@ -3274,18 +3400,13 @@ def build_ui() -> gr.Blocks:
                             "(can take a while depending on DB size)"
                         )
                         prompt_status = gr.Textbox(
-                            label="Status", interactive=False, lines=1
+                            label="Status", interactive=False, lines=4
                         )
                         refresh_prompt_btn.click(
                             fn=lambda: (gr.update(interactive=False), gr.update(interactive=False)),
                             outputs=[msg_input, send_btn],
                         ).then(
-                            fn=lambda: (
-                                _refresh_system_prompt(),
-                                "Done — system prompt refreshed.",
-                                gr.update(interactive=True),
-                                gr.update(interactive=True),
-                            )[-3:],
+                            fn=_refresh_system_prompt_stream,
                             outputs=[prompt_status, msg_input, send_btn],
                         )
 
