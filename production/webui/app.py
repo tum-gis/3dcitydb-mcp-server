@@ -335,6 +335,48 @@ _REASSEMBLE_BTN_LABEL = (
     "Re-assemble system prompt (can take a while depending on DB size)"
 )
 
+# Set after a successful import (fullstack mode): the DB changed, so the
+# cached system prompt no longer reflects it. We deliberately do NOT rebuild
+# right away — the user may still import more files. Instead, switching to
+# the Chat or System Prompt tab offers the rebuild via a popup (see build_ui).
+_prompt_stale = False
+
+
+# Stale-prompt popup helpers (module level so they may touch the global flag
+# — nested functions inside build_ui cannot, since it would shadow the
+# module global with a local name).
+#
+# The popup is a top-level gr.Column (NOT a tab, NOT a gr.HTML iframe —
+# gr.HTML renders into an iframe and strips <script> tags, so a fixed
+# overlay there would be clipped and its buttons unreachable). The column
+# is styled as a full-page fixed overlay via the head= CSS on gr.Blocks
+# (elem_id #stale-prompt-modal); the buttons are real Gradio buttons, so
+# their .click handlers fire natively. "Not now" just hides the modal;
+# "Yes" triggers the very same re-assembly stream as the button on the
+# System Prompt tab (its small js hook only switches to that tab so the
+# live progress is visible).
+_STALE_PROMPT_MODAL_HTML = """<p style="font-size:1.05rem;font-weight:600;margin:0 0 10px">🔄 System prompt is out of date</p>
+<p style="font-size:.9rem;line-height:1.45;margin:0 0 18px">The database was just changed by an import, so the cached system prompt no longer matches it — the agent would answer from a stale knowledge base. Re-assemble the prompt now? (This can take a while depending on the database size; the run is shown in the System Prompt tab.)</p>"""
+
+
+def _offer_stale_popup_clear():
+    """Tab-select handler (Chat *and* System Prompt): show the popup once
+    and consume the stale flag.
+
+    Consume (not keep) the flag so the offer appears exactly once per
+    import run — the first tab switch after an import. "Not now" hides the
+    modal (its button's .click handler sets visible=False); the flag is
+    already False, so no further tab switch re-triggers the popup. If the
+    user picks "Yes", its own .click handler starts the re-assembly
+    stream (same generator as the Re-assemble button) and switches to the
+    System Prompt tab via a small js hook.
+    """
+    global _prompt_stale
+    if not _prompt_stale:
+        return gr.update(visible=False)
+    _prompt_stale = False
+    return gr.update(visible=True)
+
 
 def _refresh_system_prompt_stream() -> Generator[tuple, None, None]:
     """Re-assemble the full system prompt, streaming per-step progress.
@@ -363,8 +405,10 @@ def _refresh_system_prompt_stream() -> Generator[tuple, None, None]:
     The side file is never part of the MCP stdout protocol or the prompt return
     value, so an agent calling the ``assemble_prompt`` tool sees nothing of it.
     """
+    global _prompt_stale
     with _sp_lock:
         _system_prompt_cache.clear()
+    _prompt_stale = False
 
     started = time.time()
     lines: deque[str] = deque(maxlen=_MAX_PROGRESS_LINES)
@@ -1725,10 +1769,9 @@ def build_import_tab(
             labels = {
                 "ifc": "Convert IFC → CityGML 3.0",
                 "import": "Import into 3DCityDB",
-                "prompt": "Assemble the agent prompt",
                 "tiles": "Generate 3D tiles",
             }
-            keys = (["ifc"] if do_ifc else []) + ["import", "prompt"] + (["tiles"] if do_tiles else [])
+            keys = (["ifc"] if do_ifc else []) + ["import"] + (["tiles"] if do_tiles else [])
             state = {k: "pending" for k in keys}
             t0 = time.time()
 
@@ -1794,19 +1837,19 @@ def build_import_tab(
                 return
             state["import"] = "done"
 
-            # ── Agent prompt ───────────────────────────────────────────────────────
-            state["prompt"] = "running"
-            log += "\nRefreshing the agent knowledge base (this can take a while)...\n"
+            # ── Agent prompt (deferred) ──────────────────────────────────────────
+            # Do NOT rebuild the prompt here: the user may still import more
+            # files. The prompt cache is invalidated and a popup offers the
+            # rebuild the moment the user switches to the Chat or System
+            # Prompt tab (see the Tab.select handlers in build_ui).
+            global _prompt_stale
+            _prompt_stale = True
+            log += ("\n✓ Database updated. The agent's system prompt is now out of date — "
+                    "you will be asked to re-assemble it when you switch to the "
+                    "Chat or System Prompt tab (you can also do this manually in "
+                    "System Prompt → Re-assemble). Import more files now if you "
+                    "like; only the last rebuild is needed.\n")
             yield _pack(log, no_change, False)
-            try:
-                _refresh_system_prompt()
-                state["prompt"] = "done"
-                log += "✓ Agent knowledge base refreshed.\n"
-            except Exception as exc:
-                state["prompt"] = "error"
-                log += f"\n⚠ Could not refresh agent knowledge base: {exc}\n"
-                yield _pack(log, no_change, True)
-                return
 
             if not do_tiles:
                 yield _pack(log, no_change, True, nav="ok")
@@ -3004,8 +3047,32 @@ def build_ui() -> gr.Blocks:
         # nested selector (see the _PRINT_CSS comment above for the same
         # issue) — `head=` injects into <head> unscoped, so it isn't rewritten.
         fill_width=True,
-        head="<style>.gradio-container, .contain { max-width: 100% !important; } "
-             "#top-row, #chat-row { max-width: 100% !important; }</style>",
+        # Stale-prompt popup: a top-level gr.Column styled as a full-page
+        # fixed overlay (see #stale-prompt-modal in build_ui). head= is used
+        # because css= selectors get scoped under .gradio-container .contain,
+        # which would clip a position:fixed rule. The inner card is the
+        # .sp-card column; its buttons are real Gradio buttons wired in
+        # build_ui ("Not now" hides the modal, "Yes" starts the re-assembly
+        # stream directly and just switches to the System Prompt tab).
+        head=(
+            "<style>.gradio-container, .contain { max-width: 100% !important; } "
+            "#top-row, #chat-row { max-width: 100% !important; } "
+            "#stale-prompt-modal { position: fixed !important; inset: 0 !important; "
+            "z-index: 10000 !important; display: flex !important; align-items: center !important; "
+            "justify-content: center !important; padding: 24px !important; "
+            "background: rgba(15,23,42,.55) !important; margin: 0 !important; } "
+            # The visible card (text + buttons) is one inner gr.Column with
+            # the sp-card class (a direct child of the overlay column, which
+            # is only the dimmed backdrop). Gradio columns carry
+            # flex: 1 1 auto, so without flex:none the card stretches to
+            # the full viewport height; max-width keeps it a compact card.
+            "#stale-prompt-modal .sp-card { background: #fff; color: #0f172a; "
+            "border-radius: 12px; padding: 22px 24px; max-width: 540px; "
+            "width: 100%; flex: none !important; "
+            "box-shadow: 0 12px 40px rgba(0,0,0,.35); } "
+            "#stale-prompt-modal button { max-width: none !important; } "
+            "</style>"
+        ),
         js=_RESIZE_JS,
         css="""
         /* gr.Textbox(visible=False) is not just CSS-hidden by Gradio 5 — the
@@ -3298,7 +3365,43 @@ def build_ui() -> gr.Blocks:
             # ── Main area ─────────────────────────────────────────────────────
             with gr.Column(scale=4):
 
-                with gr.Tab("Chat"):
+                # Stale-prompt popup (top level — must NOT live inside a tab;
+                # components in a non-selected tab are not mounted at all, so
+                # the modal has to be a direct child of this column). It is a
+                # plain gr.Column styled as a full-page fixed overlay by the
+                # #stale-prompt-modal rule in the gr.Blocks head= CSS above —
+                # NOT a gr.HTML: gr.HTML renders into an iframe (a fixed
+                # overlay would be clipped) and strips <script> tags (the
+                # buttons could never reach the page). The buttons are real
+                # Gradio buttons: the .select() handlers on the Chat /
+                # System Prompt tabs open it, "Not now" hides it (wired
+                # just below), and "Yes" starts the re-assembly stream
+                # directly (wired at the System Prompt tab where the
+                # re-assemble button lives).
+                with gr.Column(visible=False, elem_id="stale-prompt-modal",
+                                elem_classes="sp-modal") as stale_prompt_modal:
+                    # The outer column is only the dimmed full-page backdrop;
+                    # the visible card (text + buttons) is this inner column,
+                    # styled as one white box by the #stale-prompt-modal
+                    # .sp-card rule in the gr.Blocks head= CSS.
+                    with gr.Column(elem_classes="sp-card"):
+                        gr.Markdown(_STALE_PROMPT_MODAL_HTML)
+                        with gr.Row(equal_height=False):
+                            sp_yes_btn = gr.Button("Yes, re-assemble now",
+                                                   variant="primary")
+                            sp_no_btn = gr.Button("Not now",
+                                                  variant="secondary")
+
+                # "Not now" just hides the modal (the stale flag was already
+                # consumed when the popup opened, so no further tab switch
+                # re-triggers it). "Yes" needs the re-assemble button, which
+                # lives inside the System Prompt tab defined below — so its
+                # handler is wired there (right next to the button's own
+                # .click wiring).
+                sp_no_btn.click(fn=lambda: gr.update(visible=False),
+                                inputs=[], outputs=[stale_prompt_modal])
+
+                with gr.Tab("Chat") as chat_tab:
                     viewer_html = None
                     if ENABLE_VIZ:
                         with gr.Row(equal_height=True, elem_classes="resizable-row", elem_id="chat-row"):
@@ -3453,7 +3556,16 @@ def build_ui() -> gr.Blocks:
                     # demo.load() below) — Gradio's gr.Markdown has no .load() in
                     # this version.
                     mcp_tools_md = gr.Markdown(_mcp_tools_table_markdown())
-                    with gr.Accordion("Refresh system prompt", open=True):
+
+                with gr.Tab("System Prompt") as system_prompt_tab:
+                    gr.Markdown("### Re-assemble system prompt")
+                    gr.Markdown(
+                        "Rebuild the prompt from the current database contents "
+                        "(schema, object classes, examples, guidelines, …) and "
+                        "watch each step below. This should be done after an import; "
+                        "the UI also offers it via a popup when you switch tabs."
+                    )
+                    with gr.Accordion("Progress", open=True):
                         refresh_prompt_btn = gr.Button(_REASSEMBLE_BTN_LABEL)
                         prompt_status = gr.Textbox(
                             label="Status", interactive=False, lines=4
@@ -3463,19 +3575,50 @@ def build_ui() -> gr.Blocks:
                         # re-enables everything on its final yield. The button
                         # itself is locked here (not in the generator) so its
                         # label can switch to "Re-assembling…" while running.
-                        refresh_prompt_btn.click(
-                            fn=lambda: (
+                        _start_reassemble = (
+                            lambda: (
                                 gr.update(interactive=False, value="Re-assembling system prompt…"),
                                 gr.update(interactive=False),
                                 gr.update(interactive=False),
-                            ),
+                            )
+                        )
+                        refresh_prompt_btn.click(
+                            fn=_start_reassemble,
                             outputs=[refresh_prompt_btn, msg_input, send_btn],
                         ).then(
                             fn=_refresh_system_prompt_stream,
                             outputs=[refresh_prompt_btn, prompt_status, msg_input, send_btn],
                         )
 
-                with gr.Tab("System Prompt"):
+                        # The popup's "Yes, re-assemble now" button (defined in
+                        # the top-level stale_prompt_modal) starts the exact
+                        # same stream — no browser-side bridge, no artificial
+                        # button clicks: one click handler, one generator.
+                        # The little js hook just makes sure the user is left
+                        # on the System Prompt tab so the live progress box is
+                        # visible while the run happens.
+                        sp_yes_btn.click(
+                            fn=lambda: (
+                                gr.update(interactive=False, value="Re-assembling system prompt…"),
+                                gr.update(interactive=False),
+                                gr.update(interactive=False),
+                                gr.update(visible=False),
+                            ),
+                            # js only has the side effect of switching to the
+                            # System Prompt tab; it returns no value, so
+                            # Gradio falls back to the normal fn call.
+                            js="""() => {
+  var t = Array.prototype.find.call(
+    document.querySelectorAll('button[role="tab"]'),
+    function (b) { return b.textContent.trim() === 'System Prompt'; });
+  if (t) t.click();
+}""",
+                            outputs=[refresh_prompt_btn, msg_input, send_btn, stale_prompt_modal],
+                        ).then(
+                            fn=_refresh_system_prompt_stream,
+                            outputs=[refresh_prompt_btn, prompt_status, msg_input, send_btn],
+                        )
+
                     gr.Markdown("### Assembled system prompt")
                     gr.Markdown(
                         "The full prompt sent to the LLM as context — assembled live "
@@ -3505,6 +3648,19 @@ def build_ui() -> gr.Blocks:
                         outputs=[prompt_viewer, prompt_size_info],
                     )
 
+                    # ── Stale-prompt popup wiring (fullstack mode) ────────────────
+                    # After a successful import the cached prompt no longer reflects
+                    # the database — the import deliberately skips the rebuild (the
+                    # user may import more files) and only sets _prompt_stale.
+                    # Switching to the Chat or System Prompt tab then offers the
+                    # rebuild in the top-level stale_prompt_modal above; "Yes"
+                    # hides it and triggers the re-assembly stream directly
+                    # (the little js hook on the button switches to this tab).
+                    chat_tab.select(fn=_offer_stale_popup_clear,
+                                    inputs=[], outputs=[stale_prompt_modal])
+                    system_prompt_tab.select(fn=_offer_stale_popup_clear,
+                                             inputs=[], outputs=[stale_prompt_modal])
+
         # ── State ─────────────────────────────────────────────────────────────
         # (Resizable section dividers: script is injected via gr.Blocks(js=_RESIZE_JS)
         # above, targeting the rows marked `resizable-row`.)
@@ -3518,6 +3674,7 @@ def build_ui() -> gr.Blocks:
         # Ollama-only: per-turn raw reasoning trace (index-aligned with
         # history_state). See _build_reasoning_transcript.
         reasoning_state = gr.State([])
+
         # Per-turn distilled "how the answer was found" story (index-aligned
         # with history_state). See _summarize_story_ollama.
         story_state = gr.State([])
@@ -3787,6 +3944,12 @@ def build_ui() -> gr.Blocks:
                 _mcp_tools_table_markdown(),
             ) + ((gate["viewer"],) if viewer_html is not None else ())
 
+        # Stale-prompt popup: the modal is the top-level #stale-prompt-modal
+        # column (fixed overlay via the gr.Blocks head= CSS). "Not now"
+        # hides it (plain .click handler above); "Yes" starts the re-assembly
+        # stream directly (handler wired in the System Prompt tab, right next
+        # to the button's own wiring) and only uses a js hook to switch to
+        # that tab. Nothing else to wire here.
         demo.load(
             fn=_on_load,
             inputs=[provider_radio, model_dropdown, prompt_mode_radio, num_ctx_dropdown],
