@@ -483,7 +483,16 @@ def _refresh_system_prompt_stream() -> Generator[tuple, None, None]:
         elapsed = time.time() - started
         try:
             size = len(_system_prompt_cache.get("full", ""))
-            size_note = f" — prompt: {size:,} chars" if size else ""
+            # The LLM actually receives CHAT_INSTRUCTIONS + the assembled
+            # prompt; show both so the number matches the one reported by
+            # "Load / Refresh prompt" (len(CHAT_INSTRUCTIONS) + 2 newlines
+            # + size == the "Current prompt" figure).
+            size_note = (
+                f" — prompt: {size:,} chars"
+                f" (system prompt incl. chat instructions: "
+                f"{size + len(CHAT_INSTRUCTIONS) + 2:,} chars)"
+                if size else ""
+            )
         except Exception:
             size_note = ""
         n_done = sum(1 for l in lines if "— finished" in l)
