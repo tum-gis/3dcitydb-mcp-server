@@ -3591,10 +3591,14 @@ def build_ui() -> gr.Blocks:
                         "the UI also offers it via a popup when you switch tabs."
                     )
                     refresh_prompt_btn = gr.Button(_REASSEMBLE_BTN_LABEL)
+                    # Auto-growing box: starts small (2 lines) and expands
+                    # with the streamed output, capped just above the
+                    # expected content (12 progress lines + summary) so it
+                    # never becomes a giant fixed-size pane.
                     prompt_status = gr.Textbox(
                         label="",
-                        lines=30,
-                        max_lines=60,
+                        lines=2,
+                        max_lines=15,
                         interactive=False,
                         show_copy_button=True,
                         placeholder='Click "Re-assemble system prompt" to watch the rebuild steps.',
