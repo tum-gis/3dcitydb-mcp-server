@@ -2394,9 +2394,9 @@ async (_win, _event_data) => {
   // When a focused control is disabled or removed from the DOM (the
   // "Re-assemble system prompt" button is disabled the moment it is
   // clicked), the browser moves focus to <body> and auto-scrolls so the
-  // focused element is visible — i.e. it scrolls the page back to the
-  // very top. With the assembly progress status box far down the page
-  // that makes the log disappear with every update. Track the last real
+  // focused element is visible — i.e. it scrolls the page to another
+  // position. With the assembly status box being updated in place that
+  // makes the log jump around with every update. Track the last real
   // scroll position and restore it whenever focus lands on body/html.
   var lastScrollY = 0;
   window.addEventListener("scroll", function () {
@@ -3590,59 +3590,63 @@ def build_ui() -> gr.Blocks:
                         "watch each step below. This should be done after an import; "
                         "the UI also offers it via a popup when you switch tabs."
                     )
-                    with gr.Accordion("Progress", open=True):
-                        refresh_prompt_btn = gr.Button(_REASSEMBLE_BTN_LABEL)
-                        prompt_status = gr.Textbox(
-                            label="Status", interactive=False, lines=4
+                    refresh_prompt_btn = gr.Button(_REASSEMBLE_BTN_LABEL)
+                    prompt_status = gr.Textbox(
+                        label="",
+                        lines=30,
+                        max_lines=60,
+                        interactive=False,
+                        show_copy_button=True,
+                        placeholder='Click "Re-assemble system prompt" to watch the rebuild steps.',
+                    )
+                    # Lock button + chat input immediately (a double-click
+                    # must not start a second assembly); the generator
+                    # re-enables everything on its final yield. The button
+                    # itself is locked here (not in the generator) so its
+                    # label can switch to "Re-assembling…" while running.
+                    _start_reassemble = (
+                        lambda: (
+                            gr.update(interactive=False, value="Re-assembling system prompt…"),
+                            gr.update(interactive=False),
+                            gr.update(interactive=False),
                         )
-                        # Lock button + chat input immediately (a double-click
-                        # must not start a second assembly); the generator
-                        # re-enables everything on its final yield. The button
-                        # itself is locked here (not in the generator) so its
-                        # label can switch to "Re-assembling…" while running.
-                        _start_reassemble = (
-                            lambda: (
-                                gr.update(interactive=False, value="Re-assembling system prompt…"),
-                                gr.update(interactive=False),
-                                gr.update(interactive=False),
-                            )
-                        )
-                        refresh_prompt_btn.click(
-                            fn=_start_reassemble,
-                            outputs=[refresh_prompt_btn, msg_input, send_btn],
-                        ).then(
-                            fn=_refresh_system_prompt_stream,
-                            outputs=[refresh_prompt_btn, prompt_status, msg_input, send_btn],
-                        )
+                    )
+                    refresh_prompt_btn.click(
+                        fn=_start_reassemble,
+                        outputs=[refresh_prompt_btn, msg_input, send_btn],
+                    ).then(
+                        fn=_refresh_system_prompt_stream,
+                        outputs=[refresh_prompt_btn, prompt_status, msg_input, send_btn],
+                    )
 
-                        # The popup's "Yes, re-assemble now" button (defined in
-                        # the top-level stale_prompt_modal) starts the exact
-                        # same stream — no browser-side bridge, no artificial
-                        # button clicks: one click handler, one generator.
-                        # The little js hook just makes sure the user is left
-                        # on the System Prompt tab so the live progress box is
-                        # visible while the run happens.
-                        sp_yes_btn.click(
-                            fn=lambda: (
-                                gr.update(interactive=False, value="Re-assembling system prompt…"),
-                                gr.update(interactive=False),
-                                gr.update(interactive=False),
-                                gr.update(visible=False),
-                            ),
-                            # js only has the side effect of switching to the
-                            # System Prompt tab; it returns no value, so
-                            # Gradio falls back to the normal fn call.
-                            js="""() => {
+                    # The popup's "Yes, re-assemble now" button (defined in
+                    # the top-level stale_prompt_modal) starts the exact
+                    # same stream — no browser-side bridge, no artificial
+                    # button clicks: one click handler, one generator.
+                    # The little js hook just makes sure the user is left
+                    # on the System Prompt tab so the live progress box is
+                    # visible while the run happens.
+                    sp_yes_btn.click(
+                        fn=lambda: (
+                            gr.update(interactive=False, value="Re-assembling system prompt…"),
+                            gr.update(interactive=False),
+                            gr.update(interactive=False),
+                            gr.update(visible=False),
+                        ),
+                        # js only has the side effect of switching to the
+                        # System Prompt tab; it returns no value, so
+                        # Gradio falls back to the normal fn call.
+                        js="""() => {
   var t = Array.prototype.find.call(
     document.querySelectorAll('button[role="tab"]'),
     function (b) { return b.textContent.trim() === 'System Prompt'; });
   if (t) t.click();
 }""",
-                            outputs=[refresh_prompt_btn, msg_input, send_btn, stale_prompt_modal],
-                        ).then(
-                            fn=_refresh_system_prompt_stream,
-                            outputs=[refresh_prompt_btn, prompt_status, msg_input, send_btn],
-                        )
+                        outputs=[refresh_prompt_btn, msg_input, send_btn, stale_prompt_modal],
+                    ).then(
+                        fn=_refresh_system_prompt_stream,
+                        outputs=[refresh_prompt_btn, prompt_status, msg_input, send_btn],
+                    )
 
                     gr.Markdown("### Assembled system prompt")
                     gr.Markdown(
