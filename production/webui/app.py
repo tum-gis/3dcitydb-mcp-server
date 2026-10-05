@@ -415,6 +415,8 @@ def _refresh_system_prompt_stream() -> Generator[tuple, None, None]:
     state: dict = {
         "offset": 0, "error": None, "path": None,
         "started": {},  # step number -> monotonic start time
+        "done": set(),  # step numbers whose "done" record was seen
+        "max_step": 0, "total": 0,
     }
     stop_evt = threading.Event()
 
@@ -431,13 +433,18 @@ def _refresh_system_prompt_stream() -> Generator[tuple, None, None]:
                     compact=False, force_refresh=True, progress_path=p,
                 )
             finally:
+                # Signal completion FIRST, then give the main thread a beat
+                # to drain the last progress records before the side file is
+                # deleted (unlinking before the stop signal could lose the
+                # final "done" record in the drain race).
+                stop_evt.set()
+                time.sleep(0.5)
                 try:
                     os.unlink(p)
                 except OSError:
                     pass
         except Exception as exc:
             state["error"] = str(exc)
-        finally:
             stop_evt.set()
 
     t = threading.Thread(target=_worker, daemon=True)
@@ -495,7 +502,10 @@ def _refresh_system_prompt_stream() -> Generator[tuple, None, None]:
             )
         except Exception:
             size_note = ""
-        n_done = sum(1 for l in lines if "— finished" in l)
+        # This line is only reached on successful completion, so every step
+        # reported by the server is done; count from the records' "total"
+        # (falling back to the highest step number seen).
+        n_done = state["total"] or state["max_step"]
         lines.append(
             f"✅ Rebuild complete — {n_done} step(s), {elapsed:.1f}s{size_note}"
         )
@@ -526,10 +536,14 @@ def _parse_progress_records(chunk: str, state: dict, lines: deque) -> None:
             continue
         n, total = rec.get("step"), rec.get("total")
         label = rec.get("label", "").strip()
+        if n is not None and total is not None:
+            state["max_step"] = max(state["max_step"], n)
+            state["total"] = max(state["total"], total)
         if rec.get("state") == "start":
             state["started"][n] = time.monotonic()
             lines.append(f"Step {n}/{total}: {label} —")
         elif rec.get("state") == "done":
+            state["done"].add(n)
             t0 = state["started"].pop(n, None)
             dt = f" in {time.monotonic() - t0:.1f}s" if t0 else ""
             suffix = f" finished{dt}"
@@ -704,7 +718,7 @@ def _progress_html(stages: list[tuple[str, str]], elapsed: float | None = None) 
     if failed:
         color, title = "#ef4444", "Failed"
     elif finished == total:
-        color, title = "#22c55e", "Done — opening the chat…"
+        color, title = "#22c55e", "Done"
     else:
         color, title = "#3b82f6", f"{pct}%"
     clock = ""
@@ -1631,7 +1645,10 @@ def build_import_tab(
 
         import_btn = gr.Button("Import", variant="primary")
         import_progress = gr.HTML(value=_progress_html([]))
-        # Set to "ok" only when every step succeeded; the page then jumps to the chat.
+        # Set to "ok" only when every step succeeded (no longer used for a
+        # tab jump — after an import the user stays on the Import tab, as
+        # they may import more files; the stale-prompt popup is offered the
+        # moment they switch to the Chat or System Prompt tab themselves).
         nav_flag = gr.Textbox(value="", visible=False)
         import_log = gr.Textbox(
             label="Import log",
@@ -1924,13 +1941,12 @@ def build_import_tab(
                         + ([viewer_html] if viewer_html is not None else []),
             )
 
-        # Everything (conversion, import, prompt, tiles) succeeded: go to the chat.
-        _import_done.then(
-            fn=None, inputs=[nav_flag], outputs=[],
-            js="(ok) => { if (ok !== 'ok') return; const t = "
-               "[...document.querySelectorAll('button[role=\"tab\"]')]"
-               ".find(b => /^Chat/.test(b.textContent.trim())); if (t) t.click(); }",
-        )
+        # No tab jump after a successful import: the user stays where they
+        # are (they may import more files). The stale-prompt popup is shown
+        # only when the user themselves switches to the Chat or System
+        # Prompt tab (see the Tab.select handlers in build_ui); its "Yes"
+        # button then switches to the System Prompt tab and starts the
+        # re-assembly.
 
 
 # ── Main UI ────────────────────────────────────────────────────────────────────
