@@ -2697,7 +2697,7 @@ async (_win, _event_data) => {
     //      uses width="100%"),
     //   3. embed the matching document <style> block inside the clone.
     function serializeStandaloneSvg(svg) {
-      var vb = (svg.getAttribute("viewBox") || "").trim().split(/\s+/).map(Number);
+      var vb = (svg.getAttribute("viewBox") || "").trim().split(/\\s+/).map(Number);
       var clone = svg.cloneNode(true);
       clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
       if (vb.length === 4 && vb[2] > 0 && vb[3] > 0) {
@@ -2730,7 +2730,7 @@ async (_win, _event_data) => {
     // serializeStandaloneSvg() (styles embedded) or the image loses all
     // mermaid styling.
     function writePngToClipboard(svg, text) {
-      var vb = (svg.getAttribute("viewBox") || "").trim().split(/\s+/).map(Number);
+      var vb = (svg.getAttribute("viewBox") || "").trim().split(/\\s+/).map(Number);
       var vw = (vb.length === 4 && vb[2] > 0) ? vb[2] : svg.clientWidth;
       var vh = (vb.length === 4 && vb[3] > 0) ? vb[3] : svg.clientHeight;
       if (!vw || !vh) return Promise.reject(new Error("Cannot determine SVG size"));
