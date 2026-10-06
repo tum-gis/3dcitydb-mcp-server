@@ -744,10 +744,24 @@ def _viewer_html(started: bool) -> str:
 
     The web map client is only started once the database has content, so it
     never loads an empty globe (and never asks for tiles that cannot exist yet).
+
+    The iframe's src is DEFERRED (data-src; swapped in by the deferred-start
+    gate in _RESIZE_JS once the iframe is actually visible — <script> tags inside gr.HTML are stripped, so the logic must
+    live in the page-level JS). Cesium breaks when its container has zero
+    size at Viewer-ctor time: the viewer iframe lives in the Chat tab, so
+    after an import it is injected while the user is still on the Import tab
+    — i.e. hidden. Chrome tolerates starting in a 0x0 container, Firefox
+    does not: the Animation widget reads a theme color via getComputedStyle
+    on the hidden element, ``Color.fromCssColorString("")`` returns
+    undefined and the render loop dies with "An error occurred while
+    rendering. Rendering has stopped." / ``this._dataSourceDisplay``.
+    Loading only when visible sidesteps that entirely. The post-import tile
+    reload (``window.location.reload()`` inside the iframe) is unaffected:
+    the src attribute is set before any reload happens.
     """
     if started:
         return (
-            f'<iframe id="cesium-iframe" src="{_WEBMAP_SRC}" '
+            f'<iframe id="cesium-iframe" data-src="{_WEBMAP_SRC}" '
             'sandbox="allow-scripts allow-same-origin" '
             'style="width:100%;height:540px;border:none;border-radius:6px;"></iframe>'
         )
@@ -2326,6 +2340,42 @@ async (_win, _event_data) => {
     if (pending && ++tries < 100) setTimeout(poll, 200);
   })();
 
+  // ── Defer the Cesium viewer start until its iframe is actually visible ──
+  // The viewer iframe lives in the Chat tab. After an import it is injected
+  // while the user is still on the Import tab — i.e. hidden in a 0x0
+  // container. Chrome tolerates a Cesium Viewer ctor in a 0x0 container,
+  // Firefox does not: the Animation widget reads its theme color via
+  // getComputedStyle on the hidden element, Color.fromCssColorString("")
+  // returns undefined, and the render loop dies with "An error occurred
+  // while rendering. Rendering has stopped." + "_dataSourceDisplay is
+  // undefined". _viewer_html() therefore emits the URL as data-src; only
+  // start the iframe here once it has real size. The polling interval runs
+  // until activation and is cheap enough to leave running otherwise.
+  var cesiumGate = setInterval(function () {
+    var f = document.getElementById("cesium-iframe");
+    if (!f) return;
+    // 1) Deferred first start: begin the iframe only once it has real size.
+    //    (A tileset that finished generating while the viewer was not yet
+    //    started is picked up by the first load — no reload needed.)
+    if (f.dataset.src) {
+      if (f.offsetParent === null) return;              // hidden tab (display:none)
+      if (!f.getBoundingClientRect().width) return;     // 0x0 container
+      f.src = f.dataset.src;
+      delete f.dataset.src;
+      window.__citydbPendingReload = false;
+      return;
+    }
+    // 2) Deferred reload: _reloadTiles() was called while the (already
+    //    started) iframe was hidden — reloading it now would crash Cesium
+    //    the same way. Fire it once the iframe is visible again.
+    if (window.__citydbPendingReload && f.offsetParent !== null) {
+      window.__citydbPendingReload = false;
+      var t = vizWindow();
+      if (t) t.postMessage({ type: "reload_tiles" }, window.location.origin);
+    }
+  }, 150);
+  window.__citydbCesiumGate = cesiumGate;
+
   // Gradio rebuilds the chatbot DOM when a follow-up query starts. Keep
   // completed answer timings display-only and restore them after that rebuild
   // without adding them to the Python conversation history.
@@ -3001,6 +3051,14 @@ async (_win, _event_data) => {
     );
   };
   window._reloadTiles = function () {
+    var f = document.getElementById("cesium-iframe");
+    if (!f || f.offsetParent === null) {
+      // The viewer tab is hidden: reloading the iframe now would (re)start
+      // Cesium in a 0x0 container and crash it (Firefox). Defer — the gate
+      // interval fires the reload once the iframe is visible again.
+      window.__citydbPendingReload = true;
+      return;
+    }
     var target = vizWindow();
     if (target) target.postMessage({ type: "reload_tiles" }, window.location.origin);
   };
