@@ -12,6 +12,7 @@ Usage:
 
 import json
 import logging
+import os
 from dataclasses import asdict
 from mcp.server import Server
 from mcp.types import Tool, TextContent
@@ -33,6 +34,13 @@ from .tools.selection import get_feature_tree, describe_selection
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("citydb-mcp")
+
+# The 3D viewer tools (resolve_highlight_targets, get_feature_tree,
+# describe_selection) are only offered when the deployment runs with the
+# viewer enabled (ENABLE_VIZ=true). Without a viewer there is no place to
+# show the highlight/selection payloads, so they stay hidden from clients in
+# non-viz setups (BYOD, or fullstack without the viz overlay).
+ENABLE_VIZ = os.environ.get("ENABLE_VIZ", "false").lower() == "true"
 
 # Initialize server and database
 server = Server(
@@ -72,15 +80,20 @@ server = Server(
         "execute it with run_query. The remaining tools (get_database_schema, "
         "get_query_guidelines, get_generic_attributes, get_lod_config, "
         "get_examples, ...) provide supporting details and are also used "
-        "internally by assemble_prompt.\n\n"
-        "3D viewer support: resolve_highlight_targets expands feature "
-        "objectids into the ids a 3D Tiles viewer can style plus a camera "
-        "target; get_feature_tree walks the containment tree around one "
-        "picked feature (its ancestors, children, and siblings) so a client "
-        "can let a user pick the right level (e.g. a clicked wall vs. the "
-        "building it belongs to); describe_selection summarizes a finished "
-        "multi-feature selection (per-class counts, tileable ids) for use "
-        "when scoping a query to it."
+        "internally by assemble_prompt."
+        + (
+            "\n\n"
+            "3D viewer support: resolve_highlight_targets expands feature "
+            "objectids into the ids a 3D Tiles viewer can style plus a camera "
+            "target; get_feature_tree walks the containment tree around one "
+            "picked feature (its ancestors, children, and siblings) so a "
+            "client can let a user pick the right level (e.g. a clicked wall "
+            "vs. the building it belongs to); describe_selection summarizes "
+            "a finished multi-feature selection (per-class counts, tileable "
+            "ids) for use when scoping a query to it."
+            if ENABLE_VIZ
+            else ""
+        )
     ),
 )
 db = DatabaseConnection()
@@ -102,7 +115,7 @@ def _to_json(obj) -> str:
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    tools = [
         # Static tools
         Tool(
             name="get_server_version",
@@ -401,6 +414,13 @@ async def list_tools() -> list[Tool]:
             },
         ),
     ]
+    if not ENABLE_VIZ:
+        # The viewer tools are meaningless without a viewer; keep them out of
+        # the tool list (and thus out of the system prompt) in non-viz setups.
+        _viewer = {"resolve_highlight_targets", "get_feature_tree",
+                   "describe_selection"}
+        tools = [t for t in tools if t.name not in _viewer]
+    return tools
 
 
 # ============================================================
@@ -478,17 +498,19 @@ def _execute_tool(name: str, arguments: dict) -> str:
         result = run_query(db, arguments["sql"])
         return json.dumps(result, indent=2, default=str)
 
-    # --- Viewer support ---
-    if name == "resolve_highlight_targets":
-        result = resolve_highlight_targets(db, arguments["objectids"])
-        return _to_json(result)
-
-    if name == "get_feature_tree":
-        result = get_feature_tree(db, arguments["objectid"])
-        return _to_json(result)
-
-    if name == "describe_selection":
-        result = describe_selection(db, arguments["objectids"])
+    # --- Viewer support (only offered when ENABLE_VIZ=true) ---
+    if name in ("resolve_highlight_targets", "get_feature_tree",
+                "describe_selection"):
+        if not ENABLE_VIZ:
+            raise ValueError(
+                "This 3D viewer tool is only available when ENABLE_VIZ=true."
+            )
+        if name == "resolve_highlight_targets":
+            result = resolve_highlight_targets(db, arguments["objectids"])
+        elif name == "get_feature_tree":
+            result = get_feature_tree(db, arguments["objectid"])
+        else:  # describe_selection
+            result = describe_selection(db, arguments["objectids"])
         return _to_json(result)
 
     # --- User context ---
