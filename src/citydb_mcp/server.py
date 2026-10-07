@@ -116,6 +116,68 @@ def _to_json(obj) -> str:
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     tools = [
+        # The two primary tools are listed first so they stand out to MCP
+        # clients (e.g. the MCP Inspector) — they are the recommended
+        # starting points: call assemble_prompt once, then run_query.
+        Tool(
+            name="assemble_prompt",
+            description=(
+                "Assembles the complete system prompt by orchestrating all "
+                "static and dynamic tools. Returns a structured prompt string "
+                "containing database schema, object classes with resolved "
+                "properties and codelists, generic attributes, spatial context, "
+                "and optionally SQL examples and query guidelines. "
+                "Set include_query_agent_extras=false for non-query agents.\n\n"
+                "Performance note: on large databases the first call can take "
+                "several minutes to complete. The result is cached for the "
+                "lifetime of the server process, so subsequent calls return "
+                "the cached prompt immediately. Pass force_refresh=true to "
+                "force a full rebuild (e.g. after a data import)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "include_query_agent_extras": {
+                        "type": "boolean",
+                        "description": "Include SQL examples and query guidelines (default: true)",
+                        "default": True,
+                    },
+                    "compact": {
+                        "type": "boolean",
+                        "description": "Compact rendering for local models with small context windows (default: false)",
+                        "default": False,
+                    },
+                    "force_refresh": {
+                        "type": "boolean",
+                        "description": (
+                            "Bypass the cache and rebuild the prompt from the database "
+                            "(use after importing new data). Default: false."
+                        ),
+                        "default": False,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="run_query",
+            description=(
+                "Executes a read-only SQL query against 3DCityDB. "
+                "Only SELECT and WITH (CTE) statements are allowed. "
+                "Results are automatically limited to 500 rows."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sql": {
+                        "type": "string",
+                        "description": "SQL SELECT query to execute"
+                    }
+                },
+                "required": ["sql"],
+            },
+        ),
+
         # Static tools
         Tool(
             name="get_server_version",
@@ -215,26 +277,6 @@ async def list_tools() -> list[Tool]:
                     }
                 },
                 "required": ["objectclass_ids"],
-            },
-        ),
-
-        # Query execution
-        Tool(
-            name="run_query",
-            description=(
-                "Executes a read-only SQL query against 3DCityDB. "
-                "Only SELECT and WITH (CTE) statements are allowed. "
-                "Results are automatically limited to 500 rows."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "sql": {
-                        "type": "string",
-                        "description": "SQL SELECT query to execute"
-                    }
-                },
-                "required": ["sql"],
             },
         ),
 
@@ -369,48 +411,6 @@ async def list_tools() -> list[Tool]:
                     "error": {"type": "string"},
                 },
                 "required": ["session_id", "query", "rating"],
-            },
-        ),
-
-        # Assembly
-        Tool(
-            name="assemble_prompt",
-            description=(
-                "Assembles the complete system prompt by orchestrating all "
-                "static and dynamic tools. Returns a structured prompt string "
-                "containing database schema, object classes with resolved "
-                "properties and codelists, generic attributes, spatial context, "
-                "and optionally SQL examples and query guidelines. "
-                "Set include_query_agent_extras=false for non-query agents.\n\n"
-                "Performance note: on large databases the first call can take "
-                "several minutes to complete. The result is cached for the "
-                "lifetime of the server process, so subsequent calls return "
-                "the cached prompt immediately. Pass force_refresh=true to "
-                "force a full rebuild (e.g. after a data import)."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "include_query_agent_extras": {
-                        "type": "boolean",
-                        "description": "Include SQL examples and query guidelines (default: true)",
-                        "default": True,
-                    },
-                    "compact": {
-                        "type": "boolean",
-                        "description": "Compact rendering for local models with small context windows (default: false)",
-                        "default": False,
-                    },
-                    "force_refresh": {
-                        "type": "boolean",
-                        "description": (
-                            "Bypass the cache and rebuild the prompt from the database "
-                            "(use after importing new data). Default: false."
-                        ),
-                        "default": False,
-                    },
-                },
-                "required": [],
             },
         ),
     ]
