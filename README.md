@@ -225,9 +225,8 @@ The pre-built image (`khaoulakanna1/citydb-mcp-agent:latest`) is pulled automati
 | Tab | What it does |
 |-----|-------------|
 | **Chat** | Send natural-language questions; the agent writes and executes SQL automatically |
-| **SQL Inspector** | Shows the last SQL query dispatched to the database (below the chat input) |
-| **MCP Inspector** | Lists all active MCP tools and lets you refresh the assembled system prompt |
-| **System Prompt** | Displays the full assembled system prompt sent to the LLM — useful for debugging |
+| **MCP Inspector** | Shows the MCP server's self-description and lists all active MCP tools |
+| **System Prompt** | Displays the full assembled system prompt sent to the LLM and offers **Re-assemble system prompt** to rebuild it from the current database contents — useful for debugging |
 
 While the agent is working, the chat bubble shows live status: *Thinking…* → *Running query…* → *Interpreting results…*. Right next to the chat log, the **Agent activity panel** streams the full ReAct trace — each thought, tool call, and observation — with per-step timing.
 
@@ -241,7 +240,7 @@ While the agent is working, the chat bubble shows live status: *Thinking…* →
 | **Thinking** | `off` / `low` / `medium` / `high` (+ `max` for OpenAI) | Reasoning level for thinking-capable models. Ollama uses native `think`; OpenAI-compatible endpoints use `reasoning_effort`. Higher levels are slower but more thorough |
 | **Prompt mode** | `auto` / `compact` / `full` | `auto` picks compact for small local models; override for complex queries |
 | **Keep a distilled summary of how the answer was found** | on / off (default on; Ollama + OpenAI) | After each DB turn, distills the successful path (purpose + working SQL + short result) into a compact story carried into later turns. Adds one extra blocking generation per tool-using turn |
-| **Include all reasoning steps in context** | on / off (default on; Ollama + OpenAI) | Feeds each turn's full reasoning trace back into context on later turns; increases token usage |
+| **Include all reasoning steps in context** | on / off (default off; Ollama + OpenAI) | Feeds each turn's full reasoning trace back into context on later turns. Off by default: the full trace consumes a large share of the context window, and the distilled summary (above) already carries the essential path |
 | **Context window (Ollama)** | 8K / 32K / 64K / 128K / 256K (default 128K) | Tokens available to the model; a smaller window uses less memory but is too small for complex queries |
 
 **Rendering and export:**
@@ -481,6 +480,8 @@ At least one must be configured for the Docker variants. The Gradio UI auto-sele
 | `OPENAI_API_KEY` | OpenAI API key (`sk-...`); when using Ollama via the OpenAI-compatible endpoint this value must be `ollama` |
 | `OPENAI_BASE_URL` | Base URL for the OpenAI provider. Leave empty for models offered by OpenAI. When using a locally running LLM or a remote LLM (not hosted by OpenAI) via its OpenAI-compatible API (e.g., provided by llama.cpp, vLLM, or Ollama) provide the corresponding endpoint URL (e.g. `http://host.docker.internal:11434/v1/`) |
 | `OLLAMA_BASE_URL` | Ollama base URL (e.g. `http://host.docker.internal:11434`) |
+| `LITELLM_TIMEOUT` | `120` | Timeout in seconds for cloud / OpenAI-compatible provider requests |
+| `LITELLM_TIMEOUT_LOCAL` | `300` | Timeout in seconds for Ollama / local model requests |
 
 ### Query behaviour
 
@@ -572,6 +573,8 @@ call regardless of provider (Ollama or OpenAI-compatible).
 | Tool | Description |
 |------|-------------|
 | `assemble_prompt` | Orchestrates all tools into a complete system prompt in one call |
+
+> **Note:** The three 3D viewer tools — `resolve_highlight_targets`, `get_feature_tree`, and `describe_selection` — are only offered when the stack runs with the viewer enabled (`ENABLE_VIZ=true`, see [Option 3b](#option-3b-add-the-3d-viewer-optional)). In non-viz deployments they are omitted from the tool list entirely, so they never appear to clients such as the MCP Inspector.
 
 ---
 
