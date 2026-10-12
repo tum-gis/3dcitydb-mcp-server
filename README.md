@@ -142,6 +142,7 @@ Run the server over HTTP for remote clients:
 ```
 
 - Clients connect via: `http://your-server:8080/sse`
+- Modern clients (e.g. VS Code) prefer the Streamable HTTP transport: `http://your-server:8080/mcp`
 - Health check: `http://your-server:8080/health`
 
 ### LangChain agent CLI (optional)

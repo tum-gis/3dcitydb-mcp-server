@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import logging
+from contextlib import asynccontextmanager
 from .server import server, db
 
 logging.basicConfig(level=logging.INFO)
@@ -23,6 +24,7 @@ def main():
     args = parser.parse_args()
 
     from mcp.server.sse import SseServerTransport
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from starlette.applications import Starlette
     from starlette.routing import Route, Mount
     from starlette.responses import JSONResponse
@@ -30,6 +32,23 @@ def main():
 
     # SSE transport
     sse = SseServerTransport("/messages/")
+
+    # Streamable HTTP transport (preferred by modern clients, e.g. VS Code,
+    # which POSTs to the configured URL and only falls back to SSE on 404).
+    http = StreamableHTTPSessionManager(
+        app=server,
+        event_store=None,
+        json_response=True,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_: Starlette):
+        async with http.run():
+            yield
+        try:
+            db.close()
+        except Exception:
+            pass
 
     async def handle_sse(request):
         try:
@@ -55,24 +74,20 @@ def main():
                 status_code=503
             )
 
-    async def _on_shutdown():
-        try:
-            db.close()
-        except Exception:
-            pass
-
     app = Starlette(
         debug=False,
         routes=[
             Route("/health", health_check),
             Route("/sse", endpoint=handle_sse),
+            Mount("/mcp", http.handle_request),
             Mount("/messages/", app=sse.handle_post_message),
         ],
-        on_shutdown=[_on_shutdown],
+        lifespan=lifespan,
     )
 
     logger.info(f"Starting CityGML MCP Server (SSE) on {args.host}:{args.port}")
     logger.info(f"SSE endpoint: http://{args.host}:{args.port}/sse")
+    logger.info(f"Streamable HTTP endpoint: http://{args.host}:{args.port}/mcp")
     logger.info(f"Health check: http://{args.host}:{args.port}/health")
 
     uvicorn.run(app, host=args.host, port=args.port)
