@@ -37,7 +37,8 @@ services:
 
   # ── Gradio chat UI + importer ──────────────────────────────────────────────
   citydb-agent:
-    image: khaoulakanna1/citydb-mcp-agent:latest
+    image: ghcr.io/tum-gis/3dcitydb-mcp-agent:latest
+    # image: citydb-mcp-agent:local
     # build: section kept for local builds (see README for Windows note).
     # Context is the repo root so the Dockerfile can COPY both production/webui
     # and src/citydb_mcp into the image.

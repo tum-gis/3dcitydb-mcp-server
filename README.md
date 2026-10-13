@@ -213,7 +213,7 @@ docker compose -f docker-compose.byod.yml up -d
 # http://localhost:7860
 ```
 
-The pre-built image (`khaoulakanna1/citydb-mcp-agent:latest`) is pulled automatically from Docker Hub on first run.
+The pre-built image (`ghcr.io/tum-gis/3dcitydb-mcp-agent:latest`) is pulled automatically from the GitHub Container Registry on first run.
 
 ### What it includes
 
@@ -337,7 +337,7 @@ docker compose -f docker-compose.fullstack.yml up -d
 # http://localhost:7860
 ```
 
-Both images are pulled automatically from Docker Hub on first run. The first start takes ~60 seconds while PostgreSQL initialises.
+Both images are pulled automatically on first run (the agent from the GitHub Container Registry, PostgreSQL from Docker Hub). The first start takes ~60 seconds while PostgreSQL initialises.
 
 **Recommended:** pre-pull the importer's helper images so the *first* import doesn't silently block for several minutes:
 
@@ -379,7 +379,7 @@ $env:DOCKER_BUILDKIT=0; docker compose -f docker-compose.fullstack.yml up -d --b
 ```
 
 > **Windows note:** Only needed when building locally with `--build`.
-> The default `docker compose up -d` (pull from Docker Hub) works on Windows without any workaround.
+> The default `docker compose up -d` (pull from the GitHub Container Registry) works on Windows without any workaround.
 
 ### Import CityGML/CityJSON/IFC
 
