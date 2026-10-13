@@ -1,0 +1,70 @@
+name: Publish container image
+
+# Builds the citydb-agent image and pushes it to GHCR under the tum-gis
+# organization. Publishing from a workflow in this repository is what makes
+# GitHub link the package to this repo (manually pushed images show up as
+# "Internal" org packages without a repo link).
+
+on:
+  # Automatic trigger on every release tag
+  push:
+    tags:
+      - "v*"
+  # Manual trigger (Actions -> "Publish container image" -> Run workflow),
+  # or: gh workflow run publish-container.yml -f version=1.0.1
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to push (also tagged as latest)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: 3dcitydb-mcp-agent
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # v1.2.3 -> 1.2.3
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            v="${{ inputs.version }}"
+            [ -n "$v" ] || v="1.0.1"
+            echo "version=${v#v}" >> "$GITHUB_OUTPUT"
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: production/docker/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
