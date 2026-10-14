@@ -1,4 +1,21 @@
-# 3DCityDB MCP Server
+<h1 align="center">3DCityDB MCP Server</h1>
+
+<p align="center">
+  <a href="https://pypi.org/project/3dcitydb-mcp-server/"><img src="https://img.shields.io/pypi/v/3dcitydb-mcp-server?color=blue&logo=pypi&logoColor=white" alt="PyPI"></a>
+  <a href="https://pypi.org/project/3dcitydb-mcp-server/"><img src="https://img.shields.io/pypi/pyversions/3dcitydb-mcp-server?logo=python&logoColor=white" alt="Python versions"></a>
+  <a href="https://github.com/tum-gis/3dcitydb-mcp-server/blob/main/LICENCE"><img src="https://img.shields.io/badge/License-Apache--2.0-green.svg" alt="License: Apache-2.0"></a>
+  <a href="https://github.com/3dcitydb/3dcitydb"><img src="https://img.shields.io/badge/3DCityDB-v5-orange" alt="3DCityDB v5"></a>
+  <a href="https://www.ogc.org/standards/citygml/"><img src="https://img.shields.io/badge/OGC-CityGML-teal" alt="OGC CityGML"></a>
+  <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-server-purple" alt="MCP server"></a>
+  <img src="https://img.shields.io/badge/PostgreSQL-PostGIS-336791?logo=postgresql&logoColor=white" alt="PostgreSQL / PostGIS">
+  <img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker ready">
+</p>
+
+<p align="center">
+  <a href="https://pypi.org/project/3dcitydb-mcp-server/"><img src="https://img.shields.io/badge/pip_install-3dcitydb--mcp--server-3775A9?style=for-the-badge&logo=pypi&logoColor=white" alt="Install from PyPI"></a>
+  <a href="https://isprs-annals.copernicus.org/articles/XII-4-W1-2026/211/2026/isprs-annals-XII-4-W1-2026-211-2026.html"><img src="https://img.shields.io/badge/Read_the_paper-ISPRS_Annals-E34F26?style=for-the-badge&logo=readthedocs&logoColor=white" alt="Read the paper"></a>
+  <a href="https://github.com/tum-gis/3dcitydb-mcp-server/issues"><img src="https://img.shields.io/badge/Report_an_issue-GitHub-181717?style=for-the-badge&logo=github&logoColor=white" alt="Report an issue"></a>
+</p>
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server giving AI assistants direct, natural language access to semantic 3D city models in CityGML managed within a [**3DCityDB v5**](https://github.com/3dcitydb/3dcitydb) geodatabase.
 
