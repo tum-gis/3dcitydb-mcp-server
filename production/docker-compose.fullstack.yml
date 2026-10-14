@@ -3,7 +3,8 @@ services:
   # ── PostgreSQL + 3DCityDB v5 with SFCGAL ───────────────────────────────────
   #    Default parameters are tuned for better performance with large datasets.
   postgres:
-    image: khaoulakanna1/3dcitydb-v5-docker-sfcgal-patched:latest
+    image: ghcr.io/tum-gis/3dcitydb-v5-docker-sfcgal-patched:latest
+    # image: khaoulakanna1/3dcitydb-v5-docker-sfcgal-patched:latest
     ports:
       - "5432:5432" 
     shm_size: '2gb'

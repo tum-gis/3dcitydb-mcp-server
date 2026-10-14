@@ -337,7 +337,7 @@ docker compose -f docker-compose.fullstack.yml up -d
 # http://localhost:7860
 ```
 
-Both images are pulled automatically on first run (the agent from the GitHub Container Registry, PostgreSQL from Docker Hub). The first start takes ~60 seconds while PostgreSQL initialises.
+Both images are pulled automatically from the GitHub Container Registry on first run. The first start takes ~60 seconds while PostgreSQL initialises.
 
 **Recommended:** pre-pull the importer's helper images so the *first* import doesn't silently block for several minutes:
 
