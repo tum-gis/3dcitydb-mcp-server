@@ -183,6 +183,26 @@ def _clean_sql_input(raw: str) -> str:
     return raw.strip("{}").strip()
 
 
+# ── Answer-language reminder ──────────────────────────────────────────────────
+
+def _language_reminder(question: str) -> str:
+    """Reminder that anchors the Final Answer to the language of ``question``.
+
+    Quotes the actual question (instead of a hard-coded example) so the model
+    compares against the user's words, not the English tool output or its own
+    English reasoning.
+    """
+    q = " ".join(question.split())
+    if len(q) > 300:
+        q = q[:300] + "…"
+    return (
+        f"[LANGUAGE] The user's question was: \"{q}\"\n"
+        "Write the Final Answer in the same language as that question, regardless "
+        "of the language of the database content, these tool results, or your own "
+        "reasoning."
+    )
+
+
 # ── LangChain callback → event queue ──────────────────────────────────────────
 
 _SENTINEL = object()  # signals agent thread finished
@@ -1124,6 +1144,12 @@ def react_stream(
         ollama_init["temperature"] = temperature
     llm = ChatOllama(**ollama_init)
 
+    # Last user question
+    _raw_user_q = next(
+        (m.get("content", "") for m in reversed(messages) if m["role"] == "user"), ""
+    )
+    _answer_lang_reminder = _language_reminder(_raw_user_q)
+
     # ── Build the run_query tool ───────────────────────────────────────────────
     def _run_query(input_data: str) -> str:
         """Execute SQL and return a human-readable observation (same format as old demo)."""
@@ -1171,14 +1197,7 @@ def react_stream(
                 )
             # Keep the language reminder as the very last line of every observation
             # so it's the freshest text the model reads before writing Final Answer.
-            result_msg += (
-                "\n\n[REMINDER] Answer in the user's language. "
-                "English question → English answer. Never switch languages.\n"
-                "WRONG: User asks 'which objectclass has CompositeSolid geometry?' "
-                "→ 'Die Objektklasse mit CompositeSolid-Geometrie ist Gebäude.'\n"
-                "RIGHT: User asks 'which objectclass has CompositeSolid geometry?' "
-                "→ 'The objectclass with CompositeSolid geometry is Building (objectclass_id 901).'"
-            )
+            result_msg += "\n\n" + _answer_lang_reminder
             return result_msg
         except Exception as exc:
             return f"Error executing query: {exc}"
@@ -1206,21 +1225,11 @@ def react_stream(
     # break agent construction. Escape literal braces before embedding it.
     system_content = _escape_template_braces(system_content)
 
-    # Last user question
-    _raw_user_q = next(
-        (m.get("content", "") for m in reversed(messages) if m["role"] == "user"), ""
-    )
-
     # /no_think soft switch for Qwen3 etc.
-    # Also inject a per-message language reminder so the model doesn't default
-    # to German when the database content is German but the question is not.
-    _lang_reminder = (
-        "\n\n[INSTRUCTION: Write your Final Answer ONLY in the same language as the "
-        "question above. Detect the language from the words I used, NOT from the "
-        "database content or street/place names. Do not switch to German or any "
-        "other language regardless of what the data looks like.]"
-    )
-    user_q = _raw_user_q + _lang_reminder
+    # Also inject a per-message language reminder naming the question's language,
+    # so the model neither drifts to German (German DB content) nor to English
+    # (English prompt, tool output and reasoning).
+    user_q = _raw_user_q + "\n\n" + _answer_lang_reminder
     if not enable_thinking and not user_q.endswith("/no_think"):
         user_q = user_q + "\n\n/no_think"
 
