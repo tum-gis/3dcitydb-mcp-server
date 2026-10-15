@@ -8,7 +8,7 @@
   <a href="https://www.ogc.org/standards/citygml/"><img src="https://img.shields.io/badge/OGC-CityGML-teal" alt="OGC CityGML"></a>
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-server-purple" alt="MCP server"></a>
   <img src="https://img.shields.io/badge/PostgreSQL-PostGIS-336791?logo=postgresql&logoColor=white" alt="PostgreSQL / PostGIS">
-  <img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker ready">
+  <a href="ghcr.io/tum-gis/3dcitydb-mcp-agent:latest"><img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker ready"></a>
 </p>
 
 <p align="center">
