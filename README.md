@@ -172,6 +172,37 @@ A standalone CLI agent that uses the MCP tools directly:
 
 Requires `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `OLLAMA_BASE_URL` in your `.env`.
 
+### WebGUI-equivalent chat CLI
+
+The chatbot image also provides an interactive CLI that uses the same provider
+backends, prompt/context handling, MCP tools, and conversation runtime as the
+WebGUI. From the `production` directory, run:
+
+```bash
+docker exec -it production-citydb-agent-1 3dcitydb-chat chat
+```
+
+Choose a provider and model explicitly when desired. For example:
+
+```bash
+docker exec -it production-citydb-agent-1 3dcitydb-chat chat \
+  --provider ollama --model qwen3.8:27b \
+  --temperature 0.1 --thinking high --prompt-mode auto --num-ctx 131072
+```
+
+Available options also include `--base-url`, `--keep-story` /
+`--no-keep-story`, `--include-reasoning`, and `--show-reasoning`. By default,
+provider reasoning is not displayed; `--show-reasoning` adds a clearly labeled
+reasoning/activity section on stderr. Use `/new` to clear conversation history
+and `/bye` or `/exit` to leave the session. Prompt assembly reports each
+database-context step and its duration on stdout. Status and context-size
+estimates also go to stdout. INFO logs and generation/tool diagnostics between
+submitting a question and receiving its answer go to stderr. Pass
+`--quiet-stderr` to suppress stderr output, including INFO logs. The CLI uses
+the running container's environment and database configuration. The same
+command works with the BYOD Compose file by substituting
+`docker-compose.byod.yml`.
+
 ---
 
 ## Option 2: Docker — BYOD (Bring Your Own Database)
