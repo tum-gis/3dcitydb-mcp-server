@@ -667,6 +667,7 @@ documents:
 - [`idea-for-future-write-access.md`](production/docs/idea-for-future-write-access.md) — opt-in write access (DML / DDL) to the database for experimentation, off by default.
 - [`idea-for-future-memory-rag.md`](production/docs/idea-for-future-memory-rag.md) — persistent chat memory (question / answer / distilled story) with RAG retrieval of similar past turns via pgvector, off by default.
 - [`idea-for-future-llm-benchmarking.md`](production/docs/idea-for-future-llm-benchmarking.md) — a reusable CLI for interactive ChatBot conversations and repeatable multi-LLM benchmarks, including CSV question sets and optional independent answer grading.
+- [`idea-for-future-session-scoped-chat-cancellation.md`](production/docs/idea-for-future-session-scoped-chat-cancellation.md) — isolate Stop-button cancellation per chat session so concurrent users do not interrupt each other's work.
 
 ---
 
