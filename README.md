@@ -666,6 +666,7 @@ documents:
 - [`idea-for-future-Openstreetmap-interface.md`](production/docs/idea-for-future-Openstreetmap-interface.md) — querying OpenStreetMap geodata (Nominatim / Overpass) to enrich 3DCityDB queries with real-world context.
 - [`idea-for-future-write-access.md`](production/docs/idea-for-future-write-access.md) — opt-in write access (DML / DDL) to the database for experimentation, off by default.
 - [`idea-for-future-memory-rag.md`](production/docs/idea-for-future-memory-rag.md) — persistent chat memory (question / answer / distilled story) with RAG retrieval of similar past turns via pgvector, off by default.
+- [`idea-for-future-llm-benchmarking.md`](production/docs/idea-for-future-llm-benchmarking.md) — a reusable CLI for interactive ChatBot conversations and repeatable multi-LLM benchmarks, including CSV question sets and optional independent answer grading.
 
 ---
 
