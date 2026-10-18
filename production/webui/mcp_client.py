@@ -18,7 +18,6 @@ from typing import Any, TextIO
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-
 _loop: asyncio.AbstractEventLoop | None = None
 _loop_lock = threading.Lock()
 

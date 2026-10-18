@@ -56,6 +56,123 @@ There are four ways to run the 3DCityDB MCP Server (Option 3b is a 3D-viewer var
 
 ---
 
+## Chat and Benchmark CLI
+
+The WebGUI-equivalent `3dcitydb-chat` CLI is included in the chatbot image used
+by Docker Options 2, 3, and 3b. Start one of those stacks first, then run the
+CLI in its chatbot container. For example, with the fullstack stack:
+
+```bash
+docker exec -it production-citydb-agent-1 3dcitydb-chat chat
+```
+
+The same CLI can run without Docker from a source checkout, but it is not part
+of the standard PyPI package. Install the project and WebGUI dependencies,
+configure the database/provider environment as described under Option 1, then
+run these commands from the `production` directory:
+
+```bash
+python -m pip install -e ..
+python -m pip install -r webui/requirements.txt
+python -m webui.cli chat
+```
+
+The local MCP server executable (`3dcitydb-mcp`) must be on `PATH`, and the
+configured database must be reachable from the machine running the CLI. Unlike
+the Docker CLI, a local CLI process uses that machine's environment and
+filesystem.
+
+Choose a provider and model explicitly when desired. For example:
+
+```bash
+docker exec -it production-citydb-agent-1 3dcitydb-chat chat \
+  --provider ollama --model qwen3.8:27b \
+  --temperature 0.1 --thinking high --prompt-mode auto --num-ctx 131072
+```
+
+Available options also include `--base-url`, `--keep-story` /
+`--no-keep-story`, `--include-reasoning`, and `--show-reasoning`. By default,
+provider reasoning is not displayed; `--show-reasoning` adds a clearly labeled
+reasoning/activity section on stderr. Use `/new` to clear conversation history
+and `/bye` or `/exit` to leave the session. Prompt assembly reports each
+database-context step and its duration on stdout. Status and context-size
+estimates also go to stdout. INFO logs and generation/tool diagnostics between
+submitting a question and receiving its answer go to stderr. Pass
+`--quiet-stderr` to suppress stderr output, including INFO logs.
+
+### CSV-driven LLM benchmark
+
+Run model configurations against the query rows for one dataset label. The
+results CSV is appended and flushed after every answer:
+
+The repository includes editable starter files in
+[`examples/benchmark/`](examples/benchmark/). The Docker Compose files mount the
+host folder `production/data` at `/app/data` in the chatbot container. From
+PowerShell while your current directory is `examples\benchmark`, copy the
+samples into that shared folder:
+
+```powershell
+Copy-Item .\models.csv ..\..\production\data\models.csv
+Copy-Item .\questions.csv ..\..\production\data\questions.csv
+```
+
+Then run the benchmark in the chatbot container:
+
+```bash
+docker exec production-citydb-agent-1 3dcitydb-chat benchmark \
+  --models-csv /app/data/models.csv \
+  --queries-csv /app/data/questions.csv \
+  --dataset demo \
+  --repetitions 3 \
+  --output /app/data/benchmark-results.csv \
+  --temperature 0.2 --thinking off --prompt-mode auto
+```
+
+For a local source checkout, run `python -m webui.cli benchmark` from the
+`production` directory and pass host paths for the input and output files. The
+example model row uses `gpt-4.1-mini`; replace it with a model name available
+from your configured provider/endpoint. The `demo` dataset value is only a
+label used to select rows in the questions CSV; it does not need to match or
+select database contents.
+
+The models file requires `provider,model`; optional columns are
+`base_url,temperature,thinking_level,prompt_mode`. When a corresponding CLI
+option is provided, it overrides the value in the models file. Otherwise,
+nonblank model-row settings are used, falling back to the CLI defaults
+(temperature unset, thinking off, and prompt mode auto). Providers are
+`openai`, `anthropic`, and `ollama`. Credentials remain in the environment and
+must not be put in CSV files.
+
+The questions file requires
+`id,question,ground_truth,citygml_dataset`. Optional columns are
+`category,group_number,sequence_number`. `--dataset` matches
+`citygml_dataset` exactly; the label selects question rows only and does not
+switch or filter the connected database. A nonblank `group_number` starts a
+multi-turn conversation whose rows are sent in ascending `sequence_number`.
+Each standalone query and each group repetition starts with fresh chat history.
+The files use standard comma-delimited CSV: put double quotes around any field
+containing a comma, and write a literal double quote inside a quoted field as
+two double quotes (`""`). Semicolons are ordinary characters with this comma
+delimiter, so they do not split a field. The sample questions demonstrate
+quoted commas and semicolons; use a CSV-aware editor rather than splitting
+question rows manually on punctuation.
+
+Use `--env-file /path/to/db.env` to override the benchmark's `CITYDB_*`
+connection settings (also accepts `POSTGRES_*` keys and `DATABASE_URL`).
+Results include input file provenance, query/model identity, generated answer,
+status/error, latency, and context metrics. Failed calls are recorded as
+failures and do not stop later cases. `--quiet-stderr` suppresses progress,
+INFO logs, and backend diagnostics without suppressing the results CSV or
+stdout summary. For each turn, stdout shows the model and its `models.csv` line,
+group/query position, repetition, user query, and generated answer. Answer
+line breaks are written as literal `\n`
+sequences so each result remains on one physical CSV line for compatibility
+with older spreadsheet applications. Pass `--no-escape-answer-newlines` to
+preserve multiline answers in the results CSV. The CLI prints a blank line
+after each answer and two additional blank lines after each model row.
+
+---
+
 ## Option 1: PyPI Package
 
 Install the MCP server as a Python package and connect it to Claude Code, Claude Desktop, or any MCP-compatible client.
@@ -171,37 +288,6 @@ A standalone CLI agent that uses the MCP tools directly:
 ```
 
 Requires `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `OLLAMA_BASE_URL` in your `.env`.
-
-### WebGUI-equivalent chat CLI
-
-The chatbot image also provides an interactive CLI that uses the same provider
-backends, prompt/context handling, MCP tools, and conversation runtime as the
-WebGUI. From the `production` directory, run:
-
-```bash
-docker exec -it production-citydb-agent-1 3dcitydb-chat chat
-```
-
-Choose a provider and model explicitly when desired. For example:
-
-```bash
-docker exec -it production-citydb-agent-1 3dcitydb-chat chat \
-  --provider ollama --model qwen3.8:27b \
-  --temperature 0.1 --thinking high --prompt-mode auto --num-ctx 131072
-```
-
-Available options also include `--base-url`, `--keep-story` /
-`--no-keep-story`, `--include-reasoning`, and `--show-reasoning`. By default,
-provider reasoning is not displayed; `--show-reasoning` adds a clearly labeled
-reasoning/activity section on stderr. Use `/new` to clear conversation history
-and `/bye` or `/exit` to leave the session. Prompt assembly reports each
-database-context step and its duration on stdout. Status and context-size
-estimates also go to stdout. INFO logs and generation/tool diagnostics between
-submitting a question and receiving its answer go to stderr. Pass
-`--quiet-stderr` to suppress stderr output, including INFO logs. The CLI uses
-the running container's environment and database configuration. The same
-command works with the BYOD Compose file by substituting
-`docker-compose.byod.yml`.
 
 ---
 

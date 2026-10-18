@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 load_dotenv(override=False)
 
-from webui.chat_runtime import (
+from webui.chat_runtime import (  # noqa: E402
     ChatTurnSettings,
     build_reasoning_transcript,
     build_tool_cache,
@@ -29,11 +29,14 @@ from webui.chat_runtime import (
     prepare_chat_turn,
     resolve_compact,
     stream_chat_turn,
-    summarize_story_openai,
     summarize_story_ollama,
+    summarize_story_openai,
 )
-from webui.llm_utils import default_model, detect_default_provider
-from webui.mcp_client import assemble_system_prompt_sync, run_tool_sync
+from webui.llm_utils import default_model, detect_default_provider  # noqa: E402
+from webui.mcp_client import (  # noqa: E402
+    assemble_system_prompt_sync,
+    run_tool_sync,
+)
 
 _CTX_CHOICES = (8192, 32768, 65536, 131072, 262144)
 _SELF_STORY = re.compile(
@@ -83,7 +86,7 @@ def _assemble_prompt_with_progress(
 
     def drain_progress() -> None:
         nonlocal offset, remainder, step_count
-        with open(progress_path, "r", encoding="utf-8") as stream:
+        with open(progress_path, encoding="utf-8") as stream:
             stream.seek(offset)
             chunk = stream.read()
             offset = stream.tell()
@@ -219,6 +222,10 @@ class ChatConsole:
     reasoning_history: list[str | None] = field(default_factory=list)
     story_history: list[str | None] = field(default_factory=list)
     tool_cache: dict | None = None
+    last_context_tokens: int | None = None
+    last_context_limit: int | None = None
+    last_trimmed_turns: int | None = None
+    last_elapsed_seconds: float = 0.0
 
     def reset(self) -> None:
         self.history.clear()
@@ -228,6 +235,10 @@ class ChatConsole:
 
     def answer(self, question: str) -> str:
         """Run one turn and return only the cleaned final answer."""
+        self.last_context_tokens = None
+        self.last_context_limit = None
+        self.last_trimmed_turns = None
+        self.last_elapsed_seconds = 0.0
         notes = (
             [format_tool_cache_note(self.tool_cache)]
             if cache_is_fresh(self.tool_cache)
@@ -246,6 +257,9 @@ class ChatConsole:
                 leading_system_notes=notes,
             )
         limit = prepared.context_limit
+        self.last_context_tokens = prepared.estimated_tokens
+        self.last_context_limit = limit
+        self.last_trimmed_turns = prepared.dropped_messages
         percentage = prepared.estimated_tokens / limit * 100 if limit else 0
         print(
             f"Context estimate: {prepared.estimated_tokens:,} / {limit:,} tokens "
@@ -262,31 +276,35 @@ class ChatConsole:
         events: list[tuple[str, object]] = []
         answer_parts: list[str] = []
         pending_sql = ""
+        started = time.monotonic()
         with redirect_stdout(self.stderr):
-            for event, data in stream_chat_turn(
-                self.settings,
-                prepared.messages,
-                tool_executor=lambda sql: run_tool_sync(
-                    "run_query",
-                    {"sql": sql},
-                    stderr=self.stderr,
-                ),
-            ):
-                events.append((event, data))
-                if event == "tool_call":
-                    pending_sql = data.get("args", {}).get("sql", "")
-                elif event == "tool_result" and not data.get("error"):
-                    cached = build_tool_cache(
-                        pending_sql,
-                        data.get("all_rows") or data.get("preview_rows") or [],
-                        int(data.get("row_count") or 0),
-                    )
-                    if cached:
-                        self.tool_cache = cached
-                elif event == "final":
-                    answer_parts.append(str(data))
-                elif event == "stopped":
-                    raise RuntimeError("The backend stopped generation before answering.")
+            try:
+                for event, data in stream_chat_turn(
+                    self.settings,
+                    prepared.messages,
+                    tool_executor=lambda sql: run_tool_sync(
+                        "run_query",
+                        {"sql": sql},
+                        stderr=self.stderr,
+                    ),
+                ):
+                    events.append((event, data))
+                    if event == "tool_call":
+                        pending_sql = data.get("args", {}).get("sql", "")
+                    elif event == "tool_result" and not data.get("error"):
+                        cached = build_tool_cache(
+                            pending_sql,
+                            data.get("all_rows") or data.get("preview_rows") or [],
+                            int(data.get("row_count") or 0),
+                        )
+                        if cached:
+                            self.tool_cache = cached
+                    elif event == "final":
+                        answer_parts.append(str(data))
+                    elif event == "stopped":
+                        raise RuntimeError("The backend stopped generation before answering.")
+            finally:
+                self.last_elapsed_seconds = time.monotonic() - started
 
         if not answer_parts:
             raise RuntimeError("The backend finished without producing a final answer.")
@@ -337,7 +355,7 @@ class ChatConsole:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="3dcitydb-chat",
-        description="Chat with the 3DCityDB assistant using the WebGUI's chat runtime.",
+        description="Chat with or benchmark the 3DCityDB assistant using the WebGUI's chat runtime.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     chat = subparsers.add_parser("chat", help="start an interactive chat session")
@@ -390,6 +408,81 @@ def _build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--question",
         help="answer one question and exit; otherwise read stdin or run interactively",
+    )
+
+    benchmark = subparsers.add_parser(
+        "benchmark",
+        help="run CSV-defined questions against one or more model configurations",
+    )
+    benchmark.add_argument("--models-csv", required=True, help="model matrix CSV path")
+    benchmark.add_argument("--queries-csv", required=True, help="question and ground-truth CSV path")
+    benchmark.add_argument("--dataset", required=True, help="exact citygml_dataset label to select")
+    benchmark.add_argument(
+        "--repetitions",
+        type=int,
+        default=1,
+        help="number of independent repetitions (default: 1)",
+    )
+    benchmark.add_argument(
+        "--output",
+        required=True,
+        help="results CSV path; results append and flush after each query turn",
+    )
+    benchmark.add_argument(
+        "--base-url",
+        help="run-wide endpoint override for OpenAI-compatible or Ollama model rows",
+    )
+    benchmark.add_argument(
+        "--temperature",
+        type=float,
+        help="run-wide sampling temperature; overrides models.csv when provided",
+    )
+    benchmark.add_argument(
+        "--thinking",
+        choices=("off", "low", "medium", "high", "max"),
+        default=None,
+        help="run-wide thinking level; overrides models.csv when provided (default: off)",
+    )
+    benchmark.add_argument(
+        "--prompt-mode",
+        choices=("auto", "compact", "full"),
+        default=None,
+        help="run-wide prompt size policy; overrides models.csv when provided (default: auto)",
+    )
+    benchmark.add_argument(
+        "--num-ctx",
+        type=int,
+        choices=_CTX_CHOICES,
+        help="Ollama context limit; defaults to the WebGUI's 131072",
+    )
+    benchmark.add_argument(
+        "--keep-story",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="retain distilled summaries between grouped turns (default: enabled)",
+    )
+    benchmark.add_argument(
+        "--include-reasoning",
+        action="store_true",
+        help="replay prior turns' provider reasoning within grouped conversations",
+    )
+    benchmark.add_argument(
+        "--escape-answer-newlines",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "replace answer line breaks with literal \\n in the results CSV "
+            "(default: enabled; use --no-escape-answer-newlines to disable)"
+        ),
+    )
+    benchmark.add_argument(
+        "--env-file",
+        help="optional dotenv file overriding CITYDB_* settings for this benchmark",
+    )
+    benchmark.add_argument(
+        "--quiet-stderr",
+        action="store_true",
+        help="suppress stderr output, including INFO logs and backend diagnostics",
     )
     return parser
 
@@ -551,6 +644,14 @@ def main(argv: list[str] | None = None) -> int:
         logging.disable(logging.CRITICAL)
     try:
         with redirect_stderr(stderr):
+            if args.command == "benchmark":
+                from webui.benchmark import run_benchmark
+
+                return run_benchmark(
+                    args,
+                    stdout=sys.stdout,
+                    stderr=stderr,
+                )
             return run_chat(
                 args,
                 stdin=sys.stdin,
