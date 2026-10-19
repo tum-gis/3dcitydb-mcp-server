@@ -171,6 +171,57 @@ with older spreadsheet applications. Pass `--no-escape-answer-newlines` to
 preserve multiline answers in the results CSV. The CLI prints a blank line
 after each answer and two additional blank lines after each model row.
 
+### Human grading of benchmark answers
+
+After a benchmark run, open its results CSV in the standalone local grading
+application. From the `production` directory in a source checkout, run:
+
+```powershell
+python -m webui.grade --results-csv .\data\benchmark-results.csv
+```
+
+The app opens in your browser and binds only to `127.0.0.1` (default port
+`7861`). It does not start the chatbot or connect to the database. Install the
+dependencies from `production/webui/requirements.txt` in the local Python
+environment if they are not already available. Use `--port` to select another
+local port.
+
+You can also run the grader inside the chatbot container, reusing its installed
+Python environment and Gradio dependencies. The full-stack Compose file
+publishes port `7861` on the host loopback interface only. From the repository
+root, rebuild and start the agent service after updating the image:
+
+```powershell
+docker compose -f production\docker-compose.fullstack.yml up -d --build citydb-agent
+docker exec -it production-citydb-agent-1 python -m webui.grade `
+  --results-csv /app/data/benchmark-results.csv `
+  --host 0.0.0.0
+```
+
+The `0.0.0.0` bind is inside the container; Compose limits host access to
+`127.0.0.1:7861`. Open `http://127.0.0.1:7861` in the host browser. The
+foreground grader process can be stopped with `Ctrl+C`; this leaves the
+chatbot service running.
+
+Each benchmark result is shown with the question, ground-truth answer, and
+generated answer in three Markdown-rendered columns. Drag either vertical
+separator to resize adjacent columns; the chosen widths are retained in that
+browser. The displayed metadata identifies the run, query, model row, and
+repetition. Use **Previous**, **Next**, and **Next ungraded** to navigate.
+
+Rate correctness, completeness, relevance, and clarity separately from `0` to
+`3`; the controls describe the scale for each dimension. All four ratings are
+required for a result to count as fully graded. Comments are optional. Rating
+changes and comments are saved to additional `human_*` columns in the same
+results CSV, and **Save grading** is also available. Reopen the app with the
+same CSV path to continue; saved grades are loaded from the file. Failed
+benchmark rows remain visible with their status. Complete benchmark runs
+before grading a file; do not edit the same CSV concurrently.
+
+The benchmark runner accepts both older result files and files with human
+grading columns. If it appends new rows to a graded file, it preserves existing
+grades and leaves the new rows' grading fields blank.
+
 ---
 
 ## Option 1: PyPI Package

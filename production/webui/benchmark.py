@@ -15,6 +15,11 @@ from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsp
 
 from dotenv import dotenv_values
 
+from webui.benchmark_results import (
+    RESULT_COLUMNS,
+    ResultsCsvError,
+    ensure_result_schema,
+)
 from webui.chat_runtime import ChatTurnSettings, resolve_compact
 from webui.mcp_client import assemble_system_prompt_sync
 
@@ -38,35 +43,7 @@ _QUERY_COLUMNS = {
     "group_number",
     "sequence_number",
 }
-_RESULT_COLUMNS = (
-    "run_id",
-    "query_file",
-    "query_file_sha256",
-    "query_id",
-    "citygml_dataset",
-    "question",
-    "ground_truth",
-    "category",
-    "group_number",
-    "sequence_number",
-    "conversation_id",
-    "model_row",
-    "provider",
-    "model",
-    "base_url",
-    "temperature",
-    "thinking_level",
-    "prompt_mode",
-    "num_ctx",
-    "repetition",
-    "generated_answer",
-    "status",
-    "error",
-    "elapsed_seconds",
-    "context_tokens",
-    "context_limit",
-    "context_trimmed_turns",
-)
+_RESULT_COLUMNS = RESULT_COLUMNS
 _SECRET_ENV_NAMES = re.compile(r"(?:API_KEY|TOKEN|PASSWORD|SECRET)", re.IGNORECASE)
 _URL_AUTH = re.compile(r"(?i)(https?://)[^/@\s]+@")
 _URL_SECRET_QUERY = re.compile(
@@ -533,6 +510,11 @@ def _append_results(path: str | Path):
         raise BenchmarkInputError(f"Results path is a directory: {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
     needs_header = not target.exists() or target.stat().st_size == 0
+    if not needs_header:
+        try:
+            ensure_result_schema(target)
+        except ResultsCsvError as exc:
+            raise BenchmarkInputError(str(exc)) from exc
     try:
         stream = target.open("a", encoding="utf-8", newline="")
     except OSError as exc:
