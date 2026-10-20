@@ -61,23 +61,53 @@ def _grade_row(**overrides: str) -> dict[str, str]:
 def test_saving_grade_migrates_legacy_csv_and_round_trips(tmp_path):
     path = tmp_path / "benchmark-results.csv"
     row = _result_row()
+    # The fixture answer mixes a real newline with a legacy escaped "\\n";
+    # on load the escaped sequence is normalized to a real newline, so the
+    # round-trip is compared against the normalized form.
+    normalized_row = dict(row)
+    normalized_row["generated_answer"] = row["generated_answer"].replace("\\n", "\n")
     _write_results(path, benchmark_results.BENCHMARK_RESULT_COLUMNS, [row])
 
     loaded = benchmark_results.load_result_rows(path)
     identity = benchmark_results.result_identity(loaded[0])
     benchmark_results.save_human_grade(path, identity, _grade_row())
 
-    with path.open("r", encoding="utf-8", newline="") as stream:
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         saved = next(reader)
         assert tuple(reader.fieldnames or ()) == benchmark_results.RESULT_COLUMNS
-    assert all(saved[column] == row[column] for column in row)
+    assert all(saved[column] == normalized_row[column] for column in row)
     assert all(
         saved[column] == _grade_row()[column]
         for column in benchmark_results.HUMAN_GRADING_COLUMNS
     )
     assert benchmark_results.is_human_graded(saved)
-    assert benchmark_results.load_result_rows(path)[0]["generated_answer"] == row["generated_answer"]
+    assert benchmark_results.load_result_rows(path)[0]["generated_answer"] == normalized_row["generated_answer"]
+
+
+def test_load_normalizes_legacy_escaped_newlines_only_in_text_columns(tmp_path):
+    path = tmp_path / "benchmark-results.csv"
+    # base_url intentionally contains the "\\n" substring to prove non-text
+    # columns are never touched; text columns carry the legacy escaped form.
+    row = _result_row(
+        base_url=r"https://api.example.com\newline/v1",
+        ground_truth=r"Ground truth\nline two",
+        generated_answer=r"Answer\nnext\nthird",
+    )
+    _write_results(path, benchmark_results.BENCHMARK_RESULT_COLUMNS, [row])
+
+    loaded = benchmark_results.load_result_rows(path)[0]
+    assert loaded["base_url"] == row["base_url"]
+    assert loaded["ground_truth"] == "Ground truth\nline two"
+    assert loaded["generated_answer"] == "Answer\nnext\nthird"
+
+    # Saving rewrites the normalized text and stays idempotent on reload.
+    identity = benchmark_results.result_identity(loaded)
+    benchmark_results.save_human_grade(path, identity, _grade_row())
+    reloaded = benchmark_results.load_result_rows(path)[0]
+    assert reloaded["base_url"] == row["base_url"]
+    assert reloaded["ground_truth"] == "Ground truth\nline two"
+    assert reloaded["generated_answer"] == "Answer\nnext\nthird"
 
 
 def test_saving_ground_truth_updates_query_rows_in_current_run_only(tmp_path):
@@ -162,7 +192,7 @@ def test_benchmark_append_migrates_legacy_header(tmp_path):
     rows = benchmark_results.load_result_rows(path)
     assert rows[0]["query_id"] == original["query_id"]
     assert all(not rows[0][column] for column in benchmark_results.HUMAN_GRADING_COLUMNS)
-    with path.open("r", encoding="utf-8", newline="") as stream:
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
         assert tuple(next(csv.reader(stream))) == benchmark_results.RESULT_COLUMNS
 
 

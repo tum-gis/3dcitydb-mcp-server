@@ -83,7 +83,7 @@ def test_answer_newlines_are_escaped_by_default_and_can_be_preserved(tmp_path):
             assembler=lambda **_: "prompt",
         )
 
-        with Path(args.output).open("r", encoding="utf-8", newline="") as stream:
+        with Path(args.output).open("r", encoding="utf-8-sig", newline="") as stream:
             result = next(csv.DictReader(stream))
         assert result["generated_answer"] == expected
 
@@ -351,7 +351,7 @@ def test_runner_filters_dataset_orders_groups_repeats_fresh_and_flushes(tmp_path
         assembler=fake_assemble,
     )
 
-    with output_path.open("r", encoding="utf-8", newline="") as stream:
+    with output_path.open("r", encoding="utf-8-sig", newline="") as stream:
         rows = list(csv.DictReader(stream))
     assert result == 0
     assert [row["query_id"] for row in rows] == [
@@ -425,7 +425,7 @@ def test_runner_records_failures_without_discarding_other_answers(tmp_path):
         assembler=lambda **_: "prompt",
     )
 
-    with output_path.open("r", encoding="utf-8", newline="") as stream:
+    with output_path.open("r", encoding="utf-8-sig", newline="") as stream:
         rows = list(csv.DictReader(stream))
     assert rows[0]["status"] == "completed"
     assert rows[0]["generated_answer"] == "answer:hello:prior=0"

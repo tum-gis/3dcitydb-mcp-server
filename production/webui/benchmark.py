@@ -515,14 +515,18 @@ def _append_results(path: str | Path):
             ensure_result_schema(target)
         except ResultsCsvError as exc:
             raise BenchmarkInputError(str(exc)) from exc
+    # New files are written with a UTF-8 BOM (utf-8-sig) so MS Excel detects the
+    # encoding and keeps quoted multi-line cells intact on import. Appending to an
+    # existing file must use plain utf-8, or a BOM would be inserted mid-file.
+    write_encoding = "utf-8-sig" if needs_header else "utf-8"
     try:
-        stream = target.open("a", encoding="utf-8", newline="")
+        stream = target.open("a", encoding=write_encoding, newline="")
     except OSError as exc:
         raise BenchmarkInputError(f"Could not open results CSV {target}: {exc}") from exc
     writer = csv.DictWriter(stream, fieldnames=_RESULT_COLUMNS, extrasaction="raise")
     if not needs_header:
         try:
-            with target.open("r", encoding="utf-8", newline="") as existing:
+            with target.open("r", encoding="utf-8-sig", newline="") as existing:
                 actual_header = next(csv.reader(existing), [])
         except (OSError, csv.Error) as exc:
             stream.close()

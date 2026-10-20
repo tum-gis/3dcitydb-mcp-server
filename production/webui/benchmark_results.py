@@ -61,6 +61,36 @@ _VALID_HEADERS = (
 )
 _RATING_COLUMNS = HUMAN_GRADING_COLUMNS[:-1]
 
+# Free-text columns whose line breaks are converted to real newlines on load.
+# The legacy CLI default stored answer line breaks as literal two-character
+# "\\n" sequences; the grader/ground-truth editor stored real newlines. So a
+# single file mixes both. We normalize only these text columns (never e.g.
+# ``query_file``/``base_url`` — a Windows path such as ``C:\new…`` legitimately
+# contains the "\\n" substring and must not be touched).
+_NEWLINE_TEXT_COLUMNS = (
+    "question",
+    "ground_truth",
+    "generated_answer",
+    "human_comments",
+)
+
+
+def _normalize_newlines(text: str) -> str:
+    """Convert legacy escaped line breaks into real newlines.
+
+    Turns the literal two-character sequences ``\\r\\n`` / ``\\n`` / ``\\r``
+    (as written by the legacy benchmark runner) and stray CR/LF bytes into
+    genuine ``\n`` line breaks. Text that already uses real newlines passes
+    through unchanged, so the conversion is safe to apply repeatedly.
+    """
+    if not text:
+        return text
+    return (
+        text.replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\n")
+    )
+
 
 class ResultsCsvError(ValueError):
     """An invalid or inaccessible benchmark-results CSV."""
@@ -112,7 +142,9 @@ def load_result_rows(path: str | Path) -> list[dict[str, str]]:
     """Load benchmark rows and fill blank grading fields for legacy files."""
     target = Path(path)
     try:
-        with target.open("r", encoding="utf-8", newline="") as stream:
+        # utf-8-sig transparently strips a leading BOM (the files we write carry
+        # one for MS Excel), so plain-UTF-8 and BOM-prefixed files both parse.
+        with target.open("r", encoding="utf-8-sig", newline="") as stream:
             header = _read_header(stream, target)
             rows = [
                 row
@@ -122,6 +154,16 @@ def load_result_rows(path: str | Path) -> list[dict[str, str]]:
         raise
     except (OSError, UnicodeError, csv.Error) as exc:
         raise ResultsCsvError(f"Could not read results CSV {target}: {exc}") from exc
+
+    # Convert any legacy escaped line breaks to real newlines across the whole
+    # loaded file so the grader/preview and every subsequent save see one
+    # consistent format. Idempotent: already-real newlines are untouched, and
+    # only the free-text columns are converted (paths are left alone).
+    for row in rows:
+        for column in _NEWLINE_TEXT_COLUMNS:
+            value = row.get(column)
+            if value:
+                row[column] = _normalize_newlines(value)
 
     seen: set[tuple[str, ...]] = set()
     for row in rows:
@@ -140,7 +182,9 @@ def _open_temporary_csv(target: Path):
     try:
         return tempfile.NamedTemporaryFile(
             mode="w",
-            encoding="utf-8",
+            # utf-8-sig writes a leading BOM so MS Excel detects the encoding and
+            # keeps quoted multi-line cells intact on import; reading strips it.
+            encoding="utf-8-sig",
             newline="",
             prefix=f".{target.name}.",
             suffix=".tmp",
@@ -167,7 +211,9 @@ def _atomic_write_rows(path: Path, rows: list[dict[str, str]]) -> None:
                 stream,
                 fieldnames=RESULT_COLUMNS,
                 extrasaction="raise",
-                lineterminator="\n",
+                # CRLF record terminators are the CSV default Excel expects;
+                # in-cell newlines stay real (quoted), so the web UI renders them.
+                lineterminator="\r\n",
             )
             writer.writeheader()
             for row in rows:
@@ -193,7 +239,7 @@ def ensure_result_schema(path: str | Path) -> None:
     try:
         if target.stat().st_size == 0:
             return
-        with target.open("r", encoding="utf-8", newline="") as source:
+        with target.open("r", encoding="utf-8-sig", newline="") as source:
             header = _read_header(source, target)
             if header in (RESULT_COLUMNS, BENCHMARK_RESULT_COLUMNS + LEGACY_RESULT_COLUMNS):
                 for _ in _validated_rows(source, target, header):
@@ -206,7 +252,7 @@ def ensure_result_schema(path: str | Path) -> None:
                     output,
                     fieldnames=RESULT_COLUMNS,
                     extrasaction="raise",
-                    lineterminator="\n",
+                    lineterminator="\r\n",
                 )
                 writer.writeheader()
                 for _, row in _validated_rows(source, target, header):

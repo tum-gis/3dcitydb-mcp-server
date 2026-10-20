@@ -139,8 +139,25 @@ group/query position, repetition, user query, and generated answer. Answer
 line breaks are written as literal `\n`
 sequences so each result remains on one physical CSV line for compatibility
 with older spreadsheet applications. Pass `--no-escape-answer-newlines` to
-preserve multiline answers in the results CSV. The CLI prints a blank line
-after each answer and two additional blank lines after each model row.
+preserve real line breaks in the results CSV directly. The CLI prints a blank
+line after each answer and two additional blank lines after each model row.
+
+Line-break normalization: the grading app automatically converts legacy
+escaped line breaks (literal `\n` two-character sequences) in the text
+columns — `question`, `ground_truth`, `generated_answer`, and
+`human_comments` — into real line breaks every time the results file is
+loaded. The conversion is applied as soon as the file is opened, so a file
+containing a mix of escaped and real line breaks is unified on first load and
+stays unified afterwards: any save (rating, comment, or ground-truth edit)
+persists the normalized form. Columns that are not free text (for example
+`base_url`, `query_file`) are never modified, so values that legitimately
+contain backslash sequences — such as Windows paths — are left untouched.
+
+Results CSVs are written as UTF-8 with a BOM and CRLF line endings, and any
+multi-line cell (such as a ground-truth answer containing Markdown) is wrapped
+in double quotes. This keeps the file importable by MS Excel and other
+spreadsheet tools, while the grading app renders the stored line breaks as
+normal line breaks.
 
 ## Human grading of benchmark answers
 
