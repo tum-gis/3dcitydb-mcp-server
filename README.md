@@ -56,7 +56,7 @@ There are four ways to run the 3DCityDB MCP Server (Option 3b is a 3D-viewer var
 
 ---
 
-## Chat and Benchmark CLI
+## Chat CLI
 
 The WebGUI-equivalent `3dcitydb-chat` CLI is included in the chatbot image used
 by Docker Options 2, 3, and 3b. Start one of those stacks first, then run the
@@ -100,137 +100,10 @@ estimates also go to stdout. INFO logs and generation/tool diagnostics between
 submitting a question and receiving its answer go to stderr. Pass
 `--quiet-stderr` to suppress stderr output, including INFO logs.
 
-### CSV-driven LLM benchmark
+## Benchmarking and Validation
 
-Run model configurations against the query rows for one dataset label. The
-results CSV is appended and flushed after every answer:
-
-The repository includes editable starter files in
-[`examples/benchmark/`](examples/benchmark/). The Docker Compose files mount the
-host folder `production/data` at `/app/data` in the chatbot container. From
-PowerShell while your current directory is `examples\benchmark`, copy the
-samples into that shared folder:
-
-```powershell
-Copy-Item .\models.csv ..\..\production\data\models.csv
-Copy-Item .\questions.csv ..\..\production\data\questions.csv
-```
-
-Then run the benchmark in the chatbot container:
-
-```bash
-docker exec production-citydb-agent-1 3dcitydb-chat benchmark \
-  --models-csv /app/data/models.csv \
-  --queries-csv /app/data/questions.csv \
-  --dataset demo \
-  --repetitions 3 \
-  --output /app/data/benchmark-results.csv \
-  --temperature 0.2 --thinking off --prompt-mode auto
-```
-
-For a local source checkout, run `python -m webui.cli benchmark` from the
-`production` directory and pass host paths for the input and output files. The
-example model row uses `gpt-4.1-mini`; replace it with a model name available
-from your configured provider/endpoint. The `demo` dataset value is only a
-label used to select rows in the questions CSV; it does not need to match or
-select database contents.
-
-The models file requires `provider,model`; optional columns are
-`base_url,temperature,thinking_level,prompt_mode`. When a corresponding CLI
-option is provided, it overrides the value in the models file. Otherwise,
-nonblank model-row settings are used, falling back to the CLI defaults
-(temperature unset, thinking off, and prompt mode auto). Providers are
-`openai`, `anthropic`, and `ollama`. Credentials remain in the environment and
-must not be put in CSV files.
-
-The questions file requires
-`id,question,ground_truth,citygml_dataset`. Optional columns are
-`category,group_number,sequence_number`. `--dataset` matches
-`citygml_dataset` exactly; the label selects question rows only and does not
-switch or filter the connected database. A nonblank `group_number` starts a
-multi-turn conversation whose rows are sent in ascending `sequence_number`.
-Each standalone query and each group repetition starts with fresh chat history.
-The files use standard comma-delimited CSV: put double quotes around any field
-containing a comma, and write a literal double quote inside a quoted field as
-two double quotes (`""`). Semicolons are ordinary characters with this comma
-delimiter, so they do not split a field. The sample questions demonstrate
-quoted commas and semicolons; use a CSV-aware editor rather than splitting
-question rows manually on punctuation.
-
-Use `--env-file /path/to/db.env` to override the benchmark's `CITYDB_*`
-connection settings (also accepts `POSTGRES_*` keys and `DATABASE_URL`).
-Results include input file provenance, query/model identity, generated answer,
-status/error, latency, and context metrics. Failed calls are recorded as
-failures and do not stop later cases. `--quiet-stderr` suppresses progress,
-INFO logs, and backend diagnostics without suppressing the results CSV or
-stdout summary. For each turn, stdout shows the model and its `models.csv` line,
-group/query position, repetition, user query, and generated answer. Answer
-line breaks are written as literal `\n`
-sequences so each result remains on one physical CSV line for compatibility
-with older spreadsheet applications. Pass `--no-escape-answer-newlines` to
-preserve multiline answers in the results CSV. The CLI prints a blank line
-after each answer and two additional blank lines after each model row.
-
-### Human grading of benchmark answers
-
-After a benchmark run, open its results CSV in the standalone local grading
-application. From the `production` directory in a source checkout, run:
-
-```powershell
-python -m webui.grade --results-csv .\data\benchmark-results.csv
-```
-
-The app opens in your browser and binds only to `127.0.0.1` (default port
-`7861`). It does not start the chatbot or connect to the database. Install the
-dependencies from `production/webui/requirements.txt` in the local Python
-environment if they are not already available. Use `--port` to select another
-local port.
-
-You can also run the grader inside the chatbot container, reusing its installed
-Python environment and Gradio dependencies. The full-stack Compose file
-publishes port `7861` on the host loopback interface only. From the repository
-root, rebuild and start the agent service after updating the image:
-
-```powershell
-docker compose -f production\docker-compose.fullstack.yml up -d --build citydb-agent
-docker exec -it production-citydb-agent-1 python -m webui.grade `
-  --results-csv /app/data/benchmark-results.csv `
-  --host 0.0.0.0
-```
-
-The `0.0.0.0` bind is inside the container; Compose limits host access to
-`127.0.0.1:7861`. Open `http://127.0.0.1:7861` in the host browser. The
-foreground grader process can be stopped with `Ctrl+C`; this leaves the
-chatbot service running.
-
-Each benchmark result is shown with the question, ground-truth answer, and
-generated answer in three Markdown-rendered columns. Drag either vertical
-separator to resize adjacent columns; the chosen widths are retained in that
-browser. The displayed metadata identifies the run, query, model row, and
-repetition. Use **Previous**, **Next**, and **Next ungraded** to navigate.
-
-The Ground Truth column remains Markdown-rendered by default. Select the pen
-icon beside its heading to edit the raw Markdown source and see a live preview,
-then choose **Save Ground Truth** or **Cancel** before navigating. Saving
-updates the `ground_truth` value for all model and repetition rows for that
-query in the current run, while preserving other runs and existing human
-grades.
-
-Use the clipboard icon beside **Generated Answer** to copy its original
-Markdown source, which can then be pasted into the Ground Truth editor.
-
-Rate correctness, completeness, relevance, and clarity separately from `0` to
-`3`; the controls describe the scale for each dimension. All four ratings are
-required for a result to count as fully graded. Comments are optional. Rating
-changes and comments are saved to additional `human_*` columns in the same
-results CSV, and **Save grading** is also available. Reopen the app with the
-same CSV path to continue; saved grades are loaded from the file. Failed
-benchmark rows remain visible with their status. Complete benchmark runs
-before grading a file; do not edit the same CSV concurrently.
-
-The benchmark runner accepts both older result files and files with human
-grading columns. If it appends new rows to a graded file, it preserves existing
-grades and leaves the new rows' grading fields blank.
+Work on support for systematic result quality validation and benchmarking is work in progress. Documentation and usage of the already existing tools are documented
+in [`docs/benchmarking.md`](production/docs/benchmarking.md).
 
 ---
 
