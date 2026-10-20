@@ -25,3 +25,4 @@ production/data/*.xml
 production/data/*.zip
 production/data/*.json
 production/data/*.citygml
+production/data/*.csv

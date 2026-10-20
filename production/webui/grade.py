@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from webui.benchmark_results import (
     is_human_graded,
     load_result_rows,
     result_identity,
+    save_ground_truth,
     save_human_grade,
 )
 
@@ -94,6 +96,29 @@ async (_win, _event_data) => {
       row.appendChild(handle);
       handles.push(handle);
     }
+
+    function labelEditGroundTruthButton() {
+      var editGroundTruthButton = document.getElementById("edit-ground-truth-button");
+      if (editGroundTruthButton) {
+        editGroundTruthButton.setAttribute("aria-label", "Edit Ground Truth");
+        editGroundTruthButton.setAttribute("title", "Edit Ground Truth");
+      }
+      var copyGeneratedAnswerButton = document.getElementById(
+        "copy-generated-answer-button"
+      );
+      if (copyGeneratedAnswerButton) {
+        var copyDescription =
+          "Copies the original Markdown text displayed below to the clipboard. " +
+          "You can paste it into the Ground Truth Answer editing window.";
+        copyGeneratedAnswerButton.setAttribute("aria-label", copyDescription);
+        copyGeneratedAnswerButton.setAttribute("title", copyDescription);
+      }
+    }
+    labelEditGroundTruthButton();
+    new MutationObserver(labelEditGroundTruthButton).observe(document.body, {
+      childList: true,
+      subtree: true
+    });
 
     var widths = columns.map(function (column) {
       return column.getBoundingClientRect().width;
@@ -216,6 +241,48 @@ async (_win, _event_data) => {
 }
 """
 
+_BLOCK_CSS = """
+        .gradio-container, .contain { max-width: 100% !important; }
+        #grading-columns { position: relative !important; display: flex !important;
+          flex-wrap: nowrap !important; gap: 12px !important; align-items: stretch !important; }
+        #grading-columns > .column { min-width: 150px !important; overflow-wrap: anywhere; }
+        .ground-truth-heading-row {
+          align-items: center !important; flex-wrap: nowrap !important;
+          justify-content: space-between !important; gap: 4px !important;
+        }
+        .generated-answer-heading-row {
+          align-items: center !important; flex-wrap: nowrap !important;
+          justify-content: space-between !important; gap: 4px !important;
+        }
+        .ground-truth-heading-row > div:first-child {
+          flex: 1 1 0% !important; min-width: 0 !important; width: 0 !important;
+        }
+        .generated-answer-heading-row > div:first-child {
+          flex: 1 1 0% !important; min-width: 0 !important; width: 0 !important;
+        }
+        #edit-ground-truth-button, #copy-generated-answer-button {
+          flex: 0 0 32px !important; margin-left: auto !important;
+          min-width: 32px !important; width: 32px !important; height: 32px !important;
+          padding: 0 !important; border: 0 !important; background: transparent !important;
+          color: #64748b !important; font-size: 20px !important;
+        }
+        #edit-ground-truth-button:hover, #edit-ground-truth-button:focus-visible,
+        #copy-generated-answer-button:hover, #copy-generated-answer-button:focus-visible {
+          background: #f1f5f9 !important; color: #2563eb !important;
+        }
+        .grading-splitter { position: absolute; top: 0; bottom: 0; z-index: 10;
+          width: 12px; margin-left: -6px; cursor: col-resize; touch-action: none;
+          display: flex; justify-content: center; }
+        .grading-splitter::before { content: ""; width: 2px; height: 100%;
+          background: #94a3b8; border-radius: 2px; }
+        .grading-splitter:hover::before, .grading-splitter.active::before,
+        .grading-splitter:focus-visible::before { width: 4px; background: #2563eb; }
+        body.grading-resizing { cursor: col-resize !important; user-select: none !important; }
+        @media (max-width: 760px) {
+          #grading-columns { overflow-x: auto !important; }
+        }
+        """
+
 
 def _display_answer(text: str) -> str:
     """Render the benchmark's default escaped answer newlines as Markdown lines."""
@@ -246,6 +313,21 @@ def _next_ungraded_index(rows: list[dict[str, str]], index: int) -> int | None:
     )
 
 
+def _load_result_by_identity(
+    path: Path,
+    identity: tuple[str, ...],
+) -> tuple[list[dict[str, str]], int]:
+    rows = load_result_rows(path)
+    matching_indices = [
+        index for index, row in enumerate(rows) if result_identity(row) == identity
+    ]
+    if len(matching_indices) != 1:
+        raise ResultsCsvError(
+            "The selected result row is no longer present exactly once in the CSV."
+        )
+    return rows, matching_indices[0]
+
+
 def build_ui(results_csv: str | Path) -> gr.Blocks:
     """Build the independent human-grading application."""
     path = Path(results_csv).expanduser().resolve()
@@ -263,7 +345,10 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
         return (
             row.get("question", "") or "_(empty)_",
             row.get("ground_truth", "") or "_(empty)_",
+            row.get("ground_truth", ""),
+            row.get("ground_truth", "") or "_(empty)_",
             _display_answer(row.get("generated_answer", "")) or "_(empty)_",
+            _display_answer(row.get("generated_answer", "")),
             _row_markdown(row, index, len(current_rows), graded_count),
             *_grade_values(row),
             index,
@@ -275,7 +360,10 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
     (
         initial_question,
         initial_truth,
+        initial_ground_truth_source,
+        initial_ground_truth_preview,
         initial_answer,
+        initial_answer_source,
         initial_metadata,
         initial_correctness,
         initial_completeness,
@@ -304,17 +392,75 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
             "human_comments": comments or "",
         }
         save_human_grade(path, identity, grade)
-        current_rows = load_result_rows(path)
-        current_index = next(
-            row_index
-            for row_index, row in enumerate(current_rows)
-            if result_identity(row) == identity
-        )
+        current_rows, current_index = _load_result_by_identity(path, identity)
         graded_count = sum(is_human_graded(row) for row in current_rows)
         return (
             _row_markdown(current_rows[current_index], current_index, len(current_rows), graded_count),
             f"Saved grading for result {index + 1}.",
         )
+
+    def begin_ground_truth_edit(
+        identity: tuple[str, ...],
+    ) -> tuple[Any, ...]:
+        current_rows, current_index = _load_result_by_identity(path, identity)
+        source = current_rows[current_index].get("ground_truth", "")
+        return (
+            gr.update(visible=False),
+            source,
+            source or "_(empty)_",
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(visible=True),
+            gr.update(visible=True),
+            gr.update(interactive=False),
+            gr.update(interactive=False),
+            gr.update(interactive=False),
+            "Edit the raw Markdown source, then save or cancel before navigating.",
+        )
+
+    def save_ground_truth_edit(
+        source: str,
+        identity: tuple[str, ...],
+    ) -> tuple[Any, ...]:
+        updated_count = save_ground_truth(path, identity, source)
+        current_rows, current_index = _load_result_by_identity(path, identity)
+        return (
+            gr.update(
+                value=current_rows[current_index].get("ground_truth", "") or "_(empty)_",
+                visible=True,
+            ),
+            gr.update(visible=False),
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(interactive=True),
+            gr.update(interactive=True),
+            gr.update(interactive=True),
+            f"Saved Ground Truth for this query in {updated_count} result row(s) "
+            "in the current run.",
+        )
+
+    def cancel_ground_truth_edit(
+        identity: tuple[str, ...],
+    ) -> tuple[Any, ...]:
+        current_rows, current_index = _load_result_by_identity(path, identity)
+        source = current_rows[current_index].get("ground_truth", "")
+        return (
+            gr.update(value=source or "_(empty)_", visible=True),
+            source,
+            source or "_(empty)_",
+            gr.update(visible=False),
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(interactive=True),
+            gr.update(interactive=True),
+            gr.update(interactive=True),
+            "Discarded unsaved Ground Truth edits.",
+        )
+
+    def preview_ground_truth(source: str) -> str:
+        return source or "_(empty)_"
 
     def move_to(
         action: str,
@@ -356,33 +502,30 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
         rendered = render(target)
         return (*rendered[:-1], f"{saved_message} {rendered[-1]}")
 
-    with gr.Blocks(
-        title="Benchmark Answer Grader",
-        theme=gr.themes.Soft(
-            primary_hue="slate",
-            font=[gr.themes.GoogleFont("Open Sans"), "ui-sans-serif", "sans-serif"],
-            font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "ui-monospace", "monospace"],
-        ),
-        fill_width=True,
-        js=_RESIZE_JS,
-        css="""
-        .gradio-container, .contain { max-width: 100% !important; }
-        #grading-columns { position: relative !important; display: flex !important;
-          flex-wrap: nowrap !important; gap: 12px !important; align-items: stretch !important; }
-        #grading-columns > .column { min-width: 150px !important; overflow-wrap: anywhere; }
-        .grading-splitter { position: absolute; top: 0; bottom: 0; z-index: 10;
-          width: 12px; margin-left: -6px; cursor: col-resize; touch-action: none;
-          display: flex; justify-content: center; }
-        .grading-splitter::before { content: ""; width: 2px; height: 100%;
-          background: #94a3b8; border-radius: 2px; }
-        .grading-splitter:hover::before, .grading-splitter.active::before,
-        .grading-splitter:focus-visible::before { width: 4px; background: #2563eb; }
-        body.grading-resizing { cursor: col-resize !important; user-select: none !important; }
-        @media (max-width: 760px) {
-          #grading-columns { overflow-x: auto !important; }
-        }
-        """,
-    ) as demo:
+    # Gradio 5.x accepts theme/css/js only in the Blocks constructor, but emits a
+    # DeprecationWarning for each, pointing at Blocks.launch() — which only accepts
+    # them from Gradio 6.0 onward (outside the pinned >=5,<6 range). Suppress the
+    # resulting warnings locally; the parameters are fully functional on 5.x.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        demo = gr.Blocks(
+            title="Benchmark Answer Grader",
+            theme=gr.themes.Soft(
+                primary_hue="slate",
+                font=(
+                    "Fira Code",
+                    "ui-monospace",
+                    "SFMono-Regular",
+                    "Menlo",
+                    "Consolas",
+                    "monospace",
+                ),
+            ),
+            css=_BLOCK_CSS,
+            js=_RESIZE_JS,
+            fill_width=True,
+        )
+    with demo:
         gr.Markdown("# Human grading for benchmark answers")
         gr.Textbox(
             label="Benchmark results CSV",
@@ -392,16 +535,57 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
         metadata = gr.Markdown(value=initial_metadata)
         index_state = gr.State(initial_index)
         identity_state = gr.State(initial_identity)
+        generated_answer_source = gr.Textbox(
+            value=initial_answer_source,
+            visible=False,
+            show_label=False,
+        )
 
         with gr.Row(elem_id="grading-columns"):
             with gr.Column(scale=1, min_width=150):
                 gr.Markdown("### Question")
                 question_view = gr.Markdown(value=initial_question)
             with gr.Column(scale=1, min_width=150):
-                gr.Markdown("### Ground Truth Answer")
+                with gr.Row(elem_classes="ground-truth-heading-row"):
+                    gr.Markdown("### Ground Truth Answer")
+                    edit_ground_truth_button = gr.Button(
+                        "✎",
+                        size="sm",
+                        min_width=32,
+                        elem_id="edit-ground-truth-button",
+                    )
                 truth_view = gr.Markdown(value=initial_truth)
+                with gr.Column(visible=False) as ground_truth_editor:
+                    gr.Markdown("Edit the raw Markdown source. The preview updates as you type.")
+                    ground_truth_source = gr.Textbox(
+                        label="Ground Truth Markdown source",
+                        lines=10,
+                        max_lines=24,
+                        value=initial_ground_truth_source,
+                    )
+                    ground_truth_preview = gr.Markdown(
+                        value=initial_ground_truth_preview,
+                        label="Markdown preview",
+                    )
+                    with gr.Row():
+                        save_ground_truth_button = gr.Button(
+                            "Save Ground Truth",
+                            variant="primary",
+                            visible=False,
+                        )
+                        cancel_ground_truth_button = gr.Button(
+                            "Cancel",
+                            visible=False,
+                        )
             with gr.Column(scale=1, min_width=150):
-                gr.Markdown("### Generated Answer")
+                with gr.Row(elem_classes="generated-answer-heading-row"):
+                    gr.Markdown("### Generated Answer")
+                    copy_generated_answer_button = gr.Button(
+                        "📋",
+                        size="sm",
+                        min_width=32,
+                        elem_id="copy-generated-answer-button",
+                    )
                 answer_view = gr.Markdown(value=initial_answer)
         with gr.Row():
             correctness = gr.Radio(
@@ -438,6 +622,72 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
             next_ungraded = gr.Button("Next ungraded")
         save_status = gr.Markdown(value=initial_status)
 
+        edit_ground_truth_button.click(
+            fn=begin_ground_truth_edit,
+            inputs=[identity_state],
+            outputs=[
+                truth_view,
+                ground_truth_source,
+                ground_truth_preview,
+                ground_truth_editor,
+                edit_ground_truth_button,
+                save_ground_truth_button,
+                cancel_ground_truth_button,
+                previous,
+                next_button,
+                next_ungraded,
+                save_status,
+            ],
+        )
+        ground_truth_source.input(
+            fn=preview_ground_truth,
+            inputs=[ground_truth_source],
+            outputs=[ground_truth_preview],
+        )
+        copy_generated_answer_button.click(
+            fn=lambda answer: (
+                f"Copied {len(answer)} characters of original Markdown to the clipboard."
+            ),
+            inputs=[generated_answer_source],
+            outputs=[save_status],
+            js="""async (answer) => {
+              await navigator.clipboard.writeText(answer);
+              return answer;
+            }""",
+        )
+        save_ground_truth_button.click(
+            fn=save_ground_truth_edit,
+            inputs=[ground_truth_source, identity_state],
+            outputs=[
+                truth_view,
+                ground_truth_editor,
+                edit_ground_truth_button,
+                save_ground_truth_button,
+                cancel_ground_truth_button,
+                previous,
+                next_button,
+                next_ungraded,
+                save_status,
+            ],
+        )
+        cancel_ground_truth_button.click(
+            fn=cancel_ground_truth_edit,
+            inputs=[identity_state],
+            outputs=[
+                truth_view,
+                ground_truth_source,
+                ground_truth_preview,
+                ground_truth_editor,
+                edit_ground_truth_button,
+                save_ground_truth_button,
+                cancel_ground_truth_button,
+                previous,
+                next_button,
+                next_ungraded,
+                save_status,
+            ],
+        )
+
         controls = [correctness, completeness, relevance, clarity, comments]
         save_inputs = [*controls, index_state, identity_state]
         save_button.click(
@@ -453,7 +703,10 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
         display_outputs = [
             question_view,
             truth_view,
+            ground_truth_source,
+            ground_truth_preview,
             answer_view,
+            generated_answer_source,
             metadata,
             correctness,
             completeness,

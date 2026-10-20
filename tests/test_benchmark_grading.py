@@ -79,6 +79,46 @@ def test_saving_grade_migrates_legacy_csv_and_round_trips(tmp_path):
     assert benchmark_results.load_result_rows(path)[0]["generated_answer"] == row["generated_answer"]
 
 
+def test_saving_ground_truth_updates_query_rows_in_current_run_only(tmp_path):
+    path = tmp_path / "benchmark-results.csv"
+    original = _result_row()
+    same_query_other_model = _result_row(model_row="3", model="model-b")
+    same_query_other_repetition = _result_row(model_row="3", model="model-b", repetition="2")
+    other_query = _result_row(query_id="q2", question="Which building is shortest?")
+    earlier_run = _result_row(run_id="run-0", model_row="3", model="model-b")
+    same_query_other_model.update(_grade_row())
+    _write_results(
+        path,
+        benchmark_results.RESULT_COLUMNS,
+        [
+            original,
+            same_query_other_model,
+            same_query_other_repetition,
+            other_query,
+            earlier_run,
+        ],
+    )
+
+    identity = benchmark_results.result_identity(
+        benchmark_results.load_result_rows(path)[0]
+    )
+    updated_count = benchmark_results.save_ground_truth(
+        path,
+        identity,
+        "**Building B** is tallest at 25 m.",
+    )
+
+    rows = benchmark_results.load_result_rows(path)
+    assert updated_count == 3
+    assert [rows[index]["ground_truth"] for index in range(3)] == [
+        "**Building B** is tallest at 25 m."
+    ] * 3
+    assert rows[1]["human_correctness"] == "3"
+    assert rows[1]["human_comments"] == _grade_row()["human_comments"]
+    assert rows[3]["ground_truth"] == other_query["ground_truth"]
+    assert rows[4]["ground_truth"] == earlier_run["ground_truth"]
+
+
 def test_benchmark_append_preserves_grades_and_blanks_new_rows(tmp_path):
     path = tmp_path / "benchmark-results.csv"
     original = _result_row()
@@ -192,17 +232,79 @@ def test_local_grading_ui_builds_markdown_columns_and_rubric(tmp_path):
         str(component.get("props", {}).get("value", ""))
         for component in config["components"]
     ]
+    button_values = {
+        component.get("props", {}).get("value")
+        for component in config["components"]
+    }
+    edit_button = next(
+        component
+        for component in config["components"]
+        if component.get("props", {}).get("elem_id") == "edit-ground-truth-button"
+    )
+    copy_button = next(
+        component
+        for component in config["components"]
+        if component.get("props", {}).get("elem_id") == "copy-generated-answer-button"
+    )
 
     assert any("Question" in value for value in markdown_values)
     assert any("Ground Truth Answer" in value for value in markdown_values)
     assert any("Generated Answer" in value for value in markdown_values)
+    assert edit_button["props"]["value"] == "✎"
+    assert copy_button["props"]["value"] == "📋"
+    assert (
+        "Copies the original Markdown text displayed below to the clipboard."
+        in grade._RESIZE_JS
+    )
+    assert "Ground Truth Answer editing window." in grade._RESIZE_JS
     assert {
+        "Save Ground Truth",
+        "Cancel",
+    } <= button_values
+    assert 'setAttribute("aria-label", "Edit Ground Truth")' in grade._RESIZE_JS
+    assert "new MutationObserver(labelEditGroundTruthButton)" in grade._RESIZE_JS
+    copy_dependency = next(
+        dependency
+        for dependency in config["dependencies"]
+        if (copy_button["id"], "click") in dependency["targets"]
+    )
+    assert "navigator.clipboard.writeText(answer)" in copy_dependency["js"]
+    assert copy_dependency["inputs"]
+    answer_source_id = copy_dependency["inputs"][0]
+    answer_source = next(
+        component
+        for component in config["components"]
+        if component["id"] == answer_source_id
+    )
+    assert answer_source["type"] == "textbox"
+    assert answer_source["props"]["visible"] is False
+    assert answer_source["props"]["value"] == grade._display_answer(
+        row["generated_answer"]
+    )
+    assert any(
+        answer_source_id in dependency["outputs"]
+        and any(
+            target[1] == "click"
+            for target in dependency["targets"]
+        )
+        for dependency in config["dependencies"]
+    )
+    assert {
+        "Ground Truth Markdown source",
         "Correctness",
         "Completeness",
         "Relevance",
         "Clarity",
         "Comments",
     } <= labels
+    assert any(
+        component.get("props", {}).get("label") == "Markdown preview"
+        for component in config["components"]
+    )
+    assert any(
+        component.get("props", {}).get("value") == row["ground_truth"]
+        for component in config["components"]
+    )
     assert config["dependencies"]
     assert grade._build_parser().parse_args(["--results-csv", str(path)]).host == "127.0.0.1"
 

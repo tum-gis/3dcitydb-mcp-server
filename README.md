@@ -209,6 +209,16 @@ separator to resize adjacent columns; the chosen widths are retained in that
 browser. The displayed metadata identifies the run, query, model row, and
 repetition. Use **Previous**, **Next**, and **Next ungraded** to navigate.
 
+The Ground Truth column remains Markdown-rendered by default. Select the pen
+icon beside its heading to edit the raw Markdown source and see a live preview,
+then choose **Save Ground Truth** or **Cancel** before navigating. Saving
+updates the `ground_truth` value for all model and repetition rows for that
+query in the current run, while preserving other runs and existing human
+grades.
+
+Use the clipboard icon beside **Generated Answer** to copy its original
+Markdown source, which can then be pasted into the Ground Truth editor.
+
 Rate correctness, completeness, relevance, and clarity separately from `0` to
 `3`; the controls describe the scale for each dimension. All four ratings are
 required for a result to count as fully graded. Comments are optional. Rating

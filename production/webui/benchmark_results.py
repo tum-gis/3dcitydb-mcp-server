@@ -238,6 +238,30 @@ def save_human_grade(
     _atomic_write_rows(target, rows)
 
 
+def save_ground_truth(
+    path: str | Path,
+    identity: tuple[str, ...],
+    ground_truth: str,
+) -> int:
+    """Update a query's reference answer across its model and repetition rows."""
+    target = Path(path)
+    rows = load_result_rows(target)
+    selected_rows = [row for row in rows if result_identity(row) == identity]
+    if len(selected_rows) != 1:
+        raise ResultsCsvError(
+            "The selected result row is no longer present exactly once in the CSV."
+        )
+
+    query_identity = identity[:3]
+    matching_rows = [
+        row for row in rows if result_identity(row)[:3] == query_identity
+    ]
+    for row in matching_rows:
+        row["ground_truth"] = ground_truth
+    _atomic_write_rows(target, rows)
+    return len(matching_rows)
+
+
 def is_human_graded(row: dict[str, str]) -> bool:
     """Whether all four rating dimensions have been scored."""
     return all(row.get(column, "") in {"0", "1", "2", "3"} for column in _RATING_COLUMNS)
