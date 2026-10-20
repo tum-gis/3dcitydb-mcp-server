@@ -30,7 +30,7 @@ It is important to note that a simple correct/incorrect label is not sufficient
 to judge answer quality. An answer may be partly right, well structured but
 incomplete, or correct but poorly focused. For this reason, we do not ask for a
 single pass/fail verdict. Instead, a human grades each answer separately along
-**four categories**, each scored independently from `0` to `3`:
+**five categories**, each scored independently from `0` to `3`:
 
 - **Correctness** — how accurately the answer reflects the facts in the database
   and matches the ground-truth content.
@@ -40,6 +40,21 @@ single pass/fail verdict. Instead, a human grades each answer separately along
   into unrelated material.
 - **Clarity** — how clearly and understandably the answer is expressed and
   structured.
+- **Language conformity to the query** — whether the answer is written in the
+  same language as the user query and whether the database content it lists is
+  translated into that language. Most LLMs are multilingual, but they sometimes
+  fail to answer in the language the user used. In addition, CityGML datasets
+  come from many different countries, so attribute values are localized per
+  dataset: in an English dataset, residential buildings carry
+  `function=residential`, while the same building in a Japanese or German
+  dataset carries the localized value. If a user asks for a list of buildings
+  together with their usage types, the answer should not only list the foreign
+  attribute values, but also translate them into the language of the query.
+  Scale: `0` — the answer is completely in a different language than the query;
+  `1` — the answer is mostly in a different language; `2` — the answer is in the
+  same language as the query, but attributes and data items were not translated;
+  `3` — everything is provided in the correct translation according to the user
+  query.
 
 Running these evaluations is intended to be fully automated across many models.
 You can run all queries for all test datasets against different LLMs and
@@ -182,9 +197,9 @@ column, and edit them manually to strip unnecessary text and explanations.
 Finally, use a text editor or a spreadsheet tool such as Excel to copy the
 ground-truth answers back into the original `questions.csv` file.
 
-Rate correctness, completeness, relevance, and clarity separately from `0` to
-`3`; the controls describe the scale for each dimension. All four ratings are
-required for a result to count as fully graded. Comments are optional. Rating
+Rate correctness, completeness, relevance, clarity, and language conformity
+separately from `0` to `3`; the controls describe the scale for each dimension.
+All five ratings are required for a result to count as fully graded. Comments are optional. Rating
 changes and comments are saved to additional `human_*` columns in the same
 results CSV, and **Save grading** is also available. Reopen the app with the
 same CSV path to continue; saved grades are loaded from the file. Failed

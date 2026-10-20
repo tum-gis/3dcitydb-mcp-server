@@ -46,6 +46,12 @@ _RATING_CHOICES_BY_FIELD = {
         ("2 — understandable", "2"),
         ("3 — clear and well organized", "3"),
     ],
+    "human_language_conformity": _RATING_CHOICES + [
+        ("0 — answer is completely in a different language than the query", "0"),
+        ("1 — answer is mostly in a different language than the query", "1"),
+        ("2 — same language, but attributes and data items were not translated", "2"),
+        ("3 — everything is provided in the correct translation", "3"),
+    ],
 }
 _RESIZE_JS = """
 async (_win, _event_data) => {
@@ -369,6 +375,7 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
         initial_completeness,
         initial_relevance,
         initial_clarity,
+        initial_language_conformity,
         initial_comments,
         initial_index,
         initial_identity,
@@ -380,6 +387,7 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
         completeness: str,
         relevance: str,
         clarity: str,
+        language: str,
         comments: str,
         index: int,
         identity: tuple[str, ...],
@@ -389,6 +397,7 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
             "human_completeness": completeness or "",
             "human_relevance": relevance or "",
             "human_clarity": clarity or "",
+            "human_language_conformity": language or "",
             "human_comments": comments or "",
         }
         save_human_grade(path, identity, grade)
@@ -470,6 +479,7 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
         completeness: str,
         relevance: str,
         clarity: str,
+        language: str,
         comments: str,
     ) -> tuple[Any, ...]:
         saved_message = save_current(
@@ -477,6 +487,7 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
             completeness,
             relevance,
             clarity,
+            language,
             comments,
             index,
             identity,
@@ -608,6 +619,11 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
                 label="Clarity",
                 value=initial_clarity,
             )
+            language = gr.Radio(
+                _RATING_CHOICES_BY_FIELD["human_language_conformity"],
+                label="Language conformity",
+                value=initial_language_conformity,
+            )
         comments = gr.Textbox(
             label="Comments",
             lines=4,
@@ -688,14 +704,21 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
             ],
         )
 
-        controls = [correctness, completeness, relevance, clarity, comments]
+        controls = [
+            correctness,
+            completeness,
+            relevance,
+            clarity,
+            language,
+            comments,
+        ]
         save_inputs = [*controls, index_state, identity_state]
         save_button.click(
             fn=save_current,
             inputs=save_inputs,
             outputs=[metadata, save_status],
         )
-        for control in controls[:4]:
+        for control in controls[:5]:
             control.input(fn=save_current, inputs=save_inputs, outputs=[metadata, save_status])
         comments.change(fn=save_current, inputs=save_inputs, outputs=[metadata, save_status])
 
@@ -712,24 +735,25 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
             completeness,
             relevance,
             clarity,
+            language,
             comments,
             index_state,
             identity_state,
-            save_status,
         ]
+        output_values = [*display_outputs, save_status]
         for button, action in (
             (previous, "previous"),
             (next_button, "next"),
             (next_ungraded, "next_ungraded"),
         ):
             button.click(
-                fn=lambda index, identity, corr, comp, rel, clr, note, action=action: move_to(
-                    action, index, identity, corr, comp, rel, clr, note
+                fn=lambda index, identity, corr, comp, rel, clr, lang, note, action=action: move_to(
+                    action, index, identity, corr, comp, rel, clr, lang, note
                 ),
                 inputs=navigation_inputs,
-                outputs=display_outputs,
+                outputs=output_values,
             )
-        demo.load(fn=render, inputs=index_state, outputs=display_outputs)
+        demo.load(fn=render, inputs=index_state, outputs=output_values)
 
     return demo
 

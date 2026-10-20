@@ -51,6 +51,7 @@ def _grade_row(**overrides: str) -> dict[str, str]:
         "human_completeness": "2",
         "human_relevance": "3",
         "human_clarity": "2",
+        "human_language_conformity": "3",
         "human_comments": "Good answer, but a minor detail is missing.",
     })
     grade_values.update(overrides)
@@ -208,9 +209,9 @@ def test_result_file_reports_unsupported_headers_and_malformed_rows(tmp_path):
 
 def test_next_ungraded_navigation_wraps_and_stops_when_all_scored():
     rows = [
-        _result_row(human_correctness="3", human_completeness="3", human_relevance="3", human_clarity="3"),
+        _result_row(human_correctness="3", human_completeness="3", human_relevance="3", human_clarity="3", human_language_conformity="3"),
         _result_row(query_id="q2"),
-        _result_row(query_id="q3", human_correctness="1", human_completeness="2", human_relevance="3", human_clarity="1"),
+        _result_row(query_id="q3", human_correctness="1", human_completeness="2", human_relevance="3", human_clarity="1", human_language_conformity="2"),
     ]
     assert grade._next_ungraded_index(rows, 0) == 1
     assert grade._next_ungraded_index(rows, 2) == 1
@@ -295,6 +296,7 @@ def test_local_grading_ui_builds_markdown_columns_and_rubric(tmp_path):
         "Completeness",
         "Relevance",
         "Clarity",
+        "Language conformity",
         "Comments",
     } <= labels
     assert any(

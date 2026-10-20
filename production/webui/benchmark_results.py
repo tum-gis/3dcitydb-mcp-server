@@ -40,10 +40,25 @@ HUMAN_GRADING_COLUMNS = (
     "human_completeness",
     "human_relevance",
     "human_clarity",
+    "human_language_conformity",
     "human_comments",
 )
 RESULT_COLUMNS = BENCHMARK_RESULT_COLUMNS + HUMAN_GRADING_COLUMNS
-_VALID_HEADERS = (BENCHMARK_RESULT_COLUMNS, RESULT_COLUMNS)
+# Files written before the "Language conformity" dimension existed carry only
+# the first four human rating columns; they are accepted for reading and
+# migrated on save.
+LEGACY_RESULT_COLUMNS = (
+    "human_correctness",
+    "human_completeness",
+    "human_relevance",
+    "human_clarity",
+    "human_comments",
+)
+_VALID_HEADERS = (
+    BENCHMARK_RESULT_COLUMNS,
+    RESULT_COLUMNS,
+    BENCHMARK_RESULT_COLUMNS + LEGACY_RESULT_COLUMNS,
+)
 _RATING_COLUMNS = HUMAN_GRADING_COLUMNS[:-1]
 
 
@@ -180,7 +195,7 @@ def ensure_result_schema(path: str | Path) -> None:
             return
         with target.open("r", encoding="utf-8", newline="") as source:
             header = _read_header(source, target)
-            if header == RESULT_COLUMNS:
+            if header in (RESULT_COLUMNS, BENCHMARK_RESULT_COLUMNS + LEGACY_RESULT_COLUMNS):
                 for _ in _validated_rows(source, target, header):
                     pass
                 return
@@ -196,8 +211,8 @@ def ensure_result_schema(path: str | Path) -> None:
                 writer.writeheader()
                 for _, row in _validated_rows(source, target, header):
                     writer.writerow({
-                        **row,
-                        **{column: "" for column in HUMAN_GRADING_COLUMNS},
+                        column: row.get(column, "")
+                        for column in RESULT_COLUMNS
                     })
                 output.flush()
                 os.fsync(output.fileno())
@@ -220,7 +235,7 @@ def save_human_grade(
     """Update one row's human grade while preserving the latest CSV contents."""
     target = Path(path)
     if set(grade) != set(HUMAN_GRADING_COLUMNS):
-        raise ResultsCsvError("A human grade must include all four ratings and comments.")
+        raise ResultsCsvError("A human grade must include all five ratings and comments.")
     normalized: dict[str, str] = {}
     for column, value in grade.items():
         text = str(value)
@@ -263,5 +278,5 @@ def save_ground_truth(
 
 
 def is_human_graded(row: dict[str, str]) -> bool:
-    """Whether all four rating dimensions have been scored."""
+    """Whether all five rating dimensions have been scored."""
     return all(row.get(column, "") in {"0", "1", "2", "3"} for column in _RATING_COLUMNS)
