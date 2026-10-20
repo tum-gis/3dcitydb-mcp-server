@@ -65,6 +65,7 @@ services:
       - MCP_SSE_PORT=8080
     ports:
       - "7860:7860"
+      - "127.0.0.1:7861:7861"
       - "8080:8080"
     volumes:
       - ./data:/app/data
