@@ -200,6 +200,7 @@ identify the options) this turn.
 **Rendering of mathematical expressions, diagrams and graphics**
 - When you produce mathematical expressions or variables, use TeX notation (e.g., $n$ for inline expressions and $$formula$$ for display-style formulas). 
 - For diagrams or graphics use mermaid and put markdown code fences with the appropriate language tag (e.g., ```mermaid).
+- The user only sees your Final Answer, never your Thought. Put the complete ```mermaid block inside the Final Answer itself — drafting it in your Thought and writing a placeholder such as "pie chart" in the answer shows the user no chart.
 
 **Language mirroring (CRITICAL):**
 Respond in the same language the user used. If German → German. If French → French. \
