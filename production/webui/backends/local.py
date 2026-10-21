@@ -463,6 +463,12 @@ class _RobustReActParser(ReActSingleInputOutputParser):
     """
 
     _FINAL_RE = re.compile(r"Final Answer\s*:(.*)\Z", re.DOTALL | re.IGNORECASE)
+    # Empty `Action:` / `Action Input:` lines some models append after their
+    # Final Answer (observed: a trailing "Action:\nAction Input:" with nothing
+    # after either) — stripped so they don't end up in the chat reply.
+    _EMPTY_ACTION_TAIL_RE = re.compile(
+        r"(?:\s*\n[ \t]*Action(?:\s+Input)?[ \t]*:[ \t]*)+\s*\Z", re.IGNORECASE
+    )
     _ACTION_RE = re.compile(r"Action\s*:\s*(.*?)(?:\n|$)", re.IGNORECASE)
     _INPUT_RE = re.compile(
         r"Action\s+Input\s*:\s*(.*?)(?:\nObservation:|\nThought:|\Z)",
@@ -908,7 +914,8 @@ class _RobustReActParser(ReActSingleInputOutputParser):
         fa = self._FINAL_RE.search(text)
         if fa:
             self._require_tool_call(text)
-            return AgentFinish(return_values={"output": fa.group(1).strip()}, log=text)
+            output = self._EMPTY_ACTION_TAIL_RE.sub("", fa.group(1)).strip()
+            return AgentFinish(return_values={"output": output}, log=text)
 
         # `Action: {"sql": ...}` — model put the JSON payload directly after
         # `Action:` without an `Action Input:` line (observed with
