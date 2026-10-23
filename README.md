@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/tum-gis/3dcitydb-mcp-server/main/demo.gif" alt="3DCityDB MCP Server Demo" width="800">
+  <img src="https://raw.githubusercontent.com/tum-gis/3dcitydb-mcp-server/main/quick_demo_readme.gif" alt="3DCityDB MCP Server Demo" width="800">
 </p>
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server giving AI assistants direct, natural language access to semantic 3D city models in CityGML managed within a [**3DCityDB v5**](https://github.com/3dcitydb/3dcitydb) geodatabase.
