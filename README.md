@@ -17,6 +17,10 @@
   <a href="https://github.com/tum-gis/3dcitydb-mcp-server/issues"><img src="https://img.shields.io/badge/Report_an_issue-GitHub-181717?style=for-the-badge&logo=github&logoColor=white" alt="Report an issue"></a>
 </p>
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/tum-gis/3dcitydb-mcp-server/main/demo.gif" alt="3DCityDB MCP Server Demo" width="800">
+</p>
+
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server giving AI assistants direct, natural language access to semantic 3D city models in CityGML managed within a [**3DCityDB v5**](https://github.com/3dcitydb/3dcitydb) geodatabase.
 
 It dynamically resolves CityGML object classes, properties, codelists, and generic attributes from the database so the AI can answer both spatial and semantic queries stated in natural language, write and execute SQL queries, and reason about CityGML data — without any manual prompt engineering. 
