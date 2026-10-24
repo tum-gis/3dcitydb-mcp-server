@@ -29,7 +29,7 @@ services:
   # container by "Refresh 3D tiles" and the Import tab, never started by `up`.
   # Pre-pull only, like citydb-tool / ifc-to-citygml3 in the base file.
   citydb-3dtiler:
-    image: ghcr.io/tum-gis/citydb-3dtiler:latest
+    image: ghcr.io/3dcitydb/citydb-3dtiler:latest
     profiles: ["tiler"]
     entrypoint: ["true"]
     restart: "no"
