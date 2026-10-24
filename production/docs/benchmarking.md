@@ -126,7 +126,10 @@ containing a comma, and write a literal double quote inside a quoted field as
 two double quotes (`""`). Semicolons are ordinary characters with this comma
 delimiter, so they do not split a field. The sample questions demonstrate
 quoted commas and semicolons; use a CSV-aware editor rather than splitting
-question rows manually on punctuation.
+question rows manually on punctuation. In both `models.csv` and
+`questions.csv`, lines whose first cell starts with `#` are treated as
+comments and not processed, but they still count toward the line numbers
+referenced in error messages and progress output.
 
 Use `--env-file /path/to/db.env` to override the benchmark's `CITYDB_*`
 connection settings (also accepts `POSTGRES_*` keys and `DATABASE_URL`).

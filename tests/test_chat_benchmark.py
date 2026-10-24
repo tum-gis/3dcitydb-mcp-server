@@ -108,6 +108,53 @@ def test_model_csv_validation_and_optional_overrides(tmp_path):
     assert models[1].prompt_mode is None
 
 
+def test_comment_lines_are_skipped_but_counted_in_line_numbers(tmp_path):
+    models_path = tmp_path / "models.csv"
+    models_path.write_text(
+        "provider,model\n"            # line 1: header
+        "# a commented-out model\n"   # line 2: comment
+        "openai,model-a\n"            # line 3
+        "ollama,model-b\n"            # line 4
+        "# another comment\n"         # line 5
+        "anthropic,model-c\n",        # line 6
+        encoding="utf-8",
+        newline="",
+    )
+    models = benchmark.load_models_csv(models_path)
+
+    assert [model.model for model in models] == ["model-a", "model-b", "model-c"]
+    assert [model.row_number for model in models] == [3, 4, 6]
+
+    queries_path = tmp_path / "queries.csv"
+    queries_path.write_text(
+        "id,question,ground_truth,citygml_dataset\n"   # line 1: header
+        "# disabled question\n"                         # line 2: comment
+        "q1,first,one,dataset\n"                        # line 3
+        "# another disabled question\n"                 # line 4
+        "q2,second,two,dataset\n",                      # line 5
+        encoding="utf-8",
+        newline="",
+    )
+    queries = benchmark.load_queries_csv(queries_path)
+
+    assert [item.query_id for item in queries] == ["q1", "q2"]
+    assert [item.row_number for item in queries] == [3, 5]
+
+
+def test_comment_error_messages_reference_physical_line(tmp_path):
+    path = tmp_path / "models.csv"
+    path.write_text(
+        "provider,model\n"   # line 1
+        "# comment\n"        # line 2
+        "bad,model-a\n",     # line 3
+        encoding="utf-8",
+        newline="",
+    )
+
+    with pytest.raises(benchmark.BenchmarkInputError, match=r"row 3: provider must be one of"):
+        benchmark.load_models_csv(path)
+
+
 @pytest.mark.parametrize(
     ("headers", "rows", "message"),
     [

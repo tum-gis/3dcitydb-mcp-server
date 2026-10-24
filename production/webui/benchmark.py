@@ -85,7 +85,15 @@ class _WorkUnit:
     queries: tuple[QueryCase, ...]
 
 
-def _read_csv(path: str | Path, required: set[str], optional: set[str]) -> tuple[list[str], list[dict[str, str]]]:
+def _read_csv(path: str | Path, required: set[str], optional: set[str]) -> tuple[list[str], list[tuple[int, dict[str, str]]]]:
+    """Read a CSV into ``(headers, rows)``.
+
+    ``rows`` is a list of ``(line_number, row)`` pairs where ``line_number``
+    is the physical line in the file (1-based). Lines whose first cell starts
+    with ``#`` are treated as comments and skipped, but they still occupy a
+    line number, so the numbering of the remaining rows reflects their true
+    position in the file (useful for error messages and progress display).
+    """
     source = Path(path)
     try:
         with source.open("r", encoding="utf-8-sig", newline="") as stream:
@@ -105,17 +113,21 @@ def _read_csv(path: str | Path, required: set[str], optional: set[str]) -> tuple
                 raise BenchmarkInputError(
                     f"{source}: unsupported column(s): {', '.join(sorted(unknown))}."
                 )
-            rows: list[dict[str, str]] = []
+            rows: list[tuple[int, dict[str, str]]] = []
             for row in reader:
+                line_number = reader.line_num
+                first_value = row.get(headers[0])
+                if first_value is not None and first_value.strip().startswith("#"):
+                    continue  # comment line: skipped but its line number is counted
                 if None in row:
                     raise BenchmarkInputError(
-                        f"{source}: row {reader.line_num} has more values than the header."
+                        f"{source}: row {line_number} has more values than the header."
                     )
-                rows.append({
+                rows.append((line_number, {
                     key: (value or "").strip()
                     for key, value in row.items()
                     if key is not None
-                })
+                }))
             return headers, rows
     except BenchmarkInputError:
         raise
@@ -155,7 +167,7 @@ def load_models_csv(path: str | Path) -> list[ModelConfig]:
         raise BenchmarkInputError(f"{source}: no model rows found.")
 
     models: list[ModelConfig] = []
-    for row_number, row in enumerate(rows, start=2):
+    for row_number, row in rows:
         provider = row.get("provider", "").lower()
         model = row.get("model", "")
         if provider not in _PROVIDERS:
@@ -224,7 +236,7 @@ def load_queries_csv(path: str | Path) -> list[QueryCase]:
     seen_ids: set[str] = set()
     group_sequences: dict[str, set[int]] = {}
     group_datasets: dict[str, str] = {}
-    for row_number, row in enumerate(rows, start=2):
+    for row_number, row in rows:
         query_id = row.get("id", "")
         question = row.get("question", "")
         ground_truth = row.get("ground_truth", "")
@@ -598,7 +610,8 @@ def run_benchmark(
     run_id = str(uuid.uuid4())
     units = _work_units(queries)
     total_turns = sum(len(unit.queries) for unit in units) * len(models) * args.repetitions
-    model_csv_line_count = len(models) + 1
+    # Last physical line of models.csv (comment lines count toward it).
+    model_csv_line_count = max(model.row_number for model in models)
     console_type = console_factory
     if console_type is None:
         from webui.cli import ChatConsole, _assemble_prompt_with_progress
