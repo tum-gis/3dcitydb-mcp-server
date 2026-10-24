@@ -2136,6 +2136,195 @@ async (_win, _event_data) => {
     }
   });
 
+  // ── Keep the chat scrolled up while the answer streams ───────────────
+    // Both gr.Chatbot(...) instances are built with autoscroll=False: with
+    // the default (True) Gradio resets the chat's scrollTop to scrollHeight
+    // on every value change. chat_stream() yields on every stream event —
+    // every reasoning token, ping and status — so during a query the view
+    // is yanked to the bottom tens of times a second and the user cannot
+    // scroll up to read the earlier history (and Gradio 5.50's internal
+    // "user scrolled up" flag is sticky, so its autoscroll stops working
+    // permanently after the first scroll-up anyway).
+    // So this block owns all chat scrolling:
+    //   • while the user is AT the bottom → follow the stream ourselves
+    //     (chatFollowToBottom, driven every frame);
+    //   • once the user scrolls >60px away from the bottom → pin the view
+    //     to that position and keep it there for as long as they stay up,
+    //     regardless of how much content streams in;
+    //   • unpin when the user scrolls back to the bottom by gesture,
+    //     submits a new message, or clicks Gradio's "Scroll down" button,
+    //     so the view follows the stream / the new turn again.
+    var PIN_THRESHOLD = 60;   // px from the bottom = "user scrolled up"
+    var chatPinned = false;
+    var chatPinnedTop = 0;
+    var chatFollowing = true; // at the bottom → keep following the stream
+  function chatScrollEl() {
+    var conv = document.querySelector('[aria-label="chatbot conversation"]');
+    if (!conv) return null;
+    var el = conv;
+    while (el && el !== document.body) {
+      if (el.scrollHeight > el.clientHeight &&
+          /auto|scroll/.test(getComputedStyle(el).overflowY)) return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+  function chatDistanceFromBottom(el) {
+    return el.scrollHeight - el.scrollTop - el.clientHeight;
+  }
+  function chatRestore(el) {
+    if (chatPinned && el.scrollTop !== chatPinnedTop) {
+      el.scrollTop = chatPinnedTop;
+    }
+  }
+  function chatFollowToBottom(el) {
+    if (chatFollowing && !chatPinned &&
+        el.scrollHeight - el.scrollTop - el.clientHeight > 2) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }
+  // ── Per-element bookkeeping ─────────────────────────────────────────
+  // Svelte swaps the chat's scrollable element on re-renders (tab
+  // switches, the "Thinking…" bubble being replaced by the answer), so
+  // every scroll operation must resolve the CURRENT live element rather
+  // than a captured one. Handlers are attached per-element; the
+  // MutationObserver + interval enforce the position on whatever element
+  // is live right now.
+  var chatObs = null;
+  var chatObsEl = null;
+  var chatHandlerEl = null;
+  var lastGestureT = 0;   // shared: a wheel/touch/keydown stamps the time
+
+  // Resolve the currently-live scrollable element.
+  function chatLiveEl() { return chatScrollEl(); }
+
+  // Gesture stamping. A wheel/touch/keydown fires BEFORE the scroll it
+  // causes, so we only record the time here; the scroll handler below
+  // decides (with the fresh position) whether it was "to the bottom".
+  function chatStampGesture() { lastGestureT = performance.now(); }
+  function chatGesture() {
+    chatStampGesture();
+    // Any input gesture while at the bottom resumes following.
+    var el = chatLiveEl();
+    if (el && !chatPinned && chatDistanceFromBottom(el) <= PIN_THRESHOLD) {
+      chatFollowing = true;
+    }
+  }
+
+  function chatAttachHandlers(el) {
+    if (el === chatHandlerEl) return;
+    chatHandlerEl = el;
+    el.addEventListener("wheel", chatGesture, { passive: true });
+    el.addEventListener("touchmove", chatGesture, { passive: true });
+    // A scrollbar drag ends in a mouseup over the scrollbar itself
+    // (right edge). A mouseup in the content area is a click / text
+    // selection — not a scroll gesture, so it must not count (a plain
+    // click must not accidentally unpin).
+    el.addEventListener("mouseup", function (e) {
+      var r = el.getBoundingClientRect();
+      if (e.clientX >= r.right - 16) chatGesture();
+    }, { passive: true });
+    el.addEventListener("scroll", function () {
+      // Re-resolve the live element: the scroll event may have fired on
+      // a now-stale element if Svelte swapped mid-event.
+      var live = chatLiveEl();
+      if (!live) return;
+      // At-bottom is only meaningful when a real gesture is in flight —
+      // Gradio's autoscroll yank always lands exactly at the bottom but
+      // is never preceded by one (and with autoscroll=False there is no
+      // yank at all, so this branch mostly guards the user's own scrolls).
+      var atBottom = chatDistanceFromBottom(live) <= PIN_THRESHOLD;
+      var gestureAtBottom = atBottom && performance.now() - lastGestureT < 300;
+      if (chatPinned) {
+        // Our restore runs as a microtask right after each Svelte render
+        // — before any scroll event fires — so an event that still sees
+        // the pinned position is a byproduct of the restore, not input.
+        if (Math.abs(live.scrollTop - chatPinnedTop) < 1) return;
+        if (gestureAtBottom) {
+          // Reached the bottom by an explicit gesture: the user chose to
+          // follow the stream again.
+          chatPinned = false;
+          chatFollowing = true;
+        } else if (!atBottom) {
+          // User moved up OR down but did not reach the bottom: track
+          // them.
+          chatPinnedTop = live.scrollTop;
+        } else {
+          // At the bottom without a recent gesture: treat as a yank and
+          // restore to the pinned position.
+          chatRestore(live);
+        }
+      } else if (gestureAtBottom) {
+        chatPinned = false;
+        chatFollowing = true;
+      } else if (!atBottom) {
+        chatPinned = true;
+        chatPinnedTop = live.scrollTop;
+        chatFollowing = false;
+      }
+      // else: at the bottom without a gesture (user sitting at the
+      // bottom) — nothing to do; the follow loop keeps the view with
+      // the stream.
+    }, { passive: true });
+  }
+
+  function chatAttach() {
+    var el = chatScrollEl();
+    if (!el) return;
+    chatAttachHandlers(el);
+    // Re-observe when the element swaps.
+    if (el === chatObsEl) return;
+    if (chatObs) chatObs.disconnect();
+    chatObsEl = el;
+    chatObs = new MutationObserver(function () {
+      // Runs as a microtask after every Svelte DOM mutation — i.e. after
+      // the content changed and before the next paint.
+      var live = chatLiveEl();
+      if (live && chatPinned) chatRestore(live);
+    });
+    chatObs.observe(el, { childList: true, subtree: true,
+                          characterData: true });
+  }
+
+  // Single interval: enforce the pinned position or follow the stream on
+  // whatever element is live right now. ~60fps via requestAnimationFrame
+  // would be smoother, but the interval is robust to element swaps (it
+  // never holds a reference) and cheap.
+  setInterval(function () {
+    var el = chatLiveEl();
+    if (!el) return;
+    if (chatPinned) chatRestore(el);
+    else chatFollowToBottom(el);
+  }, 16);
+
+  function chatUnpin() {
+    chatPinned = false;
+    chatFollowing = true;   // follow the new turn to the bottom
+  }
+  // New message submitted, or the user pressed Gradio's own "Scroll down"
+  // button (shown when scrolled up) → follow the bottom again.
+  document.addEventListener("click", function (e) {
+    var t = e.target;
+    if (!t || !t.closest) return;
+    if (t.closest("#send-btn")) {
+      chatUnpin();
+    } else if (t.closest('button[aria-label="Scroll down"]')) {
+      chatUnpin();
+    }
+  }, { passive: true });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      var t = e.target;
+      // #msg-input is the wrapper div; the actual control is the
+      // <textarea> inside it.
+      if (t && t.closest && t.closest("#msg-input")) chatUnpin();
+    }
+  }, { passive: true });
+  // Svelte swaps the chat element on re-renders (tab switches, streaming),
+  // so resolve it lazily on every interval tick, like the splitter code.
+  setInterval(chatAttach, 400);
+  chatAttach();
+
   // ── No math rendering in the "Agent activity" trace panel ────────────
   // Gradio's markdown renderer applies KaTeX page-wide, which would mangle
   // TeX snippets inside SQL / agent output. Keep formulas there as raw
@@ -3172,6 +3361,12 @@ def build_ui() -> gr.Blocks:
                                     render_markdown=True,
                                     sanitize_html=True,
                                     allow_tags=False,
+                                    # Gradio's autoscroll yanks the view to the bottom on every
+                                    # value change (tens of times/second during a stream) and its
+                                    # "user scrolled up" flag is sticky in 5.50, so it cannot be
+                                    # relied on. _RESIZE_JS disables it here and manages the
+                                    # follow-to-bottom / scroll-pinning behaviour itself.
+                                    autoscroll=False,
                                     latex_delimiters=[
                                         {"left": "$$", "right": "$$", "display": True},
                                         {"left": "$", "right": "$", "display": False},
@@ -3258,6 +3453,9 @@ def build_ui() -> gr.Blocks:
                                     render_markdown=True,
                                     sanitize_html=True,
                                     allow_tags=False,
+                                    # See the other Chatbot above: autoscroll is disabled and the
+                                    # follow/pin behaviour is handled by _RESIZE_JS instead.
+                                    autoscroll=False,
                                     latex_delimiters=[
                                         {"left": "$$", "right": "$$", "display": True},
                                         {"left": "$", "right": "$", "display": False},
