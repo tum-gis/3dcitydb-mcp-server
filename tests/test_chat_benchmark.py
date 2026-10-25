@@ -155,6 +155,26 @@ def test_comment_error_messages_reference_physical_line(tmp_path):
         benchmark.load_models_csv(path)
 
 
+def test_results_lock_blocks_a_concurrent_writer_and_releases(tmp_path):
+    output = tmp_path / "nested" / "results.csv"
+    lock_path = tmp_path / "nested" / "results.csv.lock"
+
+    # The lock must work even before the output file/directory exists.
+    with benchmark._results_lock(output):
+        # A second (nested) acquisition against the same path must fail fast.
+        with pytest.raises(
+            benchmark.BenchmarkInputError, match="already writing to"
+        ):
+            with benchmark._results_lock(output):
+                pass
+
+    # Once released, the same path can be acquired again and the sidecar
+    # lock file is cleaned up.
+    with benchmark._results_lock(output):
+        assert lock_path.exists()
+    assert not lock_path.exists()
+
+
 @pytest.mark.parametrize(
     ("headers", "rows", "message"),
     [
@@ -345,7 +365,16 @@ class _RecordingConsole:
     def answer(self, question):
         self.history.append(question)
         if question == "fail":
+            self.last_story = ""
             raise RuntimeError("provider call failed")
+        if question == "solo":
+            self.last_story = (
+                "No SQL query was executed for this answer; it was "
+                "generated from the current conversation context and "
+                "built-in knowledge."
+            )
+        else:
+            self.last_story = "1. Ran a probe query\n   SQL: SELECT 1"
         return f"answer:{question}:prior={len(self.history) - 1}"
 
 
@@ -411,6 +440,16 @@ def test_runner_filters_dataset_orders_groups_repeats_fresh_and_flushes(tmp_path
         queries_path.read_bytes()
     ).hexdigest()
     assert all(row["context_tokens"] == "123" for row in rows)
+    assert all(
+        row["answer_story"].startswith("1. Ran a probe query")
+        for row in rows
+        if row["query_id"] != "standalone"
+    )
+    assert all(
+        row["answer_story"].startswith("No SQL query was executed")
+        for row in rows
+        if row["query_id"] == "standalone"
+    )
     assert all(row["context_limit"] == "4096" for row in rows)
     assert all(row["context_trimmed_turns"] == "1" for row in rows)
     assert all(row["status"] == "completed" for row in rows)

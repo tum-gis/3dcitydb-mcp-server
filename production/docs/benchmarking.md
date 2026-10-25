@@ -90,7 +90,7 @@ Copy-Item .\questions.csv ..\..\production\data\questions.csv
 Then run the benchmark in the chatbot container:
 
 ```bash
-docker exec production-citydb-agent-1 3dcitydb-chat benchmark \
+docker exec -it production-citydb-agent-1 3dcitydb-chat benchmark \
   --models-csv /app/data/models.csv \
   --queries-csv /app/data/questions.csv \
   --dataset demo \
@@ -99,12 +99,28 @@ docker exec production-citydb-agent-1 3dcitydb-chat benchmark \
   --temperature 0.2 --thinking off --prompt-mode auto
 ```
 
+Always use `-it` when running the benchmark from a terminal: with a TTY,
+`Ctrl+C` is forwarded into the container and stops the run (the in-progress
+turn is recorded with `status=interrupted`). Without `-it`, `Ctrl+C` only
+exits the local `docker` CLI and the benchmark keeps running in the
+background, appending results to the output file — a later run on the same
+`--output` path would then merge its rows into the same file.
+
 For a local source checkout, run `python -m webui.cli benchmark` from the
 `production` directory and pass host paths for the input and output files. The
 example model row uses `gpt-4.1-mini`; replace it with a model name available
 from your configured provider/endpoint. The `demo` dataset value is only a
 label used to select rows in the questions CSV; it does not need to match or
 select database contents.
+
+To list all available CLI options with their descriptions and defaults, run
+the benchmark tool with `--help` — inside the chatbot container:
+
+```bash
+docker exec -it production-citydb-agent-1 3dcitydb-chat benchmark --help
+```
+
+(or locally from `production`: `python -m webui.cli benchmark --help`).
 
 The models file requires `provider,model`; optional columns are
 `base_url,temperature,thinking_level,prompt_mode`. When a corresponding CLI
@@ -147,8 +163,8 @@ line after each answer and two additional blank lines after each model row.
 
 Line-break normalization: the grading app automatically converts legacy
 escaped line breaks (literal `\n` two-character sequences) in the text
-columns — `question`, `ground_truth`, `generated_answer`, and
-`human_comments` — into real line breaks every time the results file is
+columns — `question`, `ground_truth`, `generated_answer`, `answer_story`,
+and `human_comments` — into real line breaks every time the results file is
 loaded. The conversion is applied as soon as the file is opened, so a file
 containing a mix of escaped and real line breaks is unified on first load and
 stays unified afterwards: any save (rating, comment, or ground-truth edit)
@@ -161,6 +177,28 @@ multi-line cell (such as a ground-truth answer containing Markdown) is wrapped
 in double quotes. This keeps the file importable by MS Excel and other
 spreadsheet tools, while the grading app renders the stored line breaks as
 normal line breaks.
+
+The `answer_story` column (directly after `generated_answer`) records how
+the answer was determined: it holds the distilled story of the tool calls and
+SQL queries executed for the answer, or a short note when no story was
+produced — for example, because no SQL query was executed and the answer was
+generated from the conversation context and built-in knowledge, because story
+distillation is not supported by the selected provider, or because
+distillation failed. The value follows the same line-break escaping as
+`generated_answer`. Older result files without the column load with a blank
+`answer_story`, and the first save rewrites the file with the full column
+set.
+
+Because results are appended, re-running a benchmark with the same
+`--output` path adds the new run's rows to the existing file (each row is
+self-describing through its `run_id`, `query_file_sha256`, and
+`conversation_id`). To compare separate runs cleanly, use a different
+`--output` path per run. A single run holds an exclusive lock on a sidecar
+file named `<output>.lock` for the whole run: if you start a second
+benchmark writing to the same `--output` while the first is still running,
+it fails immediately with a clear error instead of interleaving its rows
+into the other run's file (or corrupting partially written records). The
+lock file is removed when a run exits.
 
 ## Human grading of benchmark answers
 
@@ -194,10 +232,10 @@ The `0.0.0.0` bind is inside the container; Compose limits host access to
 foreground grader process can be stopped with `Ctrl+C`; this leaves the
 chatbot service running.
 
-Each benchmark result is shown with the question, ground-truth answer, and
-generated answer in three Markdown-rendered columns. Drag either vertical
-separator to resize adjacent columns; the chosen widths are retained in that
-browser. The displayed metadata identifies the run, query, model row, and
+Each benchmark result is shown with the question, ground-truth answer,
+generated answer, and answer story in four Markdown-rendered columns. Drag
+any vertical separator to resize adjacent columns; the chosen widths are
+retained in that browser. The displayed metadata identifies the run, query, model row, and
 repetition. Use **Previous**, **Next**, and **Next ungraded** to navigate.
 
 The Ground Truth column remains Markdown-rendered by default. Select the pen

@@ -71,13 +71,13 @@ async (_win, _event_data) => {
       return Array.from(row.children).filter(isColumn);
     }
     var columns = getColumns();
-    if (columns.length !== 3) return false;
+    if (columns.length !== 4) return false;
     row.__gradeSplittersReady = true;
     window.__benchmarkGradeSplitsInit = true;
     window.__benchmarkGradeSplitsPending = false;
 
     var handles = [];
-    for (var boundary = 0; boundary < 2; boundary++) {
+    for (var boundary = 0; boundary < columns.length - 1; boundary++) {
       var handle = document.createElement("div");
       handle.className = "grading-splitter";
       handle.setAttribute("role", "separator");
@@ -129,10 +129,11 @@ async (_win, _event_data) => {
     var widths = columns.map(function (column) {
       return column.getBoundingClientRect().width;
     });
-    var storageKey = "benchmark-grading-column-widths-v2";
+    var MIN_WIDTH = 150;
+    var storageKey = "benchmark-grading-column-widths-v3";
     try {
       var saved = JSON.parse(localStorage.getItem(storageKey) || "null");
-      if (Array.isArray(saved) && saved.length === 3 &&
+      if (Array.isArray(saved) && saved.length === columns.length &&
           saved.every(function (value) { return typeof value === "number" && value > 0; })) {
         var widthTotal = widths.reduce(function (sum, value) { return sum + value; }, 0);
         var savedTotal = saved.reduce(function (sum, value) { return sum + value; }, 0);
@@ -148,7 +149,10 @@ async (_win, _event_data) => {
         (parseFloat(style.borderLeftWidth) || 0) +
         (parseFloat(style.borderRightWidth) || 0);
       var gap = parseFloat(style.columnGap) || 0;
-      return Math.max(3 * 150, row.clientWidth - horizontalInsets - 2 * gap);
+      return Math.max(
+        columns.length * MIN_WIDTH,
+        row.clientWidth - horizontalInsets - (columns.length - 1) * gap
+      );
     }
 
     function updateHandles() {
@@ -178,7 +182,6 @@ async (_win, _event_data) => {
         var startX = event.clientX;
         var startLeftWidth = widths[boundary];
         var startRightWidth = widths[boundary + 1];
-        var minWidth = 150;
         handle.classList.add("active");
         document.body.classList.add("grading-resizing");
         handle.setPointerCapture(event.pointerId);
@@ -186,8 +189,8 @@ async (_win, _event_data) => {
         function move(moveEvent) {
           var delta = moveEvent.clientX - startX;
           var leftWidth = Math.max(
-            minWidth,
-            Math.min(startLeftWidth + startRightWidth - minWidth, startLeftWidth + delta)
+            MIN_WIDTH,
+            Math.min(startLeftWidth + startRightWidth - MIN_WIDTH, startLeftWidth + delta)
           );
           widths[boundary] = leftWidth;
           widths[boundary + 1] = startLeftWidth + startRightWidth - leftWidth;
@@ -216,8 +219,8 @@ async (_win, _event_data) => {
         var direction = event.key === "ArrowLeft" ? -1 : 1;
         var pairTotal = widths[boundary] + widths[boundary + 1];
         widths[boundary] = Math.max(
-          150,
-          Math.min(pairTotal - 150, widths[boundary] + direction * 24)
+          MIN_WIDTH,
+          Math.min(pairTotal - MIN_WIDTH, widths[boundary] + direction * 24)
         );
         widths[boundary + 1] = pairTotal - widths[boundary];
         applyWidths();
@@ -256,14 +259,15 @@ _BLOCK_CSS = """
           align-items: center !important; flex-wrap: nowrap !important;
           justify-content: space-between !important; gap: 4px !important;
         }
-        .generated-answer-heading-row {
+        .generated-answer-heading-row, .answer-story-heading-row {
           align-items: center !important; flex-wrap: nowrap !important;
           justify-content: space-between !important; gap: 4px !important;
         }
         .ground-truth-heading-row > div:first-child {
           flex: 1 1 0% !important; min-width: 0 !important; width: 0 !important;
         }
-        .generated-answer-heading-row > div:first-child {
+        .generated-answer-heading-row > div:first-child,
+        .answer-story-heading-row > div:first-child {
           flex: 1 1 0% !important; min-width: 0 !important; width: 0 !important;
         }
         #edit-ground-truth-button, #copy-generated-answer-button {
@@ -355,6 +359,7 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
             row.get("ground_truth", "") or "_(empty)_",
             _display_answer(row.get("generated_answer", "")) or "_(empty)_",
             _display_answer(row.get("generated_answer", "")),
+            _display_answer(row.get("answer_story", "")) or "_(empty)_",
             _row_markdown(row, index, len(current_rows), graded_count),
             *_grade_values(row),
             index,
@@ -370,6 +375,7 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
         initial_ground_truth_preview,
         initial_answer,
         initial_answer_source,
+        initial_answer_story,
         initial_metadata,
         initial_correctness,
         initial_completeness,
@@ -598,6 +604,10 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
                         elem_id="copy-generated-answer-button",
                     )
                 answer_view = gr.Markdown(value=initial_answer)
+            with gr.Column(scale=1, min_width=150):
+                with gr.Row(elem_classes="answer-story-heading-row"):
+                    gr.Markdown("### How the answer was determined")
+                answer_story_view = gr.Markdown(value=initial_answer_story)
         with gr.Row():
             correctness = gr.Radio(
                 _RATING_CHOICES_BY_FIELD["human_correctness"],
@@ -730,6 +740,7 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
             ground_truth_preview,
             answer_view,
             generated_answer_source,
+            answer_story_view,
             metadata,
             correctness,
             completeness,

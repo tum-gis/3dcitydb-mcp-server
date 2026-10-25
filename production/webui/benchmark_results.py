@@ -28,6 +28,7 @@ BENCHMARK_RESULT_COLUMNS = (
     "num_ctx",
     "repetition",
     "generated_answer",
+    "answer_story",
     "status",
     "error",
     "elapsed_seconds",
@@ -54,10 +55,15 @@ LEGACY_RESULT_COLUMNS = (
     "human_clarity",
     "human_comments",
 )
+# Files written before the "answer_story" column existed lack it; they are
+# accepted for reading and migrated by inserting an empty column.
+_PRE_STORY_RESULT_COLUMNS = BENCHMARK_RESULT_COLUMNS[:21] + BENCHMARK_RESULT_COLUMNS[22:]
 _VALID_HEADERS = (
     BENCHMARK_RESULT_COLUMNS,
     RESULT_COLUMNS,
     BENCHMARK_RESULT_COLUMNS + LEGACY_RESULT_COLUMNS,
+    _PRE_STORY_RESULT_COLUMNS,
+    _PRE_STORY_RESULT_COLUMNS + HUMAN_GRADING_COLUMNS,
 )
 _RATING_COLUMNS = HUMAN_GRADING_COLUMNS[:-1]
 
@@ -71,6 +77,7 @@ _NEWLINE_TEXT_COLUMNS = (
     "question",
     "ground_truth",
     "generated_answer",
+    "answer_story",
     "human_comments",
 )
 
@@ -167,7 +174,7 @@ def load_result_rows(path: str | Path) -> list[dict[str, str]]:
 
     seen: set[tuple[str, ...]] = set()
     for row in rows:
-        for column in HUMAN_GRADING_COLUMNS:
+        for column in (*BENCHMARK_RESULT_COLUMNS, *HUMAN_GRADING_COLUMNS):
             row.setdefault(column, "")
         identity = result_identity(row)
         if identity in seen:
@@ -241,7 +248,10 @@ def ensure_result_schema(path: str | Path) -> None:
             return
         with target.open("r", encoding="utf-8-sig", newline="") as source:
             header = _read_header(source, target)
-            if header in (RESULT_COLUMNS, BENCHMARK_RESULT_COLUMNS + LEGACY_RESULT_COLUMNS):
+            if header in (
+                RESULT_COLUMNS,
+                BENCHMARK_RESULT_COLUMNS + LEGACY_RESULT_COLUMNS,
+            ):
                 for _ in _validated_rows(source, target, header):
                     pass
                 return

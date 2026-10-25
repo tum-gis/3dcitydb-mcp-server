@@ -226,6 +226,7 @@ class ChatConsole:
     last_context_limit: int | None = None
     last_trimmed_turns: int | None = None
     last_elapsed_seconds: float = 0.0
+    last_story: str = ""
 
     def reset(self) -> None:
         self.history.clear()
@@ -239,6 +240,13 @@ class ChatConsole:
         self.last_context_limit = None
         self.last_trimmed_turns = None
         self.last_elapsed_seconds = 0.0
+        if self.keep_story and self.settings.provider not in ("openai", "ollama"):
+            self.last_story = (
+                f"Story distillation is not supported for provider "
+                f"{self.settings.provider!r}."
+            )
+        else:
+            self.last_story = ""
         notes = (
             [format_tool_cache_note(self.tool_cache)]
             if cache_is_fresh(self.tool_cache)
@@ -329,11 +337,18 @@ class ChatConsole:
                         )
                 if story:
                     self.story_history.append(story)
+                    self.last_story = story
                 else:
                     self.story_history.append(None)
+                    self.last_story = f"Story distillation skipped: {error}"
                     print(f"Story distillation skipped: {error}", file=self.stderr)
             else:
                 self.story_history.append(None)
+                self.last_story = (
+                    "No SQL query was executed for this answer; it was "
+                    "generated from the current conversation context and "
+                    "built-in knowledge."
+                )
         else:
             self.story_history.append(None)
 

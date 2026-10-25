@@ -516,6 +516,66 @@ def _database_override(path: str | Path | None) -> Generator[None, None, None]:
                 os.environ[key] = value
 
 
+@contextmanager
+def _results_lock(path: str | Path):
+    """Hold an exclusive lock while a run appends to a results CSV.
+
+    The results file is opened in append mode by design (so an interrupted
+    run keeps its partial results). If a second benchmark run targeted the
+    same ``--output`` while the first was still writing, the two processes
+    would append concurrently and interleave their records (and risk corrupting
+    partially-written rows). Acquire an advisory, non-blocking lock on a
+    sidecar file and fail fast when another run already holds it.
+    """
+    lock_path = Path(path).with_name(f"{Path(path).name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    busy_message = (
+        f"Another benchmark run is already writing to {Path(path)} "
+        f"(lock {lock_path}). Use a different --output path or wait for the "
+        "other run to finish."
+    )
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise BenchmarkInputError(busy_message) from exc
+
+            def _unlock() -> None:
+                os.lseek(fd, 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise BenchmarkInputError(busy_message) from exc
+
+            def _unlock() -> None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+        try:
+            yield
+        finally:
+            _unlock()
+    finally:
+        os.close(fd)
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+
 def _append_results(path: str | Path):
     target = Path(path)
     if target.exists() and target.is_dir():
@@ -622,7 +682,7 @@ def run_benchmark(
         assemble_with_progress = None
     prompt_assembler = assembler or assemble_system_prompt_sync
 
-    with _database_override(args.env_file):
+    with _database_override(args.env_file), _results_lock(args.output):
         stream, writer = _append_results(args.output)
         completed = 0
         failures = 0
@@ -705,6 +765,7 @@ def run_benchmark(
                                     "last_elapsed_seconds",
                                     time.monotonic() - started,
                                 )
+                                story_text = getattr(console, "last_story", "") or ""
                                 result = {
                                     "run_id": run_id,
                                     "query_file": str(query_path),
@@ -732,6 +793,11 @@ def run_benchmark(
                                         _escape_answer_newlines(answer)
                                         if args.escape_answer_newlines
                                         else answer
+                                    ),
+                                    "answer_story": (
+                                        _escape_answer_newlines(story_text)
+                                        if args.escape_answer_newlines
+                                        else story_text
                                     ),
                                     "status": status,
                                     "error": error_text,

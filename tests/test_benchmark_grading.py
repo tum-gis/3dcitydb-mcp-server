@@ -181,6 +181,32 @@ def test_benchmark_append_preserves_grades_and_blanks_new_rows(tmp_path):
     assert all(not rows[1][column] for column in benchmark_results.HUMAN_GRADING_COLUMNS)
 
 
+def test_load_and_save_migrate_results_without_answer_story_column(tmp_path):
+    path = tmp_path / "pre-story-results.csv"
+    row = _result_row()
+    # Write with the pre-"answer_story" header to emulate an old file.
+    legacy_header = benchmark_results.BENCHMARK_RESULT_COLUMNS[:21] + (
+        benchmark_results.BENCHMARK_RESULT_COLUMNS[22:]
+    )
+    row.pop("answer_story")
+    _write_results(path, legacy_header, [row])
+
+    loaded = benchmark_results.load_result_rows(path)[0]
+    assert loaded["answer_story"] == ""  # blank, not lost or shifted
+
+    identity = benchmark_results.result_identity(loaded)
+    benchmark_results.save_human_grade(path, identity, _grade_row())
+
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        assert tuple(reader.fieldnames or ()) == benchmark_results.RESULT_COLUMNS
+    saved = benchmark_results.load_result_rows(path)[0]
+    # Legacy escaped line breaks are normalized to real newlines on load.
+    assert saved["generated_answer"] == row["generated_answer"].replace("\\n", "\n")
+    assert saved["status"] == row["status"]
+    assert saved["human_correctness"] == "3"
+
+
 def test_benchmark_append_migrates_legacy_header(tmp_path):
     path = tmp_path / "legacy-results.csv"
     original = _result_row()
@@ -281,6 +307,9 @@ def test_local_grading_ui_builds_markdown_columns_and_rubric(tmp_path):
     assert any("Question" in value for value in markdown_values)
     assert any("Ground Truth Answer" in value for value in markdown_values)
     assert any("Generated Answer" in value for value in markdown_values)
+    assert any(
+        "How the answer was determined" in value for value in markdown_values
+    )
     assert edit_button["props"]["value"] == "✎"
     assert copy_button["props"]["value"] == "📋"
     assert (
