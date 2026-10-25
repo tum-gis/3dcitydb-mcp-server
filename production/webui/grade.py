@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+import threading
 import warnings
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,38 @@ from webui.benchmark_results import (
     save_ground_truth,
     save_human_grade,
 )
+
+# Rapid Next/Previous clicks are dispatched by Gradio as concurrent requests.
+# Each carries the client's last-known (index, identity) pair, so overlapping
+# requests act on a stale position and race on the CSV file. A re-entrant lock
+# serializes every read-modify-write on the results file, guaranteeing that
+# navigation is applied sequentially (each step on the previous step's result)
+# and that no request reads the file mid-rewrite.
+_CSV_LOCK = threading.RLock()
+_CSV_LOCK_TIMEOUT = 120.0
+
+
+class _CsvLockTimeout(ResultsCsvError):
+    """A results-file operation could not obtain the lock in time."""
+
+
+def _locked(func):
+    """Serialize func on _CSV_LOCK and wrap any acquire timeout."""
+
+    def wrapper(*args, **kwargs):
+        acquired = _CSV_LOCK.acquire(timeout=_CSV_LOCK_TIMEOUT)
+        if not acquired:
+            raise _CsvLockTimeout(
+                "Another operation on the results file took too long to release it."
+            )
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _CSV_LOCK.release()
+
+    wrapper.__name__ = getattr(func, "__name__", "wrapped")
+    wrapper.__doc__ = getattr(func, "__doc__", None)
+    return wrapper
 
 _RATING_CHOICES = [
     ("Not rated", ""),
@@ -345,6 +378,7 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
     if not rows:
         raise ResultsCsvError(f"Results CSV {path} contains no result rows.")
 
+    @_locked
     def render(index: int) -> tuple[Any, ...]:
         current_rows = load_result_rows(path)
         if not current_rows:
@@ -388,6 +422,7 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
         initial_status,
     ) = initial
 
+    @_locked
     def save_current(
         correctness: str,
         completeness: str,
@@ -414,6 +449,7 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
             f"Saved grading for result {index + 1}.",
         )
 
+    @_locked
     def begin_ground_truth_edit(
         identity: tuple[str, ...],
     ) -> tuple[Any, ...]:
@@ -430,9 +466,12 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
             gr.update(interactive=False),
             gr.update(interactive=False),
             gr.update(interactive=False),
+            gr.update(interactive=False),
+            gr.update(interactive=False),
             "Edit the raw Markdown source, then save or cancel before navigating.",
         )
 
+    @_locked
     def save_ground_truth_edit(
         source: str,
         identity: tuple[str, ...],
@@ -451,10 +490,13 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
             gr.update(interactive=True),
             gr.update(interactive=True),
             gr.update(interactive=True),
+            gr.update(interactive=True),
+            gr.update(interactive=True),
             f"Saved Ground Truth for this query in {updated_count} result row(s) "
             "in the current run.",
         )
 
+    @_locked
     def cancel_ground_truth_edit(
         identity: tuple[str, ...],
     ) -> tuple[Any, ...]:
@@ -471,53 +513,74 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
             gr.update(interactive=True),
             gr.update(interactive=True),
             gr.update(interactive=True),
+            gr.update(interactive=True),
+            gr.update(interactive=True),
             "Discarded unsaved Ground Truth edits.",
         )
 
     def preview_ground_truth(source: str) -> str:
         return source or "_(empty)_"
 
+    @_locked
     def move_to(
         action: str,
-        index: int,
-        identity: tuple[str, ...],
         correctness: str,
         completeness: str,
         relevance: str,
         clarity: str,
         language: str,
         comments: str,
+        identity: tuple[str, ...],
     ) -> tuple[Any, ...]:
-        saved_message = save_current(
+        # Anchor on the stable identity of the row the client is displaying, not
+        # an echoed index and not a server cursor. This is what makes navigation
+        # robust under both failure modes the user hit:
+        #   * overlapping requests carry the SAME identity, so they resolve to
+        #     the same target regardless of order/staleness (no wrong-direction
+        #     multi-row jumps), and
+        #   * a page reload simply sends the identity of the visible row, so
+        #     there is no shared server position to desync from the browser.
+        current_rows, current_index = _load_result_by_identity(path, identity)
+        # save_current returns (metadata, message); the metadata is already
+        # rendered separately for the row being left, so only the message is
+        # folded into the navigation status.
+        _saved_metadata, saved_message = save_current(
             correctness,
             completeness,
             relevance,
             clarity,
             language,
             comments,
-            index,
+            current_index,
             identity,
         )
-        current_rows = load_result_rows(path)
-        if not current_rows:
-            raise ResultsCsvError(f"Results CSV {path} contains no result rows.")
-        target = max(0, min(index, len(current_rows) - 1))
+        target = current_index
         if action == "previous":
-            target = max(0, index - 1)
+            target = max(0, current_index - 1)
+        elif action == "previous20":
+            target = max(0, current_index - 20)
         elif action == "next":
-            target = min(len(current_rows) - 1, index + 1)
+            target = min(len(current_rows) - 1, current_index + 1)
+        elif action == "next20":
+            target = min(len(current_rows) - 1, current_index + 20)
         elif action == "next_ungraded":
-            ungraded_index = _next_ungraded_index(current_rows, index)
+            ungraded_index = _next_ungraded_index(current_rows, current_index)
             if ungraded_index is None:
                 message = (
                     "All results are fully graded."
-                    if is_human_graded(current_rows[index])
+                    if is_human_graded(current_rows[current_index])
                     else "There are no other ungraded results."
                 )
-                return (*render(index)[:-1], message)
+                return (*render(current_index)[:-1], message)
             target = ungraded_index
         rendered = render(target)
-        return (*rendered[:-1], f"{saved_message} {rendered[-1]}")
+        # The save message names the row we are *leaving* (where any pending
+        # ratings were stored); lead with the row we are now *on* so it matches
+        # the "Result N of M" header and doesn't read as a contradiction.
+        return (
+            *rendered[:-1],
+            f"{saved_message} Now showing result {target + 1} of {len(current_rows)}.",
+        )
 
     # Gradio 5.x accepts theme/css/js only in the Blocks constructor, but emits a
     # DeprecationWarning for each, pointing at Blocks.launch() — which only accepts
@@ -642,9 +705,11 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
         )
 
         with gr.Row():
+            previous20 = gr.Button("Previous (-20)")
             previous = gr.Button("Previous")
             save_button = gr.Button("Save grading", variant="primary")
             next_button = gr.Button("Next")
+            next20 = gr.Button("Next (+20)")
             next_ungraded = gr.Button("Next ungraded")
         save_status = gr.Markdown(value=initial_status)
 
@@ -659,8 +724,10 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
                 edit_ground_truth_button,
                 save_ground_truth_button,
                 cancel_ground_truth_button,
+                previous20,
                 previous,
                 next_button,
+                next20,
                 next_ungraded,
                 save_status,
             ],
@@ -690,8 +757,10 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
                 edit_ground_truth_button,
                 save_ground_truth_button,
                 cancel_ground_truth_button,
+                previous20,
                 previous,
                 next_button,
+                next20,
                 next_ungraded,
                 save_status,
             ],
@@ -707,8 +776,10 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
                 edit_ground_truth_button,
                 save_ground_truth_button,
                 cancel_ground_truth_button,
+                previous20,
                 previous,
                 next_button,
+                next20,
                 next_ungraded,
                 save_status,
             ],
@@ -732,7 +803,9 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
             control.input(fn=save_current, inputs=save_inputs, outputs=[metadata, save_status])
         comments.change(fn=save_current, inputs=save_inputs, outputs=[metadata, save_status])
 
-        navigation_inputs = [index_state, identity_state, *controls]
+        # Navigation anchors on the identity (stable row key) the client is
+        # displaying; the position is derived server-side from that identity.
+        navigation_inputs = [identity_state, *controls]
         display_outputs = [
             question_view,
             truth_view,
@@ -753,13 +826,15 @@ def build_ui(results_csv: str | Path) -> gr.Blocks:
         ]
         output_values = [*display_outputs, save_status]
         for button, action in (
+            (previous20, "previous20"),
             (previous, "previous"),
             (next_button, "next"),
+            (next20, "next20"),
             (next_ungraded, "next_ungraded"),
         ):
             button.click(
-                fn=lambda index, identity, corr, comp, rel, clr, lang, note, action=action: move_to(
-                    action, index, identity, corr, comp, rel, clr, lang, note
+                fn=lambda identity, corr, comp, rel, clr, lang, note, action=action: move_to(
+                    action, corr, comp, rel, clr, lang, note, identity
                 ),
                 inputs=navigation_inputs,
                 outputs=output_values,

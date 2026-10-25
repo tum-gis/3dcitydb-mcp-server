@@ -274,6 +274,142 @@ def test_next_ungraded_navigation_wraps_and_stops_when_all_scored():
     assert grade._next_ungraded_index(rows, 1) is None
 
 
+def _write_multi_row_results(tmp_path: Path, count: int) -> Path:
+    path = tmp_path / "benchmark-results.csv"
+    rows = []
+    for index in range(count):
+        row = _result_row(query_id=f"q{index}", model_row=str(2 + index))
+        row.update({column: "" for column in benchmark_results.HUMAN_GRADING_COLUMNS})
+        rows.append(row)
+    _write_results(path, benchmark_results.RESULT_COLUMNS, rows)
+    return path
+
+
+def _nav_closures(app):
+    """Map 'previous'/'next'/'next_ungraded' to their bound nav closures."""
+    closures = {}
+    for fn in app.fns.values():
+        handler = getattr(fn, "fn", None)
+        if getattr(handler, "__name__", "") != "<lambda>":
+            continue
+        defaults = getattr(handler, "__defaults__", None)
+        if defaults and defaults[0] in {"previous", "next", "next_ungraded", "previous20", "next20"}:
+            closures[defaults[0]] = handler
+    return closures
+
+
+def test_jump_buttons_step_20_and_clamp_at_ends(tmp_path):
+    """'Previous (-20)' and 'Next (+20)' jump 20 rows and clamp at the ends."""
+    total = 30
+    path = _write_multi_row_results(tmp_path, total)
+    app = grade.build_ui(path)
+    closures = _nav_closures(app)
+    assert set(closures) == {"previous", "next", "next_ungraded", "previous20", "next20"}
+
+    next20 = closures["next20"]
+    previous20 = closures["previous20"]
+    rows = benchmark_results.load_result_rows(path)
+    identity = lambda index: benchmark_results.result_identity(rows[index])
+
+    assert next20(identity(0), "", "", "", "", "", "")[14] == 20
+    assert next20(identity(10), "", "", "", "", "", "")[14] == 30 - 1  # clamps at last
+    assert previous20(identity(25), "", "", "", "", "", "")[14] == 5
+    assert previous20(identity(10), "", "", "", "", "", "")[14] == 0  # clamps at first
+
+
+def test_navigation_is_anchored_to_identity_not_server_state(tmp_path):
+    """Next/Previous must step relative to the identity the client displays.
+
+    Regression for two bugs: a page reload used to leave a stale server cursor
+    behind (Next jumped to the pre-reload row + 1), and rapid overlapping
+    clicks landed in the wrong direction. Navigation now resolves the current
+    row from the stable identity sent by the client, so there is no server
+    position state to desync and repeated/stale calls are idempotent.
+    """
+    path = _write_multi_row_results(tmp_path, 4)
+    app = grade.build_ui(path)
+    closures = _nav_closures(app)
+    assert set(closures) == {"previous", "next", "next_ungraded", "previous20", "next20"}
+
+    next_fn = closures["next"]
+    previous_fn = closures["previous"]
+    rows = benchmark_results.load_result_rows(path)
+    identity = lambda index: benchmark_results.result_identity(rows[index])
+
+    # A fresh process (like a page reload) starts at row 0 and Next goes to 1
+    # — no remembered server position interferes.
+    assert next_fn(identity(0), "", "", "", "", "", "")[14] == 1
+    assert next_fn(identity(1), "", "", "", "", "", "")[14] == 2
+    assert next_fn(identity(2), "", "", "", "", "", "")[14] == 3
+    assert next_fn(identity(3), "", "", "", "", "", "")[14] == 3  # clamps at end
+    assert previous_fn(identity(3), "", "", "", "", "", "")[14] == 2
+    assert previous_fn(identity(1), "", "", "", "", "", "")[14] == 0
+    assert previous_fn(identity(0), "", "", "", "", "", "")[14] == 0  # clamps at start
+
+    # Idempotence under overlapping requests: the same identity always yields
+    # the same target, no matter how many stale echoes arrive.
+    first = next_fn(identity(1), "", "", "", "", "", "")
+    second = next_fn(identity(1), "", "", "", "", "", "")
+    assert first[14] == second[14] == 2
+
+    # The status names the row we are now on (matches the "Result N of M"
+    # header) and does not embed the saved-row metadata of the row we left.
+    status = next_fn(identity(0), "", "", "", "", "", "")[16]
+    assert "Now showing result 2 of 4" in status
+    assert "Result 1 of 4" not in status
+
+
+def test_navigation_serializes_concurrent_requests(tmp_path):
+    """Overlapping navigation requests must not corrupt state or the file.
+
+    Mirrors the real app where Gradio dispatches rapid clicks on a thread
+    pool: every read-modify-write is serialized on the results-file lock, so
+    indices stay in range and no save collides.
+    """
+    import threading
+
+    total = 20
+    path = _write_multi_row_results(tmp_path, total)
+    app = grade.build_ui(path)
+    closures = _nav_closures(app)
+    next_fn = closures["next"]
+    previous_fn = closures["previous"]
+    rows = benchmark_results.load_result_rows(path)
+    first_identity = benchmark_results.result_identity(rows[0])
+    last_identity = benchmark_results.result_identity(rows[-1])
+
+    indices: list[int] = []
+    errors: list[BaseException] = []
+    seen = threading.Lock()
+
+    def worker(handler, identity, count: int) -> None:
+        for _ in range(count):
+            try:
+                result_index = handler(identity, "", "", "", "", "", "")[14]
+            except BaseException as exc:  # noqa: BLE001 - capture any failure
+                with seen:
+                    errors.append(exc)
+                continue
+            with seen:
+                indices.append(result_index)
+
+    threads = [
+        threading.Thread(target=worker, args=(next_fn, first_identity, 8)),
+        threading.Thread(target=worker, args=(previous_fn, last_identity, 8)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert len(indices) == 16
+    assert all(0 <= index <= total - 1 for index in indices)
+    # With identity anchoring, Next from row 0 always lands on 1 regardless
+    # of interleaving, and Previous from the last row always lands on total-2.
+    assert set(indices) <= {1, total - 2}
+
+
 def test_local_grading_ui_builds_markdown_columns_and_rubric(tmp_path):
     path = tmp_path / "benchmark-results.csv"
     row = _result_row()

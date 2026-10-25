@@ -3,6 +3,7 @@
 import csv
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import TextIO
 
@@ -209,6 +210,15 @@ def _remove_temporary_csv(path: Path) -> None:
         raise ResultsCsvError(f"Could not remove temporary results file {path}: {exc}") from exc
 
 
+# Windows raises PermissionError (WinError 5) when another in-flight save still
+# holds a handle on the destination during the final os.replace. The grader can
+# issue several saves back-to-back, so retry the rename a few times before giving
+# up. The write is idempotent (full-file rewrite of the same logical contents),
+# so a lost race is safe to re-attempt.
+_REPLACE_ATTEMPTS = 8
+_REPLACE_RETRY_DELAY = 0.05
+
+
 def _atomic_write_rows(path: Path, rows: list[dict[str, str]]) -> None:
     temporary_path: Path | None = None
     try:
@@ -227,7 +237,7 @@ def _atomic_write_rows(path: Path, rows: list[dict[str, str]]) -> None:
                 writer.writerow({column: row.get(column, "") for column in RESULT_COLUMNS})
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_path, path)
+        _rename_with_retry(temporary_path, path)
     except ResultsCsvError:
         raise
     except (OSError, UnicodeError, csv.Error) as exc:
@@ -235,6 +245,22 @@ def _atomic_write_rows(path: Path, rows: list[dict[str, str]]) -> None:
     finally:
         if temporary_path is not None:
             _remove_temporary_csv(temporary_path)
+
+
+def _rename_with_retry(temporary_path: Path, path: Path) -> None:
+    last_error: Exception | None = None
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(temporary_path, path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            if attempt + 1 < _REPLACE_ATTEMPTS:
+                time.sleep(_REPLACE_RETRY_DELAY)
+    raise ResultsCsvError(
+        f"Could not save grading to results CSV {path} after "
+        f"{_REPLACE_ATTEMPTS} attempts (file in use by another save?): {last_error}"
+    )
 
 
 def ensure_result_schema(path: str | Path) -> None:
