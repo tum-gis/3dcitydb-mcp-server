@@ -10,13 +10,13 @@ raced under concurrent UI sessions on Python 3.10+.
 import asyncio
 import json
 import os
+import sys
 import threading
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, TextIO
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-
 
 _loop: asyncio.AbstractEventLoop | None = None
 _loop_lock = threading.Lock()
@@ -40,7 +40,10 @@ def _get_loop() -> asyncio.AbstractEventLoop:
 
 
 @asynccontextmanager
-async def mcp_session(progress_path: str | None = None):
+async def mcp_session(
+    progress_path: str | None = None,
+    stderr: TextIO | None = None,
+):
     env = os.environ.copy()
     # When a progress file is supplied, hand its path to the server subprocess
     # via env var so the assembly can append live step records there. This is a
@@ -53,7 +56,10 @@ async def mcp_session(progress_path: str | None = None):
         args=[],
         env=env,
     )
-    async with stdio_client(params) as (read, write):
+    async with stdio_client(
+        params,
+        errlog=stderr if stderr is not None else sys.stderr,
+    ) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             yield session
@@ -71,8 +77,9 @@ async def assemble_system_prompt(
     compact: bool = False,
     force_refresh: bool = False,
     progress_path: str | None = None,
+    stderr: TextIO | None = None,
 ) -> str:
-    async with mcp_session(progress_path=progress_path) as session:
+    async with mcp_session(progress_path=progress_path, stderr=stderr) as session:
         raw = await call_tool(
             session, "assemble_prompt",
             {
@@ -84,8 +91,12 @@ async def assemble_system_prompt(
     return raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
 
 
-async def run_tool(tool_name: str, arguments: dict) -> str:
-    async with mcp_session() as session:
+async def run_tool(
+    tool_name: str,
+    arguments: dict,
+    stderr: TextIO | None = None,
+) -> str:
+    async with mcp_session(stderr=stderr) as session:
         raw = await call_tool(session, tool_name, arguments)
     return raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
 
@@ -124,17 +135,22 @@ def assemble_system_prompt_sync(
     compact: bool = False,
     force_refresh: bool = False,
     progress_path: str | None = None,
+    stderr: TextIO | None = None,
 ) -> str:
     return _run_sync(
         assemble_system_prompt(
             include_query_agent_extras, compact=compact, force_refresh=force_refresh,
-            progress_path=progress_path,
+            progress_path=progress_path, stderr=stderr,
         )
     )
 
 
-def run_tool_sync(tool_name: str, arguments: dict) -> str:
-    return _run_sync(run_tool(tool_name, arguments))
+def run_tool_sync(
+    tool_name: str,
+    arguments: dict,
+    stderr: TextIO | None = None,
+) -> str:
+    return _run_sync(run_tool(tool_name, arguments, stderr=stderr))
 
 
 def list_tools_sync() -> list[dict]:

@@ -56,9 +56,11 @@ ENV WEBMAP_DIR=/app/webmap
 
 # ─── Entrypoint ─────────────────────────────────────────────────────────────
 COPY production/docker/entrypoint.sh /entrypoint.sh
+COPY production/docker/3dcitydb-chat /usr/local/bin/3dcitydb-chat
 # Normalize line endings: on Windows checkouts (core.autocrlf=true) the script
 # is CRLF, which would break the shebang (#!/bin/sh\r) at container start.
-RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh /usr/local/bin/3dcitydb-chat \
+    && chmod +x /entrypoint.sh /usr/local/bin/3dcitydb-chat
 
 # Run as non-root to limit blast radius. The /app/data volume is owned by the
 # host user inside the bind mount; entrypoint stays root-readable.

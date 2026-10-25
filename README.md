@@ -60,6 +60,57 @@ There are four ways to run the 3DCityDB MCP Server (Option 3b is a 3D-viewer var
 
 ---
 
+## Chat CLI
+
+The WebGUI-equivalent `3dcitydb-chat` CLI is included in the chatbot image used
+by Docker Options 2, 3, and 3b. Start one of those stacks first, then run the
+CLI in its chatbot container. For example, with the fullstack stack:
+
+```bash
+docker exec -it production-citydb-agent-1 3dcitydb-chat chat
+```
+
+The same CLI can run without Docker from a source checkout, but it is not part
+of the standard PyPI package. Install the project and WebGUI dependencies,
+configure the database/provider environment as described under Option 1, then
+run these commands from the `production` directory:
+
+```bash
+python -m pip install -e ..
+python -m pip install -r webui/requirements.txt
+python -m webui.cli chat
+```
+
+The local MCP server executable (`3dcitydb-mcp`) must be on `PATH`, and the
+configured database must be reachable from the machine running the CLI. Unlike
+the Docker CLI, a local CLI process uses that machine's environment and
+filesystem.
+
+Choose a provider and model explicitly when desired. For example:
+
+```bash
+docker exec -it production-citydb-agent-1 3dcitydb-chat chat \
+  --provider ollama --model qwen3.8:27b \
+  --temperature 0.1 --thinking high --prompt-mode auto --num-ctx 131072
+```
+
+Available options also include `--base-url`, `--keep-story` /
+`--no-keep-story`, `--include-reasoning`, and `--show-reasoning`. By default,
+provider reasoning is not displayed; `--show-reasoning` adds a clearly labeled
+reasoning/activity section on stderr. Use `/new` to clear conversation history
+and `/bye` or `/exit` to leave the session. Prompt assembly reports each
+database-context step and its duration on stdout. Status and context-size
+estimates also go to stdout. INFO logs and generation/tool diagnostics between
+submitting a question and receiving its answer go to stderr. Pass
+`--quiet-stderr` to suppress stderr output, including INFO logs.
+
+## Benchmarking and Validation
+
+Work on support for systematic result quality validation and benchmarking is work in progress. Documentation and usage of the already existing tools are documented
+in [`docs/benchmarking.md`](production/docs/benchmarking.md).
+
+---
+
 ## Option 1: PyPI Package
 
 Install the MCP server as a Python package and connect it to Claude Code, Claude Desktop, or any MCP-compatible client.
@@ -383,7 +434,7 @@ Add the viewer to the fullstack stack by layering `docker-compose.fullstack.viz.
 docker compose -f docker-compose.fullstack.yml -f docker-compose.fullstack.viz.yml up -d
 ```
 
-The Chat tab then shows the 3DCityDB Web Map Client next to the chat. The client streams the model as [3D Tiles](https://github.com/CesiumGS/3d-tiles): they are generated on demand by the [`citydb-3dtiler`](https://github.com/tum-gis/citydb-3dtiler) container (`ghcr.io/tum-gis/citydb-3dtiler`), which the stack starts as a sibling of the agent and writes into a shared `tiles_data` volume served at `/tiles`. After an import, tick *Generate 3D tiles after import*, or press **🔄 Refresh 3D tiles** above the viewer at any time (e.g. after editing the database directly). When an answer lists `objectid`s, those features are highlighted and the camera flies to them; features without geometry of their own, such as a `Room`, are expanded to the surfaces they contain (see `resolve_highlight_targets` below).
+The Chat tab then shows the 3DCityDB Web Map Client next to the chat. The client streams the model as [3D Tiles](https://github.com/CesiumGS/3d-tiles): they are generated on demand by the [`citydb-3dtiler`](https://github.com/3dcitydb/citydb-3dtiler) container (`ghcr.io/3dcitydb/citydb-3dtiler`), which the stack starts as a sibling of the agent and writes into a shared `tiles_data` volume served at `/tiles`. After an import, tick *Generate 3D tiles after import*, or press **🔄 Refresh 3D tiles** above the viewer at any time (e.g. after editing the database directly). When an answer lists `objectid`s, those features are highlighted and the camera flies to them; features without geometry of their own, such as a `Room`, are expanded to the surfaces they contain (see `resolve_highlight_targets` below).
 
 **Selecting objects for the chatbot.** The viewer also supports selection: turn on the *ON/OFF* toggle in the viewer's selection panel and click features in the 3D scene — a click on a boundary surface, e.g. a wall, opens a small panel offering the picked surface, its containing feature such as the building, and its siblings, so you can add the level you actually mean (*Add to selection*). The selected features are listed in the panel (removable with *−*) and appear live as a *🖱 … features selected* badge in the chat UI. Press **✓ Finish selecting** when done. The chatbot receives the selection as a `[VIEWER SELECTION]` context block, so questions like "What is the total floor area of **these** buildings?" or "Wie alt sind **die ausgewählten** Objekte?" are scoped to exactly the selected `objectid`s — no coordinate or address filtering needed.
 

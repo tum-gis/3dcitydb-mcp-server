@@ -46,9 +46,19 @@ from webui.llm_utils import (
     request_stop, _clear_stop, _is_stopped,
     _get_provider_ctx_limit, _estimate_tokens, _log_context_usage,
     _ollama_reachable,
-    should_use_compact,
 )
-from webui.backends import stream as agent_stream
+from webui.chat_runtime import (
+    ChatTurnSettings,
+    build_reasoning_transcript as _build_reasoning_transcript,
+    build_tool_cache as _build_tool_cache,
+    cache_is_fresh as _cache_is_fresh,
+    format_tool_cache_note as _format_tool_cache_note,
+    resolve_compact as _resolve_compact,
+    summarize_story_ollama as _runtime_summarize_story_ollama,
+    summarize_story_openai as _runtime_summarize_story_openai,
+    prepare_chat_turn,
+    stream_chat_turn,
+)
 from webui.model_profiles import profile_for_model
 from webui.mcp_client import (
     assemble_system_prompt_sync, run_tool_sync, list_tools_sync,
@@ -166,65 +176,6 @@ if _webmap_params:
     from urllib.parse import urlencode as _urlencode
     _WEBMAP_SRC += "?" + _urlencode(_webmap_params)
 
-_MAX_CONTEXT_CHARS = 400_000
-
-# ── Last-tool-result cache (per Gradio session) ───────────────────────────────
-# When the user asks a follow-up like "which ones?" we want the model to be
-# able to reference the previous tool result without re-querying. The cache
-# is kept in a gr.State; it is updated on every successful tool result and
-# injected as a system-side hint into the next turn's messages.
-_TOOL_CACHE_TTL_SEC = 300       # 5 minutes; older entries are dropped.
-_TOOL_CACHE_ROW_CAP = 30        # max rows carried into next turn.
-_TOOL_CACHE_CHAR_CAP = 6000     # hard ceiling on the injected block.
-
-
-def _build_tool_cache(sql: str, all_rows: list, row_count: int) -> dict | None:
-    """Make a compact cache entry. Returns None if there's nothing to cache."""
-    import time as _t
-    if not sql or row_count <= 0 or not all_rows:
-        return None
-    rows = all_rows[:_TOOL_CACHE_ROW_CAP]
-    truncated = len(all_rows) > _TOOL_CACHE_ROW_CAP
-    return {
-        "sql": sql,
-        "rows": rows,
-        "row_count": row_count,
-        "truncated": truncated,
-        "ts": _t.time(),
-    }
-
-
-def _format_tool_cache_note(cache: dict) -> str:
-    """Render the cache as a system-side hint for the next turn."""
-    import json as _json
-    import time as _t
-    age = max(0, int(_t.time() - cache.get("ts", _t.time())))
-    rows_json = _json.dumps(cache["rows"], default=str, ensure_ascii=False)
-    if len(rows_json) > _TOOL_CACHE_CHAR_CAP:
-        rows_json = rows_json[: _TOOL_CACHE_CHAR_CAP] + "…(truncated)"
-    # LangChain ChatPromptTemplate interprets {name} as a template variable.
-    # Double-escape all curly braces in the JSON so they pass through as literals.
-    rows_json = rows_json.replace("{", "{{").replace("}", "}}")
-    note = (
-        "PREVIOUS QUERY RESULT (from {age}s ago, still considered fresh)\n"
-        "SQL:\n```sql\n{sql}\n```\n"
-        "Returned {n} row(s){trunc}:\n"
-        "{rows}\n\n"
-        "GUIDANCE: If the user's follow-up references this exact result "
-        "(\"which ones?\", \"show me\", \"explain\", \"format as a table\", etc.), "
-        "answer directly from these rows — do NOT re-issue the same query. "
-        "Re-query only if the follow-up needs different columns, a different "
-        "filter, or fresh data."
-    ).format(
-        age=age,
-        sql=cache["sql"].strip(),
-        n=cache["row_count"],
-        trunc=(f" (showing first {_TOOL_CACHE_ROW_CAP})" if cache.get("truncated") else ""),
-        rows=rows_json,
-    )
-    return note
-
-
 def _format_selection_note(features: list[dict]) -> str:
     """Render the viewer's current selection as a system-side scoping hint.
 
@@ -252,48 +203,6 @@ def _format_selection_note(features: list[dict]) -> str:
         "about the whole dataset instead, answer globally but say in one "
         "sentence that the selection was not applied."
     )
-
-
-def _cache_is_fresh(cache: dict | None) -> bool:
-    if not cache or not isinstance(cache, dict):
-        return False
-    import time as _t
-    return (_t.time() - cache.get("ts", 0)) <= _TOOL_CACHE_TTL_SEC
-
-
-def _trim_messages(
-    messages: list[dict], token_limit: int = 0
-) -> tuple[list[dict], int]:
-    """Drop oldest history turns (never the system prompt) to fit within the limit."""
-    system = [m for m in messages if m["role"] == "system"]
-    others = [m for m in messages if m["role"] != "system"]
-    kept: list[dict] = []
-
-    if token_limit > 0:
-        effective = int(token_limit * 0.80)
-        used = sum(len(str(m.get("content") or "")) for m in system) // 3
-        for msg in reversed(others):
-            cost = len(str(msg.get("content") or "")) // 3
-            if used + cost > effective:
-                break
-            kept.insert(0, msg)
-            used += cost
-    else:
-        used = sum(len(str(m.get("content") or "")) for m in system)
-        for msg in reversed(others):
-            cost = len(str(msg.get("content") or ""))
-            if used + cost > _MAX_CONTEXT_CHARS:
-                break
-            kept.insert(0, msg)
-            used += cost
-
-    dropped = len(others) - len(kept)
-    if dropped:
-        print(
-            f"[chat] context trim: dropped {dropped} oldest turn(s) to fit within limit",
-            flush=True,
-        )
-    return system + kept, dropped
 
 
 # ── System prompt cache (supports compact mode) ────────────────────────────────
@@ -853,31 +762,6 @@ def get_status_html(provider: str = "", model: str = "", prompt_mode_label: str 
     )
 
 
-# ── Compact-mode resolution ────────────────────────────────────────────────────
-
-def _resolve_compact(prompt_mode: str, provider: str, model: str) -> tuple[bool, str]:
-    """Return (effective_compact, label) for the given radio value + provider/model.
-
-    label is one of: 'compact (auto)', 'compact (forced)', 'full (auto)', 'full (forced)'.
-    """
-    if provider not in _LOCAL_PROVIDERS:
-        return False, "full"
-    if prompt_mode == "compact":
-        return True, "compact (forced)"
-    if prompt_mode == "full":
-        return False, "full (forced)"
-    # auto — the model's empirical class may demand a specific mode
-    # (e.g. wrong-sql models get the full prompt for stronger schema emphasis).
-    profile = profile_for_model(model) if provider in _LOCAL_PROVIDERS else None
-    if profile is not None and profile.default_prompt_mode in ("compact", "full"):
-        use_compact = profile.default_prompt_mode == "compact"
-        label = f"{profile.default_prompt_mode} (model class)"
-        return use_compact, label
-    use_compact = should_use_compact(provider, model)
-    label = "compact (auto)" if use_compact else "full (auto)"
-    return use_compact, label
-
-
 # ── SQL extraction ─────────────────────────────────────────────────────────────
 _SQL_RE = re.compile(r"```sql\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
@@ -898,202 +782,6 @@ def _esc_angle(text: str) -> str:
     <<abstract>> stereotypes, --|> arrows) is rendered as literal text by
     gr.Markdown instead of being parsed as (malformed) HTML tags."""
     return text.replace("<", "&lt;").replace(">", "&gt;")
-
-
-def _build_reasoning_transcript(events: list) -> str:
-    """Reconstruct a compact thought/action/observation transcript from the
-    raw event stream. Used to optionally replay reasoning into future turns'
-    context.
-
-    Handles both reasoning styles:
-    - Ollama: live ``thinking_token`` stream (local.py).
-    - OpenAI-compatible: complete ``thinking`` blobs emitted per LLM call
-      (cloud.py, from reasoning_content / reasoning_details fields).
-    A given turn only ever uses one of the two, so both are appended to the
-    same buffer without ambiguity.
-    """
-    parts: list[str] = []
-    buf = ""
-    for event, data in events:
-        if event in ("thinking_token", "thinking"):
-            # Flush any partial stream before a complete reasoning blob so
-            # the transcript stays in stream order.
-            if event == "thinking" and buf.strip():
-                parts.append(buf.strip())
-                buf = ""
-            buf += data
-        elif event == "tool_call":
-            if buf.strip():
-                parts.append(buf.strip())
-                buf = ""
-            sql = data.get("args", {}).get("sql", "")
-            parts.append(f"[Action] run_query: {sql}")
-        elif event == "tool_result":
-            if data.get("error"):
-                parts.append(f"[Observation] Error: {data['error']}")
-            else:
-                parts.append(f"[Observation] {data.get('row_count', 0)} row(s) returned")
-    if buf.strip():
-        parts.append(buf.strip())
-    return "\n".join(parts)
-
-
-def _trim_transcript_for_story(transcript: str) -> str:
-    """Bound the transcript fed to the story distillation prompt.
-
-    Tail-preserving: the *latest* part of the trace is kept. The successful
-    final queries (the actual success path the story must capture) sit at
-    the END of the transcript, after early exploration and failed branches —
-    a prefix cut (the old behaviour) dropped exactly that material on long
-    thinking runs. 30k chars (~8k tokens) is small against the >=64k context
-    windows of the models we target, so most transcripts fit in full.
-    """
-    max_chars = int(os.environ.get("STORY_TRANSCRIPT_MAX_CHARS", "30000"))
-    if len(transcript) <= max_chars:
-        return transcript
-    return "[…] earlier trace truncated […]\n" + transcript[-max_chars:]
-
-
-def _summarize_story_ollama(transcript: str, question: str, model: str, num_ctx: int | None) -> tuple[str, str]:
-    """Ask the same Ollama model to distill this turn's reasoning chain into a
-    compact "how the answer was found" story: numbered steps of
-    purpose → verbatim SQL → short result, dead-end branches excluded (they
-    may only appear as one-line "Avoid:" warnings).
-
-    The story is replayed into later turns' context so follow-up questions
-    can adapt earlier (working) queries instead of re-deriving them from
-    scratch. Runs synchronously — adds one extra blocking generation after
-    the turn that just finished. Returns (story, error) — exactly one is
-    truthy; on failure story is "" and error explains why.
-    """
-    if not transcript.strip():
-        return "", "no reasoning transcript to distill"
-
-    from langchain_ollama import ChatOllama
-
-    trace = _trim_transcript_for_story(transcript)
-    prompt = (
-        "A database assistant answered the user question below. Its full "
-        "reasoning trace (including abandoned, failed, or superseded "
-        "approaches) is provided after it. If the trace starts with a "
-        "truncation marker, the missing earlier part contained exploration "
-        "or failed branches — base the story only on the visible steps.\n\n"
-        f"USER QUESTION: {question[:500]}\n\n"
-        f"REASONING TRACE:\n{trace}\n\n"
-        "Write a compact story of ONLY the successful path that led to the "
-        "final answer, using exactly this structure:\n"
-        "1. <one short line: what this step achieved>\n"
-        "   SQL: <the SQL of this step, VERBATIM — copy it exactly, never "
-        "abbreviate, paraphrase, or truncate it>\n"
-        "   Result: <one or two lines: row count, the key values used, any "
-        "notable anomaly>\n"
-        "2. … (repeat per successful step, in order)\n"
-        "End with one 'Avoid:' line per abandoned or failed approach worth "
-        "remembering (one line each, e.g. a wrong column or code mapping the "
-        "agent corrected). If none, write 'Avoid: none'.\n"
-        "Rules:\n"
-        "- Do NOT include SQL from abandoned branches as numbered steps — "
-        "only as 'Avoid:' warnings.\n"
-        "- The SQL lines must be byte-for-byte identical to the trace.\n"
-        "- Make explicit WHY the final query works: the key table/column "
-        "mappings it relies on.\n"
-        "- Prose budget: at most 300 words outside the SQL blocks. No extra "
-        "sections, no restatement of the final answer."
-    )
-    try:
-        llm = ChatOllama(
-            model=model,
-            base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
-            temperature=0.0,
-            timeout=float(os.environ.get("OLLAMA_TIMEOUT", "300")),
-            num_predict=700,
-            reasoning=False,
-            model_kwargs={"num_ctx": num_ctx or 131072},
-        )
-        result = llm.invoke([{"role": "user", "content": prompt}])
-        text = (result.content or "").strip()
-        if not text:
-            return "", "model returned an empty story"
-        return text, ""
-    except Exception as exc:
-        print(f"[chat] story summarization failed: {exc}", flush=True)
-        return "", f"{type(exc).__name__}: {exc}"
-
-
-def _summarize_story_openai(transcript: str, question: str, model: str) -> tuple[str, str]:
-    """OpenAI-provider twin of _summarize_story_ollama: distill this turn's
-    reasoning trace into the same compact "how the answer was found" story.
-
-    Uses the shared LiteLLM plumbing (safe_completion / _litellm_kwargs) so
-    OLLAMA-hosted OpenAI-compatible endpoints work out of the box. Runs
-    synchronously — one extra blocking generation. Returns (story, error);
-    exactly one is truthy.
-    """
-    if not transcript.strip():
-        return "", "no reasoning transcript to distill"
-
-    from webui.llm_utils import safe_completion, _litellm_kwargs
-
-    trace = _trim_transcript_for_story(transcript)
-    prompt = (
-        "A database assistant answered the user question below. Its full "
-        "reasoning trace (including abandoned, failed, or superseded "
-        "approaches) is provided after it. If the trace starts with a "
-        "truncation marker, the missing earlier part contained exploration "
-        "or failed branches — base the story only on the visible steps.\n\n"
-        f"USER QUESTION: {question[:500]}\n\n"
-        f"REASONING TRACE:\n{trace}\n\n"
-        "Write a compact story of ONLY the successful path that led to the "
-        "final answer, using exactly this structure:\n"
-        "1. <one short line: what this step achieved>\n"
-        "   SQL: <the SQL of this step, VERBATIM — copy it exactly, never "
-        "abbreviate, paraphrase, or truncate it>\n"
-        "   Result: <one or two lines: row count, the key values used, any "
-        "notable anomaly>\n"
-        "2. … (repeat per successful step, in order)\n"
-        "End with one 'Avoid:' line per abandoned or failed approach worth "
-        "remembering (one line each, e.g. a wrong column or code mapping the "
-        "agent corrected). If none, write 'Avoid: none'.\n"
-        "Rules:\n"
-        "- Do NOT include SQL from abandoned branches as numbered steps — "
-        "only as 'Avoid:' warnings.\n"
-        "- The SQL lines must be byte-for-byte identical to the trace.\n"
-        "- Make explicit WHY the final query works: the key table/column "
-        "mappings it relies on.\n"
-        "- Prose budget: at most 300 words outside the SQL blocks. No extra "
-        "sections, no restatement of the final answer."
-    )
-    try:
-        # enable_thinking=False → reasoning_effort "none" where supported,
-        # so the distillation call stays fast and cheap.
-        #
-        # Deliberately NO temperature here: forcing temperature=0.0 through
-        # the OpenAI-compatible path makes thinking models (gpt-oss,
-        # gemma4) spend the entire completion budget on reasoning and return
-        # empty content (finish_reason=length, content=""). With the model's
-        # default sampling they produce the requested structure reliably.
-        kw = _litellm_kwargs("openai", model, None, enable_thinking=False)
-        kw["max_tokens"] = int(os.environ.get("STORY_MAX_TOKENS", "2000"))
-        # litellm silently drops the reasoning_effort kwarg for generic
-        # OpenAI-compatible endpoints (verified: the outgoing create() call
-        # carries no reasoning_effort and an empty extra_body). extra_body is
-        # forwarded verbatim, so force it through there.
-        kw["extra_body"] = {"reasoning_effort": "none"}
-        for attempt in (1, 2):
-            resp = safe_completion(kw, messages=[{"role": "user", "content": prompt}])
-            text = (resp.choices[0].message.content or "").strip()
-            if text:
-                return text, ""
-            finish = resp.choices[0].finish_reason
-            print(
-                f"[chat] story summarization (openai) attempt {attempt} "
-                f"returned empty content (finish_reason={finish})",
-                flush=True,
-            )
-        return "", "model returned an empty story"
-    except Exception as exc:
-        print(f"[chat] story summarization (openai) failed: {exc}", flush=True)
-        return "", f"{type(exc).__name__}: {exc}"
 
 
 def chat_stream(
@@ -1120,7 +808,7 @@ def chat_stream(
     # _build_reasoning_transcript / the two toggles below.
     reasoning_history = list(reasoning_history) if reasoning_history else []
     # Distilled "how the answer was found" story per turn (index-aligned
-    # with `history`). See _summarize_story_ollama.
+    # with `history`). See the shared chat runtime's story distillation helper.
     story_history = list(story_history) if story_history else []
     # Cache value to emit alongside every yield. Starts as whatever the UI
     # passed in; reassigned after a successful tool result this turn.
@@ -1169,48 +857,9 @@ def chat_stream(
     total_chars = len(system_prompt)
     print(f"[prompt] sys: {len(system_prompt)} chars, msgs: {len(history)}, total: {total_chars}", flush=True)
 
-    _COUNT_PATTERN = re.compile(
-        r"^\s*(there (are|is)|es gibt|il y a)\s+\d+\b.*\.\s*$",
-        re.IGNORECASE,
-    )
-    messages: list[dict] = [{"role": "system", "content": system_prompt}]
-    _replay_reasoning = reasoning_replay
-    for idx, (user_msg, asst_msg) in enumerate(history[:-1]):
-        if user_msg:
-            messages.append({"role": "user", "content": user_msg})
-        if asst_msg and not asst_msg.startswith("*") and not asst_msg.startswith("●"):
-            if _COUNT_PATTERN.match(asst_msg.strip()) and len(asst_msg) < 200:
-                continue
-            content = asst_msg
-            if _replay_reasoning and idx < len(reasoning_history) and reasoning_history[idx]:
-                content = f"[Reasoning]\n{reasoning_history[idx]}\n\n[Answer]\n{asst_msg}"
-            messages.append({"role": "assistant", "content": content})
-            if add_story and idx < len(story_history) and story_history[idx]:
-                # The distilled story goes in a SEPARATE system message
-                # directly after the assistant answer it belongs to:
-                # order-preserving (kept in the context of the question that
-                # produced it) but role-separated, so the model can never
-                # read it as the assistant's own past output and imitate it.
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        "[AUTO-GENERATED SUMMARY — system context only. "
-                        "This block was appended automatically after the "
-                        "preceding assistant answer by a separate process; "
-                        "the user never saw it. It exists solely to help "
-                        "answer follow-up questions. Never quote, repeat, "
-                        "imitate, or reformat it in your answers. Note that "
-                        "row counts are condition-bound.]\n"
-                        + story_history[idx]
-                    ),
-                })
-    messages.append({"role": "user", "content": user_message})
-
-    # If we have a fresh cache from the previous turn, inject it as an extra
-    # system message right after the main system prompt. _trim_messages keeps
-    # all system messages, so it survives history pruning.
+    leading_system_notes: list[str] = []
     if cache_out is not None:
-        messages.insert(1, {"role": "system", "content": _format_tool_cache_note(cache_out)})
+        leading_system_notes.append(_format_tool_cache_note(cache_out))
         print(
             f"[chat] injected cached tool result: {cache_out['row_count']} rows, "
             f"age={int((__import__('time').time() - cache_out.get('ts', 0)))}s",
@@ -1222,14 +871,32 @@ def chat_stream(
     # cache above). Gated on ENABLE_VIZ so a selection can only ever exist,
     # and only ever be injected, when the 3D viewer is actually in use.
     if ENABLE_VIZ and selection and selection.get("features"):
-        messages.insert(1, {"role": "system", "content": _format_selection_note(selection["features"])})
+        leading_system_notes.insert(0, _format_selection_note(selection["features"]))
         print(f"[chat] injected viewer selection: {len(selection['features'])} feature(s)", flush=True)
 
-    # Distilled stories from earlier turns are injected as separate system
-    # messages right after the assistant answer that produced them (see the
-    # history loop above). _trim_messages keeps all system messages, so
-    # story notes survive context pruning of their originating turn — they
-    # simply outlive it as standalone reference notes.
+    prepared_turn = prepare_chat_turn(
+        user_message,
+        history[:-1],
+        sp,
+        ChatTurnSettings(
+            provider=provider,
+            model=model,
+            temperature=temperature,
+            enable_thinking=enable_thinking,
+            prompt_mode=prompt_mode,
+            num_ctx=num_ctx,
+        ),
+        reasoning_history=reasoning_history,
+        story_history=story_history,
+        reasoning_replay=reasoning_replay,
+        add_story=add_story,
+        leading_system_notes=leading_system_notes,
+    )
+    messages = prepared_turn.messages
+    ctx_limit = prepared_turn.context_limit
+    dropped_turns = prepared_turn.dropped_messages
+    used_tok = prepared_turn.estimated_tokens
+
     _story_blocks = [s for s in story_history if s]
     if _story_blocks:
         print(
@@ -1237,10 +904,6 @@ def chat_stream(
             flush=True,
         )
 
-    ctx_limit = num_ctx if num_ctx else _get_provider_ctx_limit(provider, model)
-    messages, dropped_turns = _trim_messages(messages, token_limit=ctx_limit)
-
-    used_tok = _estimate_tokens(messages)
     ctx_bar_html = _make_ctx_bar(used_tok, ctx_limit)
 
     accumulated = ""
@@ -1299,11 +962,17 @@ def chat_stream(
 
     # ── Main agentic loop (single dispatcher call) ─────────────────────────────
     try:
-        for event, data in agent_stream(
-            provider, model, temperature, messages,
+        for event, data in stream_chat_turn(
+            ChatTurnSettings(
+                provider=provider,
+                model=model,
+                temperature=temperature,
+                enable_thinking=enable_thinking,
+                prompt_mode=prompt_mode,
+                num_ctx=num_ctx,
+            ),
+            messages,
             tool_executor=lambda sql: run_tool_sync("run_query", {"sql": sql}),
-            enable_thinking=enable_thinking,
-            num_ctx=num_ctx,
         ):
             collected_events.append((event, data))
 
@@ -1377,7 +1046,7 @@ def chat_stream(
 
     except Exception as exc:
         import traceback
-        print(f"[chat] agent_stream raised {type(exc).__name__}: {exc}", flush=True)
+        print(f"[chat] stream_chat_turn raised {type(exc).__name__}: {exc}", flush=True)
         traceback.print_exc()
         trace_md = log(f"❌ **Exception:** `{type(exc).__name__}: {exc}`")
         _exc_name = type(exc).__name__
@@ -1431,9 +1100,13 @@ def chat_stream(
             story_transcript = _build_reasoning_transcript(collected_events)
             if story_transcript:
                 if provider == "openai":
-                    story, story_error = _summarize_story_openai(story_transcript, user_message, model)
+                    story, story_error = _runtime_summarize_story_openai(
+                        story_transcript, user_message, model
+                    )
                 else:
-                    story, story_error = _summarize_story_ollama(story_transcript, user_message, model, num_ctx)
+                    story, story_error = _runtime_summarize_story_ollama(
+                        story_transcript, user_message, model, num_ctx
+                    )
                 if story:
                     story_history = story_history + [story]
                     quoted = story.replace("\n", "\n> ")
@@ -2462,6 +2135,195 @@ async (_win, _event_data) => {
       }
     }
   });
+
+  // ── Keep the chat scrolled up while the answer streams ───────────────
+    // Both gr.Chatbot(...) instances are built with autoscroll=False: with
+    // the default (True) Gradio resets the chat's scrollTop to scrollHeight
+    // on every value change. chat_stream() yields on every stream event —
+    // every reasoning token, ping and status — so during a query the view
+    // is yanked to the bottom tens of times a second and the user cannot
+    // scroll up to read the earlier history (and Gradio 5.50's internal
+    // "user scrolled up" flag is sticky, so its autoscroll stops working
+    // permanently after the first scroll-up anyway).
+    // So this block owns all chat scrolling:
+    //   • while the user is AT the bottom → follow the stream ourselves
+    //     (chatFollowToBottom, driven every frame);
+    //   • once the user scrolls >60px away from the bottom → pin the view
+    //     to that position and keep it there for as long as they stay up,
+    //     regardless of how much content streams in;
+    //   • unpin when the user scrolls back to the bottom by gesture,
+    //     submits a new message, or clicks Gradio's "Scroll down" button,
+    //     so the view follows the stream / the new turn again.
+    var PIN_THRESHOLD = 60;   // px from the bottom = "user scrolled up"
+    var chatPinned = false;
+    var chatPinnedTop = 0;
+    var chatFollowing = true; // at the bottom → keep following the stream
+  function chatScrollEl() {
+    var conv = document.querySelector('[aria-label="chatbot conversation"]');
+    if (!conv) return null;
+    var el = conv;
+    while (el && el !== document.body) {
+      if (el.scrollHeight > el.clientHeight &&
+          /auto|scroll/.test(getComputedStyle(el).overflowY)) return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+  function chatDistanceFromBottom(el) {
+    return el.scrollHeight - el.scrollTop - el.clientHeight;
+  }
+  function chatRestore(el) {
+    if (chatPinned && el.scrollTop !== chatPinnedTop) {
+      el.scrollTop = chatPinnedTop;
+    }
+  }
+  function chatFollowToBottom(el) {
+    if (chatFollowing && !chatPinned &&
+        el.scrollHeight - el.scrollTop - el.clientHeight > 2) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }
+  // ── Per-element bookkeeping ─────────────────────────────────────────
+  // Svelte swaps the chat's scrollable element on re-renders (tab
+  // switches, the "Thinking…" bubble being replaced by the answer), so
+  // every scroll operation must resolve the CURRENT live element rather
+  // than a captured one. Handlers are attached per-element; the
+  // MutationObserver + interval enforce the position on whatever element
+  // is live right now.
+  var chatObs = null;
+  var chatObsEl = null;
+  var chatHandlerEl = null;
+  var lastGestureT = 0;   // shared: a wheel/touch/keydown stamps the time
+
+  // Resolve the currently-live scrollable element.
+  function chatLiveEl() { return chatScrollEl(); }
+
+  // Gesture stamping. A wheel/touch/keydown fires BEFORE the scroll it
+  // causes, so we only record the time here; the scroll handler below
+  // decides (with the fresh position) whether it was "to the bottom".
+  function chatStampGesture() { lastGestureT = performance.now(); }
+  function chatGesture() {
+    chatStampGesture();
+    // Any input gesture while at the bottom resumes following.
+    var el = chatLiveEl();
+    if (el && !chatPinned && chatDistanceFromBottom(el) <= PIN_THRESHOLD) {
+      chatFollowing = true;
+    }
+  }
+
+  function chatAttachHandlers(el) {
+    if (el === chatHandlerEl) return;
+    chatHandlerEl = el;
+    el.addEventListener("wheel", chatGesture, { passive: true });
+    el.addEventListener("touchmove", chatGesture, { passive: true });
+    // A scrollbar drag ends in a mouseup over the scrollbar itself
+    // (right edge). A mouseup in the content area is a click / text
+    // selection — not a scroll gesture, so it must not count (a plain
+    // click must not accidentally unpin).
+    el.addEventListener("mouseup", function (e) {
+      var r = el.getBoundingClientRect();
+      if (e.clientX >= r.right - 16) chatGesture();
+    }, { passive: true });
+    el.addEventListener("scroll", function () {
+      // Re-resolve the live element: the scroll event may have fired on
+      // a now-stale element if Svelte swapped mid-event.
+      var live = chatLiveEl();
+      if (!live) return;
+      // At-bottom is only meaningful when a real gesture is in flight —
+      // Gradio's autoscroll yank always lands exactly at the bottom but
+      // is never preceded by one (and with autoscroll=False there is no
+      // yank at all, so this branch mostly guards the user's own scrolls).
+      var atBottom = chatDistanceFromBottom(live) <= PIN_THRESHOLD;
+      var gestureAtBottom = atBottom && performance.now() - lastGestureT < 300;
+      if (chatPinned) {
+        // Our restore runs as a microtask right after each Svelte render
+        // — before any scroll event fires — so an event that still sees
+        // the pinned position is a byproduct of the restore, not input.
+        if (Math.abs(live.scrollTop - chatPinnedTop) < 1) return;
+        if (gestureAtBottom) {
+          // Reached the bottom by an explicit gesture: the user chose to
+          // follow the stream again.
+          chatPinned = false;
+          chatFollowing = true;
+        } else if (!atBottom) {
+          // User moved up OR down but did not reach the bottom: track
+          // them.
+          chatPinnedTop = live.scrollTop;
+        } else {
+          // At the bottom without a recent gesture: treat as a yank and
+          // restore to the pinned position.
+          chatRestore(live);
+        }
+      } else if (gestureAtBottom) {
+        chatPinned = false;
+        chatFollowing = true;
+      } else if (!atBottom) {
+        chatPinned = true;
+        chatPinnedTop = live.scrollTop;
+        chatFollowing = false;
+      }
+      // else: at the bottom without a gesture (user sitting at the
+      // bottom) — nothing to do; the follow loop keeps the view with
+      // the stream.
+    }, { passive: true });
+  }
+
+  function chatAttach() {
+    var el = chatScrollEl();
+    if (!el) return;
+    chatAttachHandlers(el);
+    // Re-observe when the element swaps.
+    if (el === chatObsEl) return;
+    if (chatObs) chatObs.disconnect();
+    chatObsEl = el;
+    chatObs = new MutationObserver(function () {
+      // Runs as a microtask after every Svelte DOM mutation — i.e. after
+      // the content changed and before the next paint.
+      var live = chatLiveEl();
+      if (live && chatPinned) chatRestore(live);
+    });
+    chatObs.observe(el, { childList: true, subtree: true,
+                          characterData: true });
+  }
+
+  // Single interval: enforce the pinned position or follow the stream on
+  // whatever element is live right now. ~60fps via requestAnimationFrame
+  // would be smoother, but the interval is robust to element swaps (it
+  // never holds a reference) and cheap.
+  setInterval(function () {
+    var el = chatLiveEl();
+    if (!el) return;
+    if (chatPinned) chatRestore(el);
+    else chatFollowToBottom(el);
+  }, 16);
+
+  function chatUnpin() {
+    chatPinned = false;
+    chatFollowing = true;   // follow the new turn to the bottom
+  }
+  // New message submitted, or the user pressed Gradio's own "Scroll down"
+  // button (shown when scrolled up) → follow the bottom again.
+  document.addEventListener("click", function (e) {
+    var t = e.target;
+    if (!t || !t.closest) return;
+    if (t.closest("#send-btn")) {
+      chatUnpin();
+    } else if (t.closest('button[aria-label="Scroll down"]')) {
+      chatUnpin();
+    }
+  }, { passive: true });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      var t = e.target;
+      // #msg-input is the wrapper div; the actual control is the
+      // <textarea> inside it.
+      if (t && t.closest && t.closest("#msg-input")) chatUnpin();
+    }
+  }, { passive: true });
+  // Svelte swaps the chat element on re-renders (tab switches, streaming),
+  // so resolve it lazily on every interval tick, like the splitter code.
+  setInterval(chatAttach, 400);
+  chatAttach();
 
   // ── No math rendering in the "Agent activity" trace panel ────────────
   // Gradio's markdown renderer applies KaTeX page-wide, which would mangle
@@ -3499,6 +3361,12 @@ def build_ui() -> gr.Blocks:
                                     render_markdown=True,
                                     sanitize_html=True,
                                     allow_tags=False,
+                                    # Gradio's autoscroll yanks the view to the bottom on every
+                                    # value change (tens of times/second during a stream) and its
+                                    # "user scrolled up" flag is sticky in 5.50, so it cannot be
+                                    # relied on. _RESIZE_JS disables it here and manages the
+                                    # follow-to-bottom / scroll-pinning behaviour itself.
+                                    autoscroll=False,
                                     latex_delimiters=[
                                         {"left": "$$", "right": "$$", "display": True},
                                         {"left": "$", "right": "$", "display": False},
@@ -3585,6 +3453,9 @@ def build_ui() -> gr.Blocks:
                                     render_markdown=True,
                                     sanitize_html=True,
                                     allow_tags=False,
+                                    # See the other Chatbot above: autoscroll is disabled and the
+                                    # follow/pin behaviour is handled by _RESIZE_JS instead.
+                                    autoscroll=False,
                                     latex_delimiters=[
                                         {"left": "$$", "right": "$$", "display": True},
                                         {"left": "$", "right": "$", "display": False},
@@ -3767,7 +3638,7 @@ def build_ui() -> gr.Blocks:
         reasoning_state = gr.State([])
 
         # Per-turn distilled "how the answer was found" story (index-aligned
-        # with history_state). See _summarize_story_ollama.
+        # with history_state). See the shared chat runtime's story distillation helper.
         story_state = gr.State([])
         # The user's current 3D-viewer selection: {"features": [{"objectid",
         # "classname"}, ...], "count": int}. Defined unconditionally so

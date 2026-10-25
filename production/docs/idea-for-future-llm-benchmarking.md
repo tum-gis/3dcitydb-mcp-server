@@ -1,5 +1,15 @@
 # Idea: Reproducible LLM Benchmarking for the CityDB ChatBot
 
+> **Status: benchmarking work has already started and is implemented.**
+>
+> The shared chat runtime, the interactive `3dcitydb-chat chat` CLI, the CSV
+> model/question inputs, the `benchmark` subcommand, the incremental results
+> CSV, and the standalone local grading GUI for the benchmark categories are
+> already built into this repository. The current state, usage, CSV formats,
+> and result/grading workflow are documented in
+> [benchmarking.md](./benchmarking.md) — refer to that file rather than the
+> proposals below, which remain useful background for the original design.
+
 ## Motivation
 
 The ChatBot can query a 3DCityDB through OpenAI, Anthropic, and Ollama-backed
@@ -406,8 +416,6 @@ Focused tests should cover:
 
 - Automatically discovering or switching between CityGML datasets inside a
   database.
-- Automatically converting arbitrary IFC-Bench records or downloading its
-  IFC project files.
 - Parallel benchmark execution or automatic retry policies that would alter
   provider load and latency measurements.
 - A built-in dashboard for visualizing comparisons; result CSVs should first

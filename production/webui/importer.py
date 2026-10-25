@@ -12,12 +12,12 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 CITYDB_TOOL_IMAGE = "ghcr.io/3dcitydb/citydb-tool"
-TILER_IMAGE = "ghcr.io/tum-gis/citydb-3dtiler:latest"
+TILER_IMAGE = "ghcr.io/3dcitydb/citydb-3dtiler:latest"
 TILER_OUTPUT_PATH = "/home/tester/citydb-3dtiler/shared"  # inside the tiler container
 # pg2b3dm inside the image is an x86-64 binary; the image's arm64 variant fails
 # with "rosetta error: failed to open elf" (Apple Silicon), so always run amd64.
 TILER_PLATFORM = os.environ.get("CITYDB_TILER_PLATFORM", "linux/amd64")
-# ghcr.io/tum-gis/citydb-3dtiler 0.9.4 ("latest") crashes at start with
+# ghcr.io/3dcitydb/citydb-3dtiler 0.9.4 ("latest") crashes at start with
 # "No module named 'cql2'": its requirements.txt lists cql2 but the Dockerfile
 # does not install it. Install it when missing (no-op once the image is fixed).
 _TILER_ENTRYPOINT_SCRIPT = (
