@@ -217,6 +217,12 @@ Run the server over HTTP for remote clients:
 - Modern clients (e.g. VS Code) prefer the Streamable HTTP transport: `http://your-server:8080/mcp`
 - Health check: `http://your-server:8080/health`
 
+The repository ships a ready-made [`.mcp.json`](.mcp.json) that points an
+MCP client (e.g. VS Code) at `http://localhost:8080/mcp/`. With the
+fullstack stack running locally, it enables the `3dcitydb-*` tools in your
+editor without any manual configuration. Adjust the URL if you run the
+SSE server on a different host or port.
+
 ### LangChain agent CLI (optional)
 
 A standalone CLI agent that uses the MCP tools directly:

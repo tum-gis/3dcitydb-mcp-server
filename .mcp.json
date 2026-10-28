@@ -1,0 +1,11 @@
+{
+	"mcpServers": {
+		"3dcitydb": {
+			"type": "http",
+			"url": "http://localhost:8080/mcp/",
+			"tools": [
+				"*"
+			]
+		}
+	}
+}
