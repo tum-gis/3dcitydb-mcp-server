@@ -723,6 +723,7 @@ documents:
 - [`idea-for-future-memory-rag.md`](production/docs/idea-for-future-memory-rag.md) — persistent chat memory (question / answer / distilled story) with RAG retrieval of similar past turns via pgvector, off by default.
 - [`idea-for-future-llm-benchmarking.md`](production/docs/idea-for-future-llm-benchmarking.md) — a reusable CLI for interactive ChatBot conversations and repeatable multi-LLM benchmarks, including CSV question sets and optional independent answer grading.
 - [`idea-for-future-session-scoped-chat-cancellation.md`](production/docs/idea-for-future-session-scoped-chat-cancellation.md) — isolate Stop-button cancellation per chat session so concurrent users do not interrupt each other's work.
+- [`idea-for-future-speech-interaction.md`](production/docs/idea-for-future-speech-interaction.md) — let users talk to the ChatBot: voice input/output and a wake word ("Hello CityBot") via an optional local `citydb-voice` sidecar (offline STT/TTS, English + German, no API keys), off by default.
 
 ---
 
