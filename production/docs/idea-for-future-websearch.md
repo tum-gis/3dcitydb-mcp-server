@@ -20,7 +20,7 @@ tell me which roof types are defined."* or (after uploading a file) *"Here is
 our district's building register — how many buildings are of type
 'office'?"*
 
-## Required Capabilities (four distinct tools)
+## Required Capabilities (four tool families)
 
 | Tool | Purpose |
 |------|---------|
@@ -58,7 +58,7 @@ Architecture:
 
 ```mermaid
 flowchart LR
-    A["Gradio ChatBot<br/>(cloud backend)"] -->|stdio MCP| B["web-research MCP server<br/>fetch / download / inspect"]
+    A["Gradio ChatBot<br/>(cloud backend)"] -->|stdio MCP| B["web-research MCP server<br/>fetch / download / upload / inspect"]
     A -->|stdio MCP| C["3dcitydb-mcp<br/>run_query"]
     B -->|"HTTP JSON API,<br/>same Docker network"| D["SearXNG container"]
     D -->|keyless upstream| E["DuckDuckGo, Bing,<br/>Wikipedia, ..."]
@@ -123,7 +123,7 @@ or keep `searxng-mcp` as a separate server for search:
 # tools (all operating on the bound user's document store — see "Per-user isolation")
 web_search(query)                           → [{title, url, snippet}, ...]   (SearXNG JSON API)
 fetch_url(url)                              → markdown text (trafilatura/bs4), size-capped
-download_file(url, doc_id?)                 → saves to <store>/<user_id>/<doc_id>, returns {doc_id, size, mime}
+download_file(url, doc_id?)                 → saves to <store>/<user_id>/<doc_id>, returns {doc_id, size, mime, outline}
 upload_file(data, filename)                 → same, for user-uploaded files (bytes arrive via the WebUI)
 list_documents()                            → [{doc_id, original_name, source, size, mime, last_accessed_at, outline}]
 inspect_file(doc_id, offset=0, limit=4000)  → text slice (one-time extraction → <doc_id>.txt sidecar, then bounded reads)
@@ -145,7 +145,7 @@ Reasons for an MCP server rather than plain Python functions in `webui/`:
 
 Counter-argument (honest alternative): if this is *only* ever needed by the
 ChatBot, plain functions in `webui/` wired into the cloud backend's tool
-dispatch are ~200 lines and skip subprocess/session management. Both are
+dispatch are ~400–500 lines and skip subprocess/session management. Both are
 reasonable; the MCP route is more future-proof for this codebase.
 
 ## Integration Touchpoints (WebUI-side)
@@ -206,11 +206,13 @@ this outline, so the model "sees the shape" of a 300-page spec for a few
 hundred characters and can jump straight to the interesting region.
 
 **3. One-time full extraction, cached on disk.**
-For formats where slicing needs extracted text (PDF), the first
-`inspect_file` call extracts the text **once** into a sidecar file
-(`<doc_id>.txt` next to the document); all later calls are plain bounded
-reads of that file. Paging 20 times through a spec is 20 cheap file reads,
-not 20 re-parses.
+For formats where slicing needs extracted text (PDF, or a text file inside a
+zip), the first `inspect_file` call extracts the text **once** into a sidecar
+file (`<doc_id>.txt` next to the document); all later calls are plain bounded
+reads of that file. For zips, `inspect_file` accepts an optional `entry`
+argument naming the member to read (default: the largest text-like member);
+its extraction goes to `<doc_id>.<entry>.txt`. Paging 20 times through a
+spec is then 20 cheap file reads, not 20 re-parses.
 
 **4. `search_in_file(doc_id, pattern)` for targeted lookup.**
 Blind paging through a large document is wasteful, so the server adds a
@@ -315,8 +317,8 @@ mechanism mirrors the scratchpad's expiry, operating on the file system
 instead of table rows:
 
 - **Per-document `last_accessed_at`** — bumped every time the model calls
-  `inspect_file` on the document (a document the model never opens is the
-  primary deletion candidate).
+  `inspect_file` *or* `search_in_file` on the document (a document the model
+  never opens is the primary deletion candidate).
 - **Per-user `last_seen`** — bumped on every chat turn, same as the
   scratchpad; a user whose identity goes stale has their whole directory
   swept.
