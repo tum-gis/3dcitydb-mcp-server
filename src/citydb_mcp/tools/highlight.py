@@ -267,6 +267,98 @@ def resolve_highlight_targets(db: DatabaseConnection, objectids: list[str]) -> d
     }
 
 
+# Flood scene: every Building's base height (lowest z of its envelope, the same
+# definition the chat recipes count with) and the ids under which its geometry
+# sits in the tileset. Tilers export boundary surfaces whose objectid is usually
+# "<building objectid>_<suffix>", so the viewer maps those by prefix; only
+# surfaces breaking that rule are listed explicitly (`extra_ids`).
+MAX_FLOOD_BUILDINGS = 100_000
+
+_FLOOD_BUILDINGS_SQL = """
+SELECT f.objectid,
+       ST_ZMin(f.envelope) AS base,
+       ARRAY(SELECT s.objectid
+             FROM property p JOIN feature s ON s.id = p.val_feature_id
+             WHERE p.feature_id = f.id AND p.name = 'boundary'
+               AND left(s.objectid, length(f.objectid) + 1) <> f.objectid || '_') AS extra_ids
+FROM feature f
+JOIN objectclass oc ON oc.id = f.objectclass_id AND oc.classname = 'Building'
+WHERE f.envelope IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM property fn
+                  WHERE fn.feature_id = f.id AND fn.name = 'function'
+                    AND fn.val_string = ANY(%s))
+LIMIT %s
+"""
+
+
+def get_flood_buildings(db: DatabaseConnection, exclude_functions=()) -> dict:
+    """Base height of every Building for the viewer's flood scene.
+
+    Returns ``{"buildings": [[objectid, base_m], ...], "extra_ids": {objectid: [tile_id, ...]},
+    "truncated": bool}``. Buildings whose ``function`` is in ``exclude_functions``
+    (bridges, walls, roofs-only structures, ...) are left out so the viewer's
+    counter matches a chat answer that excludes them too.
+    """
+    rows = db.execute(_FLOOD_BUILDINGS_SQL,
+                      (list(exclude_functions or []), MAX_FLOOD_BUILDINGS))
+    buildings, extra = [], {}
+    for row in rows:
+        if row.get("base") is None:
+            continue
+        buildings.append([row["objectid"], round(float(row["base"]), 3)])
+        if row.get("extra_ids"):
+            extra[row["objectid"]] = list(row["extra_ids"])
+    return {
+        "buildings": buildings,
+        "extra_ids": extra,
+        "truncated": len(rows) >= MAX_FLOOD_BUILDINGS,
+    }
+
+
+# Position of a few focus features (e.g. an address and the nearest dry
+# buildings) for the flood scene's camera and route lines: WGS84 centre, z range
+# and the distance (envelope to envelope, as in the chat recipes) from `anchor`.
+MAX_FOCUS_POSITIONS = 20
+
+_FOCUS_POSITIONS_SQL = """
+WITH f AS (SELECT objectid, envelope FROM feature WHERE objectid = ANY(%s) AND envelope IS NOT NULL),
+a AS (SELECT envelope FROM f WHERE objectid = %s)
+SELECT f.objectid,
+       ST_X(ST_Transform(ST_Centroid(f.envelope), 4326)) AS lon,
+       ST_Y(ST_Transform(ST_Centroid(f.envelope), 4326)) AS lat,
+       ST_ZMin(f.envelope) AS zmin, ST_ZMax(f.envelope) AS zmax,
+       (SELECT ST_Distance(f.envelope, a.envelope) FROM a) AS distance_m
+FROM f
+"""
+
+
+def get_focus_positions(db: DatabaseConnection, objectids, anchor: str | None = None) -> dict:
+    """``{objectid: {lon, lat, zmin, zmax, distance_m}}`` for up to MAX_FOCUS_POSITIONS ids.
+
+    ``distance_m`` is measured from ``anchor`` (None without one). Failures
+    return an empty dict; the viewer then simply keeps its camera.
+    """
+    ids = _clean_ids(objectids)[:MAX_FOCUS_POSITIONS]
+    if not ids:
+        return {}
+    try:
+        rows = db.execute(_FOCUS_POSITIONS_SQL, (ids, anchor))
+    except Exception as exc:
+        logger.warning("focus position query failed: %s", exc)
+        return {}
+    out = {}
+    for r in rows:
+        if r.get("lon") is None or r.get("lat") is None:
+            continue
+        out[r["objectid"]] = {
+            "lon": float(r["lon"]), "lat": float(r["lat"]),
+            "zmin": float(r["zmin"]) if r.get("zmin") is not None else None,
+            "zmax": float(r["zmax"]) if r.get("zmax") is not None else None,
+            "distance_m": round(float(r["distance_m"]), 1) if r.get("distance_m") is not None else None,
+        }
+    return out
+
+
 def get_dataset_extent(db: DatabaseConnection) -> dict | None:
     """Bounding box of all features in WGS84: {west, south, east, north, height_min, height_max}.
 

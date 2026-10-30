@@ -353,6 +353,7 @@ def _effective_settings(model: ModelConfig, args) -> ChatTurnSettings:
         enable_thinking=thinking_level,
         prompt_mode=prompt_mode,
         num_ctx=(args.num_ctx or 131072) if model.provider == "ollama" else None,
+        full_lists=getattr(args, "full_lists", True),
     )
 
 
@@ -725,111 +726,117 @@ def run_benchmark(
                                 f"{run_id}:model-{model.row_number}:rep-{repetition}:"
                                 f"{unit.conversation_key}"
                             )
-                            for query_index, query in enumerate(unit.queries, start=1):
-                                group_label = (
-                                    query.group_number
-                                    if query.group_number
-                                    else f"standalone ({query.query_id})"
-                                )
-                                print(
-                                    f"Provider: {settings.provider} | "
-                                    f"Model: {settings.model} "
-                                    f"(models.csv line {model.row_number} of "
-                                    f"{model_csv_line_count}) | "
-                                    f"Prompt: {settings.prompt_mode}",
-                                    file=stdout,
-                                    flush=True,
-                                )
-                                print(
-                                    f"Group: {group_label} | "
-                                    f"Query: {query_index} of {len(unit.queries)} | "
-                                    f"Repetition: {repetition} of {args.repetitions}",
-                                    file=stdout,
-                                    flush=True,
-                                )
-                                print(f"User query: {query.question}", file=stdout, flush=True)
-                                started = time.monotonic()
-                                status = "completed"
-                                answer = ""
-                                error_text = ""
-                                try:
-                                    answer = console.answer(query.question)
-                                except KeyboardInterrupt:
-                                    status = "interrupted"
-                                    error_text = "KeyboardInterrupt"
-                                except Exception as exc:
-                                    status = "failed"
-                                    error_text = _safe_error(exc)
-                                elapsed = getattr(
-                                    console,
-                                    "last_elapsed_seconds",
-                                    time.monotonic() - started,
-                                )
-                                story_text = getattr(console, "last_story", "") or ""
-                                result = {
-                                    "run_id": run_id,
-                                    "query_file": str(query_path),
-                                    "query_file_sha256": query_hash,
-                                    "query_id": query.query_id,
-                                    "citygml_dataset": query.citygml_dataset,
-                                    "question": query.question,
-                                    "ground_truth": query.ground_truth,
-                                    "category": query.category,
-                                    "group_number": query.group_number,
-                                    "sequence_number": query.sequence_number or "",
-                                    "conversation_id": conversation_id,
-                                    "model_row": model.row_number,
-                                    "provider": settings.provider,
-                                    "model": settings.model,
-                                    "base_url": _safe_base_url(endpoint),
-                                    "temperature": (
-                                        "" if settings.temperature is None else settings.temperature
-                                    ),
-                                    "thinking_level": settings.enable_thinking,
-                                    "prompt_mode": settings.prompt_mode,
-                                    "num_ctx": settings.num_ctx or "",
-                                    "repetition": repetition,
-                                    "generated_answer": (
-                                        _escape_answer_newlines(answer)
-                                        if args.escape_answer_newlines
-                                        else answer
-                                    ),
-                                    "answer_story": (
-                                        _escape_answer_newlines(story_text)
-                                        if args.escape_answer_newlines
-                                        else story_text
-                                    ),
-                                    "status": status,
-                                    "error": error_text,
-                                    "elapsed_seconds": f"{elapsed:.3f}",
-                                    "context_tokens": getattr(console, "last_context_tokens", ""),
-                                    "context_limit": getattr(console, "last_context_limit", ""),
-                                    "context_trimmed_turns": getattr(
-                                        console, "last_trimmed_turns", ""
-                                    ),
-                                }
-                                writer.writerow(result)
-                                stream.flush()
-                                completed += 1
-                                failures += status != "completed"
-                                if answer:
-                                    print(f"Answer:\n{answer}", file=stdout, flush=True)
-                                else:
+                            try:
+                                for query_index, query in enumerate(unit.queries, start=1):
+                                    group_label = (
+                                        query.group_number
+                                        if query.group_number
+                                        else f"standalone ({query.query_id})"
+                                    )
                                     print(
-                                        f"No answer generated (status: {status}).",
+                                        f"Provider: {settings.provider} | "
+                                        f"Model: {settings.model} "
+                                        f"(models.csv line {model.row_number} of "
+                                        f"{model_csv_line_count}) | "
+                                        f"Prompt: {settings.prompt_mode}",
                                         file=stdout,
                                         flush=True,
                                     )
-                                print(file=stdout, flush=True)
-                                print(
-                                    f"[{status}] {settings.provider}/{settings.model} "
-                                    f"query={query.query_id} repetition={repetition}",
-                                    file=stderr,
-                                    flush=True,
-                                )
-                                print(file=stderr, flush=True)
-                                if status == "interrupted":
-                                    raise KeyboardInterrupt
+                                    print(
+                                        f"Group: {group_label} | "
+                                        f"Query: {query_index} of {len(unit.queries)} | "
+                                        f"Repetition: {repetition} of {args.repetitions}",
+                                        file=stdout,
+                                        flush=True,
+                                    )
+                                    print(f"User query: {query.question}", file=stdout, flush=True)
+                                    started = time.monotonic()
+                                    status = "completed"
+                                    answer = ""
+                                    error_text = ""
+                                    try:
+                                        answer = console.answer(query.question)
+                                    except KeyboardInterrupt:
+                                        status = "interrupted"
+                                        error_text = "KeyboardInterrupt"
+                                    except Exception as exc:
+                                        status = "failed"
+                                        error_text = _safe_error(exc)
+                                    elapsed = getattr(
+                                        console,
+                                        "last_elapsed_seconds",
+                                        time.monotonic() - started,
+                                    )
+                                    story_text = getattr(console, "last_story", "") or ""
+                                    result = {
+                                        "run_id": run_id,
+                                        "query_file": str(query_path),
+                                        "query_file_sha256": query_hash,
+                                        "query_id": query.query_id,
+                                        "citygml_dataset": query.citygml_dataset,
+                                        "question": query.question,
+                                        "ground_truth": query.ground_truth,
+                                        "category": query.category,
+                                        "group_number": query.group_number,
+                                        "sequence_number": query.sequence_number or "",
+                                        "conversation_id": conversation_id,
+                                        "model_row": model.row_number,
+                                        "provider": settings.provider,
+                                        "model": settings.model,
+                                        "base_url": _safe_base_url(endpoint),
+                                        "temperature": (
+                                            "" if settings.temperature is None else settings.temperature
+                                        ),
+                                        "thinking_level": settings.enable_thinking,
+                                        "prompt_mode": settings.prompt_mode,
+                                        "num_ctx": settings.num_ctx or "",
+                                        "repetition": repetition,
+                                        "generated_answer": (
+                                            _escape_answer_newlines(answer)
+                                            if args.escape_answer_newlines
+                                            else answer
+                                        ),
+                                        "answer_story": (
+                                            _escape_answer_newlines(story_text)
+                                            if args.escape_answer_newlines
+                                            else story_text
+                                        ),
+                                        "status": status,
+                                        "error": error_text,
+                                        "elapsed_seconds": f"{elapsed:.3f}",
+                                        "context_tokens": getattr(console, "last_context_tokens", ""),
+                                        "context_limit": getattr(console, "last_context_limit", ""),
+                                        "context_trimmed_turns": getattr(
+                                            console, "last_trimmed_turns", ""
+                                        ),
+                                    }
+                                    writer.writerow(result)
+                                    stream.flush()
+                                    completed += 1
+                                    failures += status != "completed"
+                                    if answer:
+                                        print(f"Answer:\n{answer}", file=stdout, flush=True)
+                                    else:
+                                        print(
+                                            f"No answer generated (status: {status}).",
+                                            file=stdout,
+                                            flush=True,
+                                        )
+                                    print(file=stdout, flush=True)
+                                    print(
+                                        f"[{status}] {settings.provider}/{settings.model} "
+                                        f"query={query.query_id} repetition={repetition}",
+                                        file=stderr,
+                                        flush=True,
+                                    )
+                                    print(file=stderr, flush=True)
+                                    if status == "interrupted":
+                                        raise KeyboardInterrupt
+                            finally:
+                                # the conversation's own scratchpad (see ChatConsole.close)
+                                close = getattr(console, "close", None)
+                                if close:
+                                    close()
                 print(file=stdout, flush=True)
                 print(file=stdout, flush=True)
                 print(file=stderr, flush=True)

@@ -95,7 +95,9 @@ docker exec -it production-citydb-agent-1 3dcitydb-chat chat \
 ```
 
 Available options also include `--base-url`, `--keep-story` /
-`--no-keep-story`, `--include-reasoning`, and `--show-reasoning`. By default,
+`--no-keep-story`, `--full-lists` / `--no-full-lists` (also for `benchmark`; see
+**Show every row in result tables** below; with `--no-full-lists` the full result is
+printed as CSV after the answer), `--include-reasoning`, and `--show-reasoning`. By default,
 provider reasoning is not displayed; `--show-reasoning` adds a clearly labeled
 reasoning/activity section on stderr. Use `/new` to clear conversation history
 and `/bye` or `/exit` to leave the session. Prompt assembly reports each
@@ -319,6 +321,7 @@ While the agent is working, the chat bubble shows live status: *Thinking…* →
 | **Thinking** | `off` / `low` / `medium` / `high` (+ `max` for OpenAI) | Reasoning level for thinking-capable models. Ollama uses native `think`; OpenAI-compatible endpoints use `reasoning_effort`. Higher levels are slower but more thorough |
 | **Prompt mode** | `auto` / `compact` / `full` | `auto` picks compact for small local models; override for complex queries |
 | **Keep a distilled summary of how the answer was found** | on / off (default on; Ollama + OpenAI) | After each DB turn, distills the successful path (purpose + working SQL + short result) into a compact story carried into later turns. Adds one extra blocking generation per tool-using turn |
+| **Show every row in result tables** | on / off (default on; all providers) | On: the answer's table lists every row the query returned (e.g. all building IDs). Off: results with more than 10 rows show 5 example rows and the sentence "5 of N", which answers faster for long lists. Above 10 rows the complete result is attached below the answer as collapsible CSV and JSON in both modes (not sent back to the model). Prompt rules: `_LIST_RULES` / `chat_instructions()` in `webui/llm_utils.py` |
 | **Include all reasoning steps in context** | on / off (default off; Ollama + OpenAI) | Feeds each turn's full reasoning trace back into context on later turns. Off by default: the full trace consumes a large share of the context window, and the distilled summary (above) already carries the essential path |
 | **Context window (Ollama)** | 8K / 32K / 64K / 128K / 256K (default 128K) | Tokens available to the model; a smaller window uses less memory but is too small for complex queries |
 
@@ -714,6 +717,11 @@ The accompanying paper, [Enabling AI Agents for Semantic 3D City Models through 
 }
 ```
 
+Further documentation of implemented web UI internals:
+
+- [`session-layer.md`](production/docs/session-layer.md) — users, browser tabs and turns: per-tab Stop, parallel chats, a user context passed to MCP tool calls, and per-user data folders with expiry.
+- [`scratchpad.md`](production/docs/scratchpad.md) — the spatial scratchpad: per-user saved results (building sets, pins, hulls) that the chatbot creates with MCP tools and the 3D viewer shows, isolated by a read-only database role and a per-user view.
+
 ---
 
 ## Ideas for Future Developments
@@ -726,10 +734,10 @@ documents:
 - [`idea-for-future-websearch.md`](production/docs/idea-for-future-websearch.md) — giving the ChatBot the ability to do web searches and to download & inspect files (e.g. specifications) using a self-hosted SearXNG metasearch engine.
 - [`idea-for-future-Openstreetmap-interface.md`](production/docs/idea-for-future-Openstreetmap-interface.md) — querying OpenStreetMap geodata (Nominatim / Overpass) to enrich 3DCityDB queries with real-world context.
 - [`idea-for-future-write-access.md`](production/docs/idea-for-future-write-access.md) — opt-in write access (DML / DDL) to the database for experimentation, off by default.
-- [`idea-for-future-spatial-scratchpad.md`](production/docs/idea-for-future-spatial-scratchpad.md) — a per-user "spatial scratchpad" table + MCP tools to create, store, style, navigate to, visualize (in the 3D viewer) and delete temporary/derived spatial objects (markers, 2D overlays, 3D solids/pipes), isolated via row-level security, off by default.
+- [`idea-for-future-spatial-scratchpad.md`](production/docs/idea-for-future-spatial-scratchpad.md) — a per-user "spatial scratchpad" table + MCP tools to create, store, style, navigate to, visualize (in the 3D viewer) and delete temporary/derived spatial objects (markers, 2D overlays, 3D solids/pipes), isolated via row-level security, off by default. *Implemented in simplified form, see [`scratchpad.md`](production/docs/scratchpad.md).*
 - [`idea-for-future-memory-rag.md`](production/docs/idea-for-future-memory-rag.md) — persistent chat memory (question / answer / distilled story) with RAG retrieval of similar past turns via pgvector, off by default.
 - [`idea-for-future-llm-benchmarking.md`](production/docs/idea-for-future-llm-benchmarking.md) — a reusable CLI for interactive ChatBot conversations and repeatable multi-LLM benchmarks, including CSV question sets and optional independent answer grading.
-- [`idea-for-future-session-scoped-chat-cancellation.md`](production/docs/idea-for-future-session-scoped-chat-cancellation.md) — isolate Stop-button cancellation per chat session so concurrent users do not interrupt each other's work.
+- [`idea-for-future-session-scoped-chat-cancellation.md`](production/docs/idea-for-future-session-scoped-chat-cancellation.md) — isolate Stop-button cancellation per chat session so concurrent users do not interrupt each other's work. *Implemented, see [`session-layer.md`](production/docs/session-layer.md).*
 - [`idea-for-future-speech-interaction.md`](production/docs/idea-for-future-speech-interaction.md) — let users talk to the ChatBot: voice input/output and a wake word ("Hello CityBot") via an optional local `citydb-voice` sidecar (offline STT/TTS, English + German, no API keys), off by default.
 
 ---

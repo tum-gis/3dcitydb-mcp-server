@@ -24,14 +24,19 @@ class DatabaseConnection:
     parallel tool calls) never share a cursor on the same connection.
     """
 
-    def __init__(self):
+    def __init__(self, user: str | None = None, password: str | None = None,
+                 read_only: bool = True):
+        """``user``/``password`` override the CITYDB_* login (e.g. the
+        scratchpad's query role). ``read_only=False`` is only for the
+        scratchpad writer, which touches nothing but the scratchpad table."""
         self.conn_params = {
             "host": os.getenv("CITYDB_HOST"),
             "port": int(os.getenv("CITYDB_PORT", "5432")),
             "dbname": os.getenv("CITYDB_NAME"),
-            "user": os.getenv("CITYDB_USER"),
-            "password": os.getenv("CITYDB_PASSWORD"),
+            "user": user or os.getenv("CITYDB_USER"),
+            "password": password if user else os.getenv("CITYDB_PASSWORD"),
         }
+        self.read_only = read_only
         schema = os.getenv("CITYDB_SCHEMA", "citydb")
         if not _SCHEMA_RE.match(schema):
             raise ValueError(
@@ -64,7 +69,8 @@ class DatabaseConnection:
         """
         conn.autocommit = True
         with conn.cursor() as cur:
-            cur.execute("SET default_transaction_read_only = on")
+            cur.execute("SET default_transaction_read_only = "
+                        + ("on" if self.read_only else "off"))
 
     def connect(self):
         """Back-compat: return a borrowed connection.
@@ -89,11 +95,18 @@ class DatabaseConnection:
                 except Exception:
                     pass
 
-    def execute(self, query: str, params: tuple = None) -> list[dict]:
+    def execute(self, query: str, params: tuple = None,
+                settings: dict | None = None) -> list[dict]:
+        """Run one statement. ``settings`` (e.g. ``{"citydb.user_id": uid}``)
+        are set with ``set_config(..., is_local => true)`` in the same
+        transaction, so they never leak to the next user of the pooled
+        connection."""
         pool = self._get_pool()
         conn = pool.getconn()
         try:
             self._configure_connection(conn)
+            if settings:
+                conn.autocommit = False
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 # Identifier-quote the schema name; defence-in-depth on top of
                 # the regex validation in __init__.
@@ -102,10 +115,20 @@ class DatabaseConnection:
                         schema=_pg_sql.Identifier(self.schema)
                     )
                 )
+                for name, value in (settings or {}).items():
+                    cur.execute("SELECT set_config(%s, %s, true)", (name, str(value)))
                 cur.execute(query, params)
-                if cur.description:
-                    return [dict(row) for row in cur.fetchall()]
-                return []
+                rows = [dict(row) for row in cur.fetchall()] if cur.description else []
+            if settings:
+                conn.commit()
+            return rows
+        except Exception:
+            if settings:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            raise
         finally:
             self._release(conn)
 

@@ -19,6 +19,9 @@ htmlcov/
 prompts/
 
 # Data files
+# Runtime state of the web UI (per-user session folders, scratchpad audit log)
+production/data/users/
+production/data/audit/
 production/data/*.gml
 production/data/*.ifc
 production/data/*.xml

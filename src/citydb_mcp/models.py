@@ -285,3 +285,5 @@ class VocabularyData:
     generic_attr_values: dict = field(default_factory=dict)   # attr_name -> list of (value, count)
     street_count: int = 0       # total distinct street names (independent of whether street_names is populated)
     city_count: int = 0         # total distinct non-empty city values in the address table
+    numbers_in_street: bool = False  # house_number is empty and the numbers sit in `street` ("Hauptstraße 5")
+    street_example: str = ""         # one such street value, for the prompt example

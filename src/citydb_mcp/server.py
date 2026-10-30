@@ -31,6 +31,8 @@ from .tools.runtime_tools import (
 from .tools.assembly import assemble_prompt
 from .tools.highlight import resolve_highlight_targets
 from .tools.selection import get_feature_tree, describe_selection
+from .tool_context import split_tool_ctx, set_tool_ctx, reset_tool_ctx, current_tool_ctx
+from .tools import scratchpad
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("citydb-mcp")
@@ -420,6 +422,9 @@ async def list_tools() -> list[Tool]:
         _viewer = {"resolve_highlight_targets", "get_feature_tree",
                    "describe_selection"}
         tools = [t for t in tools if t.name not in _viewer]
+    if scratchpad.enabled():
+        tools += [Tool(name=n, description=spec["description"], inputSchema=spec["inputSchema"])
+                  for n, spec in scratchpad.TOOL_SCHEMAS.items()]
     return tools
 
 
@@ -429,6 +434,10 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    # The web UI's session context (_ctx) is not a tool argument: strip it and
+    # expose it via current_tool_ctx() for per-user tools.
+    arguments, ctx = split_tool_ctx(arguments)
+    token = set_tool_ctx(ctx)
     try:
         result = _execute_tool(name, arguments)
         return [TextContent(type="text", text=result)]
@@ -438,6 +447,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             type="text",
             text=json.dumps({"error": str(e)})
         )]
+    finally:
+        reset_tool_ctx(token)
 
 
 def _execute_tool(name: str, arguments: dict) -> str:
@@ -493,9 +504,24 @@ def _execute_tool(name: str, arguments: dict) -> str:
         result = get_examples(oc_ids)
         return _to_json(result)
 
+    # --- Spatial scratchpad (CITYDB_SCRATCHPAD=true) ---
+    if name in scratchpad.TOOL_SCHEMAS:
+        if not scratchpad.enabled():
+            raise ValueError("the scratchpad is off (CITYDB_SCRATCHPAD=true enables it)")
+        result = scratchpad.run_tool(name, arguments, current_tool_ctx().get("user_id"))
+        return json.dumps(result, ensure_ascii=False, default=str)
+
     # --- Query execution ---
     if name == "run_query":
-        result = run_query(db, arguments["sql"])
+        # With the scratchpad on: the read-only query role, and the caller's
+        # user id so the view my_scratchpad shows only their own items.
+        target, guarded = scratchpad.run_query_target(db)
+        result = run_query(
+            target, arguments["sql"],
+            settings=scratchpad.user_settings(
+                scratchpad.effective_user_id(current_tool_ctx().get("user_id"))) or None,
+            guard=scratchpad.guard_sql if guarded else None,
+        )
         return json.dumps(result, indent=2, default=str)
 
     # --- Viewer support (only offered when ENABLE_VIZ=true) ---

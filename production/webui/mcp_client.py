@@ -91,11 +91,21 @@ async def assemble_system_prompt(
     return raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
 
 
+def _with_ctx(arguments: dict, ctx: dict | None) -> dict:
+    """Add the session context as ``_ctx``. Only the web UI sets it (the LLM
+    only ever supplies e.g. ``sql``); the server strips it before dispatch."""
+    if not ctx:
+        return arguments
+    return {**arguments, "_ctx": dict(ctx)}
+
+
 async def run_tool(
     tool_name: str,
     arguments: dict,
     stderr: TextIO | None = None,
+    ctx: dict | None = None,
 ) -> str:
+    arguments = _with_ctx(arguments, ctx)
     async with mcp_session(stderr=stderr) as session:
         raw = await call_tool(session, tool_name, arguments)
     return raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
@@ -149,8 +159,9 @@ def run_tool_sync(
     tool_name: str,
     arguments: dict,
     stderr: TextIO | None = None,
+    ctx: dict | None = None,
 ) -> str:
-    return _run_sync(run_tool(tool_name, arguments, stderr=stderr))
+    return _run_sync(run_tool(tool_name, arguments, stderr=stderr, ctx=ctx))
 
 
 def list_tools_sync() -> list[dict]:

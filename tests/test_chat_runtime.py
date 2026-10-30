@@ -14,6 +14,8 @@ def test_prepare_chat_turn_replays_prior_context_and_injects_notes_in_order(
 ):
     monkeypatch.setattr(chat_runtime, "_get_provider_ctx_limit", lambda *_: 4096)
     monkeypatch.setattr(chat_runtime, "_estimate_tokens", lambda _: 123)
+    # Other test modules load a local .env; keep its prompt additions out of this one.
+    monkeypatch.setattr(chat_runtime, "extra_prompt_blocks", lambda: "")
     history = [["first question", "There are 2 buildings."], ["follow-up", "Found 2."]]
 
     prepared = chat_runtime.prepare_chat_turn(
