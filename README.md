@@ -34,14 +34,25 @@ The evaluation of the MCP Server for the [accompanying paper](https://isprs-anna
 
 ## Features
 
+The project has two layers with their own feature sets: the **MCP server** (the model-facing tool provider, usable from any MCP client) and the **Chatbot** (the browser GUI that wraps the MCP server with a multi-LLM agentic loop, an optional 3D viewer and per-user state).
+
+### MCP Server Features
+
 - **Dynamic schema resolution** — walks the CityGML class hierarchy to discover available object classes and their properties
 - **Property filtering** — only includes properties that actually exist in the database
 - **Country-aware codelist resolution** — qualified `<namespace>:<Class>.<attribute>` keys, country selected via the database EPSG code; only codes actually present in the data are exposed
 - **Generic attribute enrichment** — automatic categorical detection for generic attributes
 - **Read-only query execution** — `run_query` enforces SELECT-only; writes are blocked at the application layer *and* the database layer, where every pooled connection runs in a read-only transaction (`default_transaction_read_only = on`) so even a crafted CTE hiding a write is rejected by PostgreSQL
 - **Prompt assembly** — `assemble_prompt` orchestrates all tools into a complete system prompt in one call
+- **Per-user context into tool calls** — every tool call can carry a server-side `_ctx` (user / session / turn) that is stripped before dispatch, so per-user tools such as the scratchpad know *which* user is calling without ever trusting the model
+
+### Chatbot Features
+
 - **Gradio chat UI** — browser-based interface with multi-LLM support (Anthropic, OpenAI, Ollama), thinking-level control, live reasoning trace, mermaid/LaTeX rendering, and PDF export
+- **Multi-user, per-tab sessions** — each browser tab is an independent session with its own Stop button and its own user identity (a uuid in the browser's `localStorage`, no login), so several users — and several tabs of the same user — can chat in parallel without interfering ([session layer](production/docs/session-layer.md))
 - **Integrated 3D viewer (optional)** — embeds the 3DCityDB Web Map Client into the chat UI (fullstack Docker mode, see [Option 3b](#option-3b-add-the-3d-viewer-optional)); the model is streamed as 3D Tiles generated on demand by a separate `citydb-3dtiler` container. Features from an answer are highlighted in 3D and the camera flies to them, and selected viewer objects are passed to the chatbot so questions can refer to them ("these buildings", "the selected ones")
+- **Spatial scratchpad (optional)** — a per-user "staging area" the chatbot fills with saved, reusable results: *featuresets* (named sets of buildings, e.g. "the buildings affected in 2013") and *geometries* (pins, lines, draped 2D areas, extruded 3D solids, convex hulls) with per-item name, colour, opacity and 2D/3D class. Items appear as a labelled list in the 3D viewer, can be shown, hidden, re-styled, re-flown-to and deleted — and re-queried later with ordinary SQL against a per-user `my_scratchpad` view. Enabled by `CITYDB_SCRATCHPAD=true`; see [Spatial scratchpad](#spatial-scratchpad-optional) and [`scratchpad.md`](production/docs/scratchpad.md)
+- **Flood scene (optional)** — a quick "bathtub" flood visualization: a query result with a `flood_level_m` column draws a water surface at that height and colours every building red (flooded), green (held back by a `protection_m` barrier) or grey (dry), with an on-screen water-level slider and gauge. Enabled by `FLOOD_SCENE=true`; see [`flood-scene.md`](production/docs/flood-scene.md)
 - **CityGML 1.0-3.0/CityJSON/IFC import** — one-click import via the Gradio UI (fullstack Docker mode only); `.ifc` files are converted to CityGML 3.0 first
 
 ---
@@ -309,6 +320,8 @@ The pre-built image (`ghcr.io/tum-gis/3dcitydb-mcp-agent:latest`) is pulled auto
 | **MCP Inspector** | Shows the MCP server's self-description and lists all active MCP tools |
 | **System Prompt** | Displays the full assembled system prompt sent to the LLM and offers **Re-assemble system prompt** to rebuild it from the current database contents — useful for debugging |
 
+> **Note:** the **Import CityGML / CityJSON / IFC** tab is only shown in the **fullstack** variant (Option 3); BYOD connects to an existing database and has no import tab (see [Import CityGML/CityJSON/IFC](#import-citygmlicityjsonifc) under Option 3).
+
 While the agent is working, the chat bubble shows live status: *Thinking…* → *Running query…* → *Interpreting results…*. Right next to the chat log, the **Agent activity panel** streams the full ReAct trace — each thought, tool call, and observation — with per-step timing.
 
 **Chat settings** (above the input field):
@@ -449,6 +462,77 @@ The Chat tab then shows the 3DCityDB Web Map Client next to the chat. The client
 
 The viewer is baked into the `citydb-mcp-agent` image, so until the published image is updated rebuild it locally with `docker compose -f docker-compose.fullstack.yml build citydb-agent`.
 
+### Spatial scratchpad (optional)
+
+The **spatial scratchpad** gives the chatbot a place to park intermediate and final results so they
+survive beyond a single answer and can be inspected in 3D and queried again. Each saved item is
+either:
+
+- a **featureset** — a named set of `objectid`s, e.g. *"the buildings in Bräugasse"* or *"the
+  buildings taller than 30 m"*, shown as coloured buildings in the tiles; or
+- a **geometry** — a pin, point, line, draped 2D polygon or extruded 3D solid, e.g. *"a pin on my
+  house"*, *"a 3D convex hull around these two buildings"*, or *"a 25 m solid from this polygon"*.
+
+**What it is useful for.** It turns a chat into a little scratch workspace: ask the chatbot to *save
+the result* of a query ("store the affected buildings in a variable `affected_2013`"), then in a
+later turn *reuse* it ("how many of `affected_2013` are residential?", "show me the buildings
+within 100 m of my marker `my_house`"). Because the saved items are a per-user SQL view
+(`my_scratchpad`), you can also join them against the CityGML schema in ordinary `run_query`
+queries — set differences, proximity, aggregates — without re-running the original, possibly
+expensive, query. Typical uses:
+
+- stage and compare the results of several analysis steps (set A minus set B, A ∩ B, …);
+- drop labelled pins / markers / areas / solids into the 3D view to annotate the scene;
+- give the user a persistent, clickable, fly-to-able list of "my objects" (bottom-right panel) that
+  survives across turns and across page reloads of the same browser.
+
+**How it works.** The chatbot creates and manages items through four dedicated MCP tools
+(`save_to_scratchpad`, `update_scratchpad_item`, `scratchpad_action`, `list_scratchpad`), which also
+work from external MCP clients (Claude Desktop, VS Code). Saving a featureset re-runs the user's
+SELECT **read-only in the server** — the geometry / objectids never pass through the model. Items
+are **isolated per user** (a read-only database role plus a `security_barrier` view filtered to the
+user's id from the session layer, not from the model), capped (100 items, 20k vertices, 100k
+objectids per user), and every change is written to a JSONL audit log. The 3D viewer renders each
+item according to its class: pins with labels, `Point3D` spheres, 3D lines as pipes, filled /
+draped polygons and solids, and floating markers with a stem down to the terrain.
+
+> **Note:** the scratchpad is stored in the *database*, so it is available in **all** Docker options
+> (BYOD included); the **3D display** additionally needs the viewer (`ENABLE_VIZ=true`, Option 3b).
+> Enabling `CITYDB_SCRATCHPAD=true` needs a bootstrap role with `CREATEROLE` (the bundled fullstack
+> superuser has it; with a restricted BYOD account a fallback guard is used instead).
+
+Enable it in `production/.env`:
+
+```env
+CITYDB_SCRATCHPAD=true
+# Optional: shared scratchpad id for external MCP clients without a web UI session
+# CITYDB_SCRATCHPAD_MCP_USER=<default: a fixed uuid>
+# Optional: one JSON line per change; empty switches the audit log off
+# CITYDB_MCP_AUDIT_LOG=/app/data/audit/scratchpad.jsonl
+```
+
+Full reference — data model, class vocabulary (15 geometry classes + `FeatureSet`), the
+2D↔3D/height/extrusion rules, isolation details, and the viewer behaviour — is in
+[`production/docs/scratchpad.md`](production/docs/scratchpad.md).
+
+### Flood scene (optional)
+
+The 3D viewer can also render a quick **bathtub flood** scenario, triggered from an ordinary
+`run_query` — so it works with any model (including local Ollama) and needs no extra tool. When an
+answer contains a constant column `flood_level_m` (the water level in the data's height system), the
+viewer draws a flat water surface at that height and colours every building: **red** = flooded
+(lowest point below the water), **green** = held back by a `protection_m` barrier, **grey** = dry.
+A panel offers the affected count, the current level, a level slider, a gauge widget and a
+"Hide flood" button. It is a fast first estimate (no flow, no connectivity, no defences), not a
+hydraulic model. Requires the viewer (`ENABLE_VIZ=true`) and buildings with absolute heights.
+
+```env
+FLOOD_SCENE=true
+```
+
+See [`production/docs/flood-scene.md`](production/docs/flood-scene.md) for the full mechanics, the
+gauge/warning-level settings, and the limitations.
+
 ### Building locally (optional)
 
 ```bash
@@ -477,7 +561,7 @@ Once the UI is open:
 
 | Option | Effect |
 |---|---|
-| Georeference to Oktoberfest / Munich | Use when the IFC model carries no real-world georeferencing of its own |
+| Georeference to Oktoberfest / Munich | Use when the IFC model carries no real-world georeferencing of its own. It will be translated to the Theresienwiese in Munich, which is the place where the annual Oktoberfest takes place. |
 | Skip storeys | Don't create `Storey` features from the IFC building structure |
 | Group unrelated doors/windows into a dummy BuildingConstructiveElement | For IFC models where door/window openings aren't properly related to a wall |
 
@@ -487,14 +571,26 @@ The file is first converted to CityGML 3.0 via [`ghcr.io/tum-gis/ifc-to-citygml3
 
 Set `SRID` to the EPSG code for your data before the first start. Common values:
 
-| Region | CRS | SRID |
-|--------|-----|------|
-| Germany (UTM Zone 32N) | ETRS89 / UTM Zone 32N | `25832` |
-| Germany (UTM Zone 33N) | ETRS89 / UTM Zone 33N | `25833` |
-| USA (NAD83 / UTM Zone 14N) | NAD83 | `26914` |
-| Global (WGS84) | WGS 84 | `4326` |
+| Region | CRS | SRID | Dimensionality | Units of measure |
+|--------|-----|------|----------------|------------------|
+| Germany (UTM Zone 32N) | ETRS89 / UTM Zone 32N | `25832` | 2D | (m, m) |
+| Germany (UTM Zone 33N) | ETRS89 / UTM Zone 33N | `25833` | 2D | (m, m) |
+| USA (NAD83 / UTM Zone 14N) | NAD83 | `26914` | 2D | (m, m) |
+| USA (NAD83 / UTM Zone 14N) | NAD83 (US survey feet) | `32614` | 2D | (ft, ft) |
+| Japan (PLATEAU) | JGD2011 (JGD2024) + JGD2011 vertical (compound) | `6697` | 3D | (°, °, m) |
+| Global (WGS84) | WGS 84 | `4326` | 2D | (°, °) |
+| The Netherlands (RD New + NAP height) | RD + NAP height (compound) | `7415` | 3D | (m, m, m) |
 
-Note that you should name a 3D SRID, if available. However, often the CRS used in CityGML datasets use a compound CRS with separate SRIDs for planimetry and height, and for these combinations often no predefined SRIDs are defined in PostGIS. In this case, just name the SRID of the planimetric coordinates (2D), like in the examples shown above. 
+**Dimensionality** is how many coordinates the CRS defines: the German, US and global rows above are 2D (planar easting/northing, or longitude/latitude, with no vertical axis in the CRS definition). A 3D CRS carries heights as part of the coordinate system, and the two 3D rows here are *compound* CRS — a horizontal part joined to a separate vertical part:
+
+- The **Netherlands** `7415` = the planimetric RD New grid (Amersfoort, EPSG:28992) + NAP height (Normaal Amsterdams Peil, EPSG:5709).
+- **Japan (PLATEAU)** `6697` = **JGD2011 / JGD2024** geographic lat/lon in degrees (EPSG:6668) + **JGD2011 (vertical)** gravity-related height in metres (EPSG:6695).
+
+In both, the data already carries x, y *and* a height.
+
+**The US is not automatically in feet.** The standard NAD83 / UTM CRS (such as `26914`) is in **metres** — `26914` uses metre units for both easting and northing. The **US survey foot** version is a *separate* EPSG code: `32614` is *NAD83 / UTM zone 14N in US survey feet* (a different zone-numbering scheme, `326xx`, and the 1.000000226 US-survey-foot length). US CityGML data is commonly published in either form, so read the CRS from the file header: if it says `26914` / `269xx` the units are metres, if it says `326xx` the units are US survey feet. (Geographic WGS 84 / NAD83, `4326` / `4269`, are in degrees regardless.)
+
+You should name a 3D SRID whenever one is available for your data. However, many CityGML datasets use a compound CRS with separate SRIDs for planimetry and height, and for these combinations a predefined SRID is often *not* available in PostGIS. In that case, name the SRID of the planimetric coordinates (2D) instead, as in the 2D rows above.
 
 ### Useful commands
 
@@ -614,6 +710,35 @@ call regardless of provider (Ollama or OpenAI-compatible).
 | `STORY_TRANSCRIPT_MAX_CHARS` | `30000` | Maximum characters of the reasoning transcript fed into the distillation prompt. Tail-preserving: if the trace is longer, the *beginning* is cut (early exploration) so the final successful queries are always kept |
 | `STORY_MAX_TOKENS` | `2000` | Maximum tokens the story itself may contain (OpenAI-compatible provider; the Ollama path is fixed at 700) |
 
+### Sessions / multiple users (WebUI)
+
+Per-user state (user identity, per-tab Stop, parallel chats) — see
+[`session-layer.md`](production/docs/session-layer.md).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WEBUI_CONCURRENCY` | `4` | How many chat turns may run at the same time (Gradio's default would be 1) |
+
+### Spatial scratchpad (only used when `CITYDB_SCRATCHPAD=true`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CITYDB_SCRATCHPAD` | `false` | Master switch for the per-user spatial scratchpad (table + four MCP tools + `my_scratchpad` view + `[SCRATCHPAD]` prompt block) |
+| `CITYDB_QUERY_USER` | `citydb_query` | Name of the dedicated read-only role used for `run_query` and the scratchpad |
+| `CITYDB_QUERY_PASSWORD` | *derived* | Password for that role; if unset it is derived deterministically from `CITYDB_PASSWORD` and `CITYDB_NAME` so the web UI and every MCP subprocess agree |
+| `CITYDB_SCRATCHPAD_MCP_USER` | *fixed uuid* | Shared scratchpad user id for external MCP clients that have no web UI session |
+| `CITYDB_MCP_AUDIT_LOG` | *(empty)* | Path to a JSONL audit log, one line per scratchpad change; empty switches it off |
+
+### Flood scene (only used when `FLOOD_SCENE=true`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FLOOD_SCENE` | `false` | Adds a short `[FLOOD SCENE]` prompt block: a result with a `flood_level_m` column draws the water surface and coloured buildings |
+| `FLOOD_EXCLUDE_FUNCTIONS` | *(empty)* | Comma-separated CityGML function codes that are not buildings, excluded from the flood count and named in the prompt |
+| `FLOOD_GAUGE_NAME` / `FLOOD_GAUGE_ZERO_M` | *(empty)* | Viewer gauge widget: gauge name and its zero in the data's height system |
+| `FLOOD_STAGES` | *(empty)* | Comma-separated warning levels (cm above gauge zero) marked on the gauge |
+| `FLOOD_REFERENCE_CM` / `FLOOD_REFERENCE_LABEL` | *(empty)* | A historic flood reading (cm) and its label, shown on the gauge |
+
 ---
 
 ## Available MCP Tools
@@ -656,7 +781,22 @@ call regardless of provider (Ollama or OpenAI-compatible).
 |------|-------------|
 | `assemble_prompt` | Orchestrates all tools into a complete system prompt in one call |
 
-> **Note:** The three 3D viewer tools — `resolve_highlight_targets`, `get_feature_tree`, and `describe_selection` — are only offered when the stack runs with the viewer enabled (`ENABLE_VIZ=true`, see [Option 3b](#option-3b-add-the-3d-viewer-optional)). In non-viz deployments they are omitted from the tool list entirely, so they never appear to clients such as the MCP Inspector.
+### Spatial scratchpad (only when `CITYDB_SCRATCHPAD=true`)
+
+| Tool | Description |
+|------|-------------|
+| `save_to_scratchpad` | Save a result as a named item — a featureset (SELECT with an `objectid` column) or a geometry (SELECT with a `geom` column, or GeoJSON) — with optional label, colour, class and 2D/3D height/extrusion settings. Replaces an existing name |
+| `update_scratchpad_item` | Change a saved item in place: style (label, colour, opacity, size), class, and height/extrusion (which may rewrite the geometry to match) |
+| `scratchpad_action` | Act on named items — `show`, `hide`, `delete` (deleting more than one needs `confirm: true`), or `goto` (fly the camera to them) |
+| `list_scratchpad` | List the user's items: name, label, kind, class, colour, visibility and count/geometry type |
+
+> **Note:** The 3D viewer tools — `resolve_highlight_targets`, `get_feature_tree`, and
+> `describe_selection` — are only offered when the stack runs with the viewer enabled
+> (`ENABLE_VIZ=true`, see [Option 3b](#option-3b-add-the-3d-viewer-optional)). The four scratchpad
+> tools are only offered when `CITYDB_SCRATCHPAD=true`. In deployments where a feature is off, its
+> tools are omitted from the tool list entirely, so they never appear to clients such as the
+> MCP Inspector. The scratchpad additionally exposes a per-user `my_scratchpad` SQL view that can be
+> queried with ordinary `run_query` calls. See [Spatial scratchpad](#spatial-scratchpad-optional).
 
 ---
 
@@ -678,22 +818,22 @@ call regardless of provider (Ollama or OpenAI-compatible).
                (PostgreSQL + PostGIS)
 
 
-  Browser ──► Gradio UI (port 7860)           [Docker variants only]
-                      │
-          ┌───────────┴──────────────────────────────┐
+      Browser ──► Gradio UI (port 7860)       [Docker variants only]
+                                │
+          ┌─────────────────────┴────────────────────┐
           │                                          │
    Anthropic / OpenAI                        Ollama (local)
    LiteLLM cloud backend                     LangChain ReAct (langchain-ollama)
    (incl. OpenAI-compatible endpoints         robust tool-call parser
     via OPENAI_BASE_URL)                      model profiles + native thinking
           │                                          │
-          └──────────────────────┬───────────────────┘
-                      │
-               MCP Client (spawns citydb-mcp subprocess)
-                      │
-               3DCityDB MCP Server
-                      │
-                 3DCityDB v5
+          └─────────────────────┬────────────────────┘
+                                │
+              MCP Client (spawns citydb-mcp subprocess)
+                                │
+                          3DCityDB MCP Server
+                                │
+                           3DCityDB v5
 ```
 
 ---
@@ -717,12 +857,12 @@ The accompanying paper, [Enabling AI Agents for Semantic 3D City Models through 
 }
 ```
 
-Further documentation of implemented web UI internals:
+## Further documentation of implemented web UI internals:
 
 - [`session-layer.md`](production/docs/session-layer.md) — users, browser tabs and turns: per-tab Stop, parallel chats, a user context passed to MCP tool calls, and per-user data folders with expiry.
 - [`scratchpad.md`](production/docs/scratchpad.md) — the spatial scratchpad: per-user saved results (building sets, pins, hulls) that the chatbot creates with MCP tools and the 3D viewer shows, isolated by a read-only database role and a per-user view.
+- [`flood-scene.md`](production/docs/flood-scene.md) — the 3D flood scene: a `flood_level_m` column in a query result draws a water surface and colours every building red / green / grey, with a level slider and gauge.
 
----
 
 ## Ideas for Future Developments
 
@@ -734,11 +874,13 @@ documents:
 - [`idea-for-future-websearch.md`](production/docs/idea-for-future-websearch.md) — giving the ChatBot the ability to do web searches and to download & inspect files (e.g. specifications) using a self-hosted SearXNG metasearch engine.
 - [`idea-for-future-Openstreetmap-interface.md`](production/docs/idea-for-future-Openstreetmap-interface.md) — querying OpenStreetMap geodata (Nominatim / Overpass) to enrich 3DCityDB queries with real-world context.
 - [`idea-for-future-write-access.md`](production/docs/idea-for-future-write-access.md) — opt-in write access (DML / DDL) to the database for experimentation, off by default.
-- [`idea-for-future-spatial-scratchpad.md`](production/docs/idea-for-future-spatial-scratchpad.md) — a per-user "spatial scratchpad" table + MCP tools to create, store, style, navigate to, visualize (in the 3D viewer) and delete temporary/derived spatial objects (markers, 2D overlays, 3D solids/pipes), isolated via row-level security, off by default. *Implemented in simplified form, see [`scratchpad.md`](production/docs/scratchpad.md).*
 - [`idea-for-future-memory-rag.md`](production/docs/idea-for-future-memory-rag.md) — persistent chat memory (question / answer / distilled story) with RAG retrieval of similar past turns via pgvector, off by default.
-- [`idea-for-future-llm-benchmarking.md`](production/docs/idea-for-future-llm-benchmarking.md) — a reusable CLI for interactive ChatBot conversations and repeatable multi-LLM benchmarks, including CSV question sets and optional independent answer grading.
-- [`idea-for-future-session-scoped-chat-cancellation.md`](production/docs/idea-for-future-session-scoped-chat-cancellation.md) — isolate Stop-button cancellation per chat session so concurrent users do not interrupt each other's work. *Implemented, see [`session-layer.md`](production/docs/session-layer.md).*
 - [`idea-for-future-speech-interaction.md`](production/docs/idea-for-future-speech-interaction.md) — let users talk to the ChatBot: voice input/output and a wake word ("Hello CityBot") via an optional local `citydb-voice` sidecar (offline STT/TTS, English + German, no API keys), off by default.
+
+These new features are already implemented (to full extent or partially):
+- [`idea-for-future-spatial-scratchpad.md`](production/docs/idea-for-future-spatial-scratchpad.md) — a per-user "spatial scratchpad" table + MCP tools to create, store, style, navigate to, visualize (in the 3D viewer) and delete temporary/derived spatial objects (markers, 2D overlays, 3D solids/pipes), isolated via row-level security, off by default. *Implemented in a slightly modified form, see [`scratchpad.md`](production/docs/scratchpad.md).*
+- [`idea-for-future-session-scoped-chat-cancellation.md`](production/docs/idea-for-future-session-scoped-chat-cancellation.md) — isolate Stop-button cancellation per chat session so concurrent users do not interrupt each other's work. *Implemented, see [`session-layer.md`](production/docs/session-layer.md).*
+- [`idea-for-future-llm-benchmarking.md`](production/docs/idea-for-future-llm-benchmarking.md) — a reusable CLI for interactive ChatBot conversations and repeatable multi-LLM benchmarks, including CSV question sets and optional independent answer grading. *Partially implemented and documented in [`benchmarking.md`](production/docs/benchmarking.md)*
 
 ---
 
