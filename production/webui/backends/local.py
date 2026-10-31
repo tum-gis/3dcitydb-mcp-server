@@ -22,9 +22,10 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.agents.output_parsers import ReActSingleInputOutputParser
 
+from webui.session import TurnControl
+from webui.llm_utils import long_result_note, scratch_tool_hint, scratch_tool_result
 from webui.llm_utils import (
     MAX_ITERATIONS,
-    _is_stopped,
     _log_context_usage,
     _parse_tool_result,
     _post_process_markdown,
@@ -185,6 +186,27 @@ def _clean_sql_input(raw: str) -> str:
 
 # ── Answer-language reminder ──────────────────────────────────────────────────
 
+def _parse_json_input(raw) -> dict:
+    """The JSON object of an extra tool's Action Input (fences and text around
+    it are tolerated). Raises ValueError if there is none."""
+    if isinstance(raw, dict):
+        return raw
+    text = str(raw or "").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("no JSON object found")
+    if end - start > 300 * 1024:
+        raise ValueError("input too large")
+    try:
+        data = json.loads(text[start:end + 1])
+    except json.JSONDecodeError as exc:
+        raise ValueError(str(exc)) from exc
+    if not isinstance(data, dict):
+        raise ValueError("not a JSON object")
+    return data
+
+
 def _language_reminder(question: str) -> str:
     """Reminder that anchors the Final Answer to the language of ``question``.
 
@@ -318,6 +340,19 @@ class _EventCallback(BaseCallbackHandler):
         self._stream_buffer = []       # discard any buffered tokens from the thinking phase
         self._streaming_final = False
         raw = input_str if isinstance(input_str, str) else json.dumps(input_str)
+        self._current_tool = tool_name or "run_query"
+        if self._current_tool != "run_query":
+            try:
+                args = _parse_json_input(raw)
+            except ValueError:
+                args = {"input": raw[:500]}
+            key = (self._current_tool, raw)
+            self._consecutive_repeats = self._consecutive_repeats + 1 if key == self._last_action_key else 1
+            self._last_action_key = key
+            self._consecutive_parse_failures = 0
+            self._q.put(("tool_call", {"tool": self._current_tool, "args": args, "iteration": self._iteration}))
+            self._q.put(("status", "Saving…"))
+            return
         sql = _clean_sql_input(raw)
         self._consecutive_parse_failures = 0
         # Repetition guard: update the consecutive-identical-query counter so
@@ -336,7 +371,11 @@ class _EventCallback(BaseCallbackHandler):
         if self._in_error_retry:
             self._in_error_retry = False
             return
-        result_data = self._parse_tool_output(str(output))
+        if getattr(self, "_current_tool", "run_query") != "run_query":
+            result_data = {**scratch_tool_result(getattr(self, "last_extra_raw", "") or "{}"),
+                           "tool": self._current_tool}
+        else:
+            result_data = self._parse_tool_output(str(output))
         self._ctx_emit(len(str(output)), force=True)
         self._q.put(("tool_result", {**result_data, "iteration": self._iteration}))
         self._iteration += 1
@@ -666,6 +705,11 @@ class _RobustReActParser(ReActSingleInputOutputParser):
             if not isinstance(tc, dict):
                 continue
             name = str(tc.get("name") or "").lower()
+            if name in self._tool_names and name != "run_query":
+                # An extra tool (e.g. save_to_scratchpad): its input is JSON.
+                args = tc.get("args")
+                raw = args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False)
+                return AgentAction(tool=name, tool_input=raw, log=raw)
             if "run_query" not in name:
                 continue
             args = tc.get("args")
@@ -900,7 +944,8 @@ class _RobustReActParser(ReActSingleInputOutputParser):
                     )
                     return coerced
                 raise OutputParserException(
-                    f"Unknown tool name '{result.tool}'. The only available tool is run_query. "
+                    f"Unknown tool name '{result.tool}'. Available tools: "
+                    f"{', '.join(sorted(self._tool_names))}. "
                     "Use this format:\n"
                     "Action: run_query\n"
                     'Action Input: {"sql": "SELECT ..."}'
@@ -1114,6 +1159,9 @@ def react_stream(
     *,
     enable_thinking: bool | str | None = False,
     num_ctx: int | None = None,
+    turn: TurnControl | None = None,
+    extra_tools: dict | None = None,
+    full_lists: bool = True,
 ) -> Generator[tuple, None, None]:
     """LangChain ReAct agent for Ollama.
 
@@ -1125,7 +1173,14 @@ def react_stream(
     The ollama client that langchain-ollama 0.3.x pins only accepts
     bool/None/low/medium/high, so "max" is not a valid level and must not
     be passed here.
+
+    ``turn`` carries this turn's stop flag (a fresh one when none is passed).
+    ``extra_tools`` ({name: {"spec": openai_spec, "run": fn(args) -> str}}) are
+    offered next to run_query (e.g. the scratchpad tools); their Action Input
+    is a JSON object.
     """
+    turn = turn or TurnControl()
+    extra_tools = extra_tools or {}
 
     # ── Build the LangChain LLM ────────────────────────────────────────────────
     # Per-model invocation defaults (plan step c): only fill in controls the
@@ -1189,6 +1244,7 @@ def react_stream(
                 f"TOTAL ROWS RETURNED: {count}{truncation_note}. "
                 f"Use this exact number in your answer — do NOT count the rows yourself. "
                 f"The result is:\n{result_str}"
+                + long_result_note(count, full_lists)
             )
             # Detect semantically empty aggregate (all zeros / all nulls).
             # This typically means a missing CG_MakeSolid wrapper or a wrong join.
@@ -1219,6 +1275,33 @@ def react_stream(
             'e.g. {"sql": "SELECT f.objectid FROM feature f WHERE f.objectclass_id = 901"}'
         ),
     )
+
+    # ── Extra tools (JSON input, e.g. the scratchpad) ──────────────────────────
+    def _make_extra_tool(name: str, entry: dict) -> Tool:
+        def _run(input_data: str) -> str:
+            try:
+                args = _parse_json_input(input_data)
+            except ValueError as exc:
+                return (f"Error: the Action Input for {name} must be a JSON object ({exc}). "
+                        "Call the tool again with valid JSON.")
+            print(f"[local] {name} → {json.dumps(args, ensure_ascii=False)[:160]}", flush=True)
+            try:
+                raw = str(entry["run"](args))
+            except Exception as exc:
+                raw = json.dumps({"error": str(exc)})
+            callback.last_extra_raw = raw
+            data = scratch_tool_result(raw)
+            if data.get("error"):
+                return f"Error: {data['error']}. " + scratch_tool_hint(data) + "\n\n" + _answer_lang_reminder
+            rows = "\n".join(json.dumps(r, ensure_ascii=False, default=str) for r in data["preview_rows"])
+            return (f"{name} succeeded:\n{rows}\n"
+                    "Continue (more tool calls if the user asked for more), then give the "
+                    "Final Answer with the name(s) and count(s).\n\n" + _answer_lang_reminder)
+
+        spec = entry["spec"]["function"]
+        props = ", ".join(f'"{k}"' for k in spec.get("parameters", {}).get("properties", {}))
+        return Tool(name=name, func=_run,
+                    description=f"{spec['description']} Action Input: a JSON object with the keys {props}.")
 
     # ── Build the system prompt ────────────────────────────────────────────────
     if _USE_STATIC_PROMPT:
@@ -1265,7 +1348,10 @@ def react_stream(
             "Thought: what you are thinking\n"
             "Action: the action to take, should be one of [{tool_names}]\n"
             'Action Input: {{"sql": "SELECT ..."}}\n'
-            "Observation: the result of the action\n"
+            + ("(For the other tools the Action Input is a JSON object with that tool's keys, e.g. "
+               'Action: save_to_scratchpad / Action Input: {{"name": "my_set", "sql": "SELECT f.objectid FROM ..."}})\n'
+               if extra_tools else "")
+            + "Observation: the result of the action\n"
             "... (Thought/Action/Action Input/Observation can repeat as needed)\n"
             "Thought: I now know the final answer\n"
             "LANGUAGE RULE (mandatory): Detect the language from the USER'S WORDS, "
@@ -1283,10 +1369,13 @@ def react_stream(
     callback = _EventCallback(event_q)
 
     # ── Build the agent executor ───────────────────────────────────────────────
-    agent = create_react_agent(llm, [sql_tool], react_prompt, output_parser=_RobustReActParser(callback, user_question=_raw_user_q, tool_names={sql_tool.name}))
+    callback.last_extra_raw = ""
+    tools = [sql_tool] + [_make_extra_tool(n, e) for n, e in extra_tools.items()]
+    agent = create_react_agent(llm, tools, react_prompt, output_parser=_RobustReActParser(
+        callback, user_question=_raw_user_q, tool_names={t.name for t in tools}))
     agent_executor = AgentExecutor(
         agent=agent,
-        tools=[sql_tool],
+        tools=tools,
         verbose=True,
         max_iterations=MAX_ITERATIONS,
         early_stopping_method="generate",
@@ -1321,7 +1410,7 @@ def react_stream(
     output_text = ""
     streaming_started = False
     while True:
-        if _is_stopped():
+        if turn.stopped():
             yield ("stopped", "")
             return
 

@@ -100,7 +100,7 @@ def test_chat_console_uses_shared_runtime_and_keeps_answer_separate(monkeypatch)
             dropped_messages=0,
         )
 
-    def fake_stream(settings, messages, tool_executor):
+    def fake_stream(settings, messages, tool_executor, **_kwargs):
         tool_executor("SELECT objectid FROM feature")
         yield "thinking_token", "Reasoning only."
         yield "tool_call", {
@@ -290,3 +290,98 @@ def test_cli_settings_match_configurable_chat_options(monkeypatch):
     assert args.keep_story is False
     assert args.include_reasoning is True
     assert args.show_reasoning is True
+
+
+def _scratch_console(monkeypatch, **kwargs):
+    monkeypatch.setenv("CITYDB_SCRATCHPAD", "true")
+    return cli.ChatConsole(
+        settings=ChatTurnSettings(provider="openai", model="test"),
+        system_prompt="schema",
+        keep_story=False,
+        stderr=io.StringIO(),
+        stdout=io.StringIO(),
+        **kwargs,
+    )
+
+
+def test_cli_offers_the_scratchpad_tools_with_its_own_user(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli, "run_tool_sync",
+                        lambda name, args, stderr=None, ctx=None: calls.append((name, args, ctx)) or "{}")
+    seen = {}
+
+    def fake_stream(settings, messages, tool_executor, extra_tools=None, **_kwargs):
+        seen["tools"] = sorted(extra_tools or {})
+        tool_executor("SELECT 1")
+        extra_tools["save_to_scratchpad"]["run"]({"name": "pin", "geojson": {}})
+        yield "tool_call", {"tool": "save_to_scratchpad", "args": {"sql": "SELECT 1 AS objectid"}}
+        yield "tool_result", {"row_count": 1, "preview_rows": [{"ok": True}], "all_rows": []}
+        yield "final", "Saved."
+
+    monkeypatch.setattr(cli, "prepare_chat_turn", lambda *a, **k: PreparedChatTurn(
+        messages=[], effective_compact=False, prompt_mode_label="full", context_limit=1000,
+        estimated_tokens=1, dropped_messages=0))
+    monkeypatch.setattr(cli, "stream_chat_turn", fake_stream)
+    console = _scratch_console(monkeypatch)
+    other = _scratch_console(monkeypatch)
+
+    assert console.answer("Save it") == "Saved."
+    assert seen["tools"] == ["list_scratchpad", "save_to_scratchpad", "scratchpad_action",
+                             "update_scratchpad_item"]
+    assert [c[0] for c in calls] == ["run_query", "save_to_scratchpad"]
+    assert all(c[2]["user_id"] == console.scratchpad_user for c in calls)
+    assert console.scratchpad_user != other.scratchpad_user  # conversations are isolated
+    assert console.tool_cache is None  # a scratchpad report is not a reusable query result
+
+
+def test_cli_removes_a_generated_scratchpad_but_keeps_a_given_one(monkeypatch):
+    from citydb_mcp.tools import scratchpad
+
+    removed = []
+    monkeypatch.setattr(scratchpad, "delete_user", lambda uid: removed.append(uid) or 2)
+    console = _scratch_console(monkeypatch)
+    console.close()
+    assert removed == [console.scratchpad_user]
+    uid = "11111111-1111-4111-8111-111111111111"
+    kept = _scratch_console(monkeypatch, scratchpad_user=uid)
+    kept.close()
+    assert kept.keep_scratchpad and removed == [console.scratchpad_user]
+    args = cli._build_parser().parse_args(["chat", "--scratchpad-user", uid.upper()])
+    assert args.scratchpad_user == uid
+
+
+def test_cli_without_scratchpad_offers_no_extra_tools(monkeypatch):
+    monkeypatch.setenv("CITYDB_SCRATCHPAD", "false")
+    console = cli.ChatConsole(settings=ChatTurnSettings(provider="openai", model="test"),
+                              system_prompt="schema")
+    assert console._extra_tools() == {}
+
+
+def test_cli_full_lists_flag(monkeypatch):
+    monkeypatch.setattr(cli, "detect_default_provider", lambda: "openai")
+    monkeypatch.setattr(cli, "default_model", lambda _: "test-model")
+    parser = cli._build_parser()
+    assert cli._resolve_settings(parser.parse_args(["chat"]), parser).full_lists is True
+    assert cli._resolve_settings(parser.parse_args(["chat", "--no-full-lists"]), parser).full_lists is False
+
+
+def test_cli_short_lists_print_the_full_list_but_keep_it_out_of_history(monkeypatch):
+    rows = [{"objectid": f"B{i}"} for i in range(12)]
+    raw = json.dumps({"success": True, "results": rows})
+    monkeypatch.setattr(cli, "run_tool_sync", lambda *args, **_kwargs: raw)
+
+    def fake_stream(settings, messages, tool_executor, **_kwargs):
+        tool_executor("SELECT objectid FROM feature")
+        yield "final", "5 of 12 buildings."
+
+    monkeypatch.setattr(cli, "prepare_chat_turn", lambda *a, **k: PreparedChatTurn(
+        messages=[], effective_compact=False, prompt_mode_label="full", context_limit=1000,
+        estimated_tokens=1, dropped_messages=0))
+    monkeypatch.setattr(cli, "stream_chat_turn", fake_stream)
+    for full_lists, attached in ((False, True), (True, False)):
+        console = cli.ChatConsole(
+            settings=ChatTurnSettings(provider="openai", model="test", full_lists=full_lists),
+            system_prompt="schema", keep_story=False, stderr=io.StringIO(), stdout=io.StringIO())
+        answer = console.answer("Which buildings?")
+        assert ("Full list (12 rows, CSV):\nobjectid\nB0" in answer) is attached
+        assert console.history[-1][1] == "5 of 12 buildings."

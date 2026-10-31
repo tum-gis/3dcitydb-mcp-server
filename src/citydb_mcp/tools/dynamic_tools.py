@@ -2672,6 +2672,26 @@ def get_vocabulary(db: DatabaseConnection):
     except Exception:
         city_count = 0
 
+    # House numbers inside `street`: some exports (e.g. Bavarian LoD2) leave
+    # house_number empty and write "Bräugasse 20" into street. Detected when most
+    # addresses have no house_number but a street ending in a number.
+    numbers_in_street, street_example = False, ""
+    try:
+        hn_row = db.execute_single(r"""
+            SELECT COUNT(*) AS n,
+                   COUNT(*) FILTER (WHERE (house_number IS NULL OR house_number = '')
+                                      AND street ~ '\d+\s*[a-zA-Z]?\s*$') AS in_street,
+                   MIN(street) FILTER (WHERE (house_number IS NULL OR house_number = '')
+                                         AND street ~ '^[^;,]+ \d+[a-zA-Z]?$') AS example
+            FROM address
+            WHERE street IS NOT NULL AND street != ''
+        """)
+        if hn_row and hn_row["n"]:
+            numbers_in_street = hn_row["in_street"] * 2 > hn_row["n"]
+            street_example = (hn_row.get("example") or "") if numbers_in_street else ""
+    except Exception:
+        pass
+
     # Generic attribute distinct values per attribute (frequency-ordered)
     # Only include attributes with ≤ 30 distinct values (categorical).
     # Hard-cap the result set at 10 000 (name, val_string) groups so the scan
@@ -2699,6 +2719,8 @@ def get_vocabulary(db: DatabaseConnection):
         generic_attr_values=generic_attr_values,
         street_count=distinct_streets or 0,
         city_count=city_count,
+        numbers_in_street=numbers_in_street,
+        street_example=street_example,
     )
     _vocab_cache = {"data": result}
     _vocab_cache_ts = now

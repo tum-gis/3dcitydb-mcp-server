@@ -1,6 +1,28 @@
 # Idea: Spatial Scratchpad — a temporary, visualizable results table in the 3DCityDB
 
-## Status: draft, not yet implemented
+## Status: superseded, implemented in a simplified form
+
+The feature now exists, see [scratchpad.md](scratchpad.md). This document is kept as the original
+design. The main deviations of the implementation:
+
+- Four MCP tools (`save_to_scratchpad`, `update_scratchpad_item`, `scratchpad_action`,
+  `list_scratchpad`) instead of the 8 proposed ones. An interim SQL column convention fallback
+  (`scratch_save`, ... in an ordinary `run_query`) was later removed; the MCP tools are the only way.
+- The server re-runs the saved SELECT itself instead of the LLM passing WKT, so geometry never passes
+  through the model.
+- Isolation by a dedicated read-only role plus a `security_barrier` view instead of row-level security,
+  because the app connects as a superuser, which bypasses RLS.
+- One table with one `geom` column instead of two geometry columns. The 15-class vocabulary is kept
+  (`class` column), plus `FeatureSet`; `kind` (featureset/geometry) is an addition.
+- Implemented from this design as well: the in-place update (`update_scratchpad_item`), the
+  confirmation for bulk deletes (simple form: `confirm: true` after the user said yes; no UI button),
+  the JSONL audit log (`CITYDB_MCP_AUDIT_LOG`) and the vertical line from a floating `3Dmarker` to
+  the ground.
+- The class and the stored geometry always agree: `height_m` / `extrude_m` / `base_z` turn 2D items
+  into 3D ones on the server (2Dmarker -> 3Dmarker, Polygon2D -> Solid3D via `CG_Extrude`), and
+  `box3d` (`ST_3DExtent`), `box2d`, `geography` and curves can be saved as well.
+- The terminal chat and the benchmark (`3dcitydb-chat`) use the same tools, with an own scratchpad
+  per run or conversation.
 
 A proposed new table plus a small set of MCP operations that let the agent
 **create, store, style, navigate to, visualize, and delete** lightweight

@@ -38,12 +38,14 @@ import gradio as gr
 
 from webui import __version__ as CHATBOT_VERSION
 from webui.llm_utils import (
-    ANTHROPIC_MODELS, OPENAI_MODELS, CHAT_INSTRUCTIONS,
+    ANTHROPIC_MODELS, OPENAI_MODELS, CHAT_INSTRUCTIONS, chat_instructions,
     detect_default_provider, models_for_provider,
     get_ollama_models, get_openai_ollama_models,
     _rows_to_markdown_table,
     extract_highlight_payload, fallback_regex_extract, build_highlight_payload,
-    request_stop, _clear_stop, _is_stopped,
+    extract_flood_scene, build_flood_payload,
+    scratchpad_enabled, note_scratch_result, build_scratchpad_payload,
+    scratchpad_tool_specs, format_full_result,
     _get_provider_ctx_limit, _estimate_tokens, _log_context_usage,
     _ollama_reachable,
 )
@@ -60,6 +62,10 @@ from webui.chat_runtime import (
     stream_chat_turn,
 )
 from webui.model_profiles import profile_for_model
+from webui.session import (
+    begin_turn, end_turn, stop_session, register_user, forget_session,
+    touch_user, start_purge_timer, register_purge_hook, user_for,
+)
 from webui.mcp_client import (
     assemble_system_prompt_sync, run_tool_sync, list_tools_sync,
     get_server_instructions_sync,
@@ -784,7 +790,157 @@ def _esc_angle(text: str) -> str:
     return text.replace("<", "&lt;").replace(">", "&gt;")
 
 
+_DISPLAY_MATH_RE = re.compile(r"\$\$")
+_INLINE_MATH_RE = re.compile(r"(?<![\\$])\$(?!\$)")
+# A longer unclosed tail is more likely a stray "$" (currency) than a formula
+# still being typed — show it rather than freezing the bubble.
+_MAX_HELD_MATH_CHARS = 1500
+
+
+def _stream_safe_math(text: str) -> str:
+    """Cut a streaming answer before an unclosed $$…$$ / $…$ formula.
+
+    The chatbot re-renders the whole message (KaTeX included) on every
+    streamed token; a half-written formula flips between raw TeX and broken
+    math on each update, which looks like the app is glitching. Holding the
+    tail back until the closing delimiter arrives makes each formula appear
+    once, fully rendered. The final (non-streaming) update shows all text.
+    """
+    cut = None
+    display = [m.start() for m in _DISPLAY_MATH_RE.finditer(text)]
+    if len(display) % 2:
+        cut = display[-1]
+    else:
+        inline = [m.start() for m in _INLINE_MATH_RE.finditer(text)]
+        if len(inline) % 2:
+            cut = inline[-1]
+    if cut is None or len(text) - cut > _MAX_HELD_MATH_CHARS:
+        return text
+    return text[:cut]
+
+
+# How many chat turns may run at the same time (Gradio's default is 1, so two
+# users would wait for each other).
+_WEBUI_CONCURRENCY = max(1, int(os.environ.get("WEBUI_CONCURRENCY", "4") or 4))
+
+_USER_ID_JS = """
+(_) => {
+  let id = null;
+  try { id = localStorage.getItem("citydb_user_id"); } catch (e) {}
+  if (!id) {
+    id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : null;
+    try { if (id) localStorage.setItem("citydb_user_id", id); } catch (e) {}
+  }
+  return id || "";
+}
+"""
+
+
+def _on_register_user(raw_user_id: str, request: gr.Request):
+    session_id = getattr(request, "session_hash", None) or "local"
+    user_id = register_user(session_id, raw_user_id)
+    note = "" if user_id == (raw_user_id or "").strip().lower() else " (new id)"
+    print(f"[session] tab {session_id[:8]} -> user {user_id[:8]}{note}", flush=True)
+    if ENABLE_VIZ:
+        # A returning user gets their saved items back in the viewer.
+        return _scratch_state_value(build_scratchpad_payload(user_id))
+
+
+def _scratch_state_value(payload):
+    """Value for the hidden scratch_state textbox; the nonce makes a repeated
+    payload (e.g. fly to the same item twice) still count as a change."""
+    if payload is None:
+        return gr.update()
+    return json.dumps({**payload, "t": time.time()}, ensure_ascii=False, default=str)
+
+
+def _on_scratch_sink(raw: str, request: gr.Request):
+    """A click in the viewer's item list (show / hide / delete / goto).
+    `raw` is untrusted browser input; the action runs for this tab's user only."""
+    from citydb_mcp.tools import scratchpad
+
+    try:
+        data = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        return gr.update()
+    action, name = data.get("action"), data.get("name")
+    if action not in scratchpad.ACTIONS or not scratchpad.valid_name(name):
+        return gr.update()
+    user_id = user_for(getattr(request, "session_hash", None) or "local")
+    print(f"[scratchpad] viewer {action} {name}: {scratchpad.apply_action(user_id, action, [name])}", flush=True)
+    return _scratch_state_value(build_scratchpad_payload(user_id, [name] if action in ("goto", "show") else []))
+
+
+def _touch_scratchpad(user_id: str) -> None:
+    if not scratchpad_enabled():
+        return
+    try:
+        from citydb_mcp.tools import scratchpad
+        scratchpad.touch_user(user_id)
+    except Exception as exc:
+        print(f"[scratchpad] touch failed: {exc}", flush=True)
+
+
+def _start_scratchpad() -> None:
+    """Create table/view/query role once and delete expired users' items."""
+    if not scratchpad_enabled():
+        return
+    from citydb_mcp.tools import scratchpad
+
+    def _provision():
+        print(f"[scratchpad] provision: {scratchpad.provision()}", flush=True)
+
+    threading.Thread(target=_provision, name="scratchpad-provision", daemon=True).start()
+    register_purge_hook(scratchpad.delete_user)
+
+
+def _on_unload(request: gr.Request = None):
+    session_id = getattr(request, "session_hash", None)
+    if session_id:
+        forget_session(session_id)
+
+
 def chat_stream(
+    user_message: str,
+    history: list,
+    provider: str,
+    model: str,
+    set_temperature: bool,
+    temperature: float,
+    enable_thinking: bool | str,
+    prompt_mode: str,
+    num_ctx_label: str,
+    log_history: list | None = None,
+    tool_cache: dict | None = None,
+    reasoning_replay: bool = False,
+    add_story: bool = False,
+    reasoning_history: list | None = None,
+    story_history: list | None = None,
+    selection: dict | None = None,
+    full_lists: bool = True,
+    request: gr.Request = None,
+) -> Generator[tuple, None, None]:
+    """One chat turn of one browser tab. Binds the turn to the tab's session
+    (own Stop flag, user id for tool calls); see webui/session.py."""
+    session_id = getattr(request, "session_hash", None) or "local"
+    ctx, turn = begin_turn(session_id)
+    print(f"[session] turn {ctx.turn_id} user={ctx.user_id[:8]} session={session_id[:8]}", flush=True)
+    touch_user(ctx.user_id)
+    _touch_scratchpad(ctx.user_id)
+    try:
+        yield from _chat_turn(
+            user_message, history, provider, model, set_temperature, temperature,
+            enable_thinking, prompt_mode, num_ctx_label, log_history, tool_cache,
+            reasoning_replay, add_story, reasoning_history, story_history, selection,
+            ctx=ctx, turn=turn, full_lists=full_lists,
+        )
+    finally:
+        end_turn(session_id, turn)
+
+
+def _chat_turn(
     user_message: str,
     history: list,
     provider: str,
@@ -801,6 +957,10 @@ def chat_stream(
     reasoning_history: list | None = None,
     story_history: list | None = None,
     selection: dict | None = None,
+    *,
+    ctx,
+    turn,
+    full_lists: bool = True,
 ) -> Generator[tuple, None, None]:
     if log_history is None:
         log_history = []
@@ -832,8 +992,6 @@ def chat_stream(
     if enable_thinking in ("off", ""):
         enable_thinking = False
 
-    _clear_stop()
-
     _NO_HL = gr.update()
     _NO_CTX = gr.update()
 
@@ -853,7 +1011,7 @@ def chat_stream(
     history[-1][1] = "*Connecting to knowledge base…*"
     yield history, history, "*Idle.*", "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
     sp = _get_system_prompt(compact=effective_compact)
-    system_prompt = CHAT_INSTRUCTIONS + "\n\n" + sp
+    system_prompt = chat_instructions(full_lists) + "\n\n" + sp
     total_chars = len(system_prompt)
     print(f"[prompt] sys: {len(system_prompt)} chars, msgs: {len(history)}, total: {total_chars}", flush=True)
 
@@ -885,6 +1043,7 @@ def chat_stream(
             enable_thinking=enable_thinking,
             prompt_mode=prompt_mode,
             num_ctx=num_ctx,
+            full_lists=bool(full_lists),
         ),
         reasoning_history=reasoning_history,
         story_history=story_history,
@@ -907,6 +1066,7 @@ def chat_stream(
     ctx_bar_html = _make_ctx_bar(used_tok, ctx_limit)
 
     accumulated = ""
+    _last_answer_yield = 0.0
     trace_lines: list[str] = []
     got_content = False
     collected_events: list = []
@@ -960,6 +1120,31 @@ def chat_stream(
         table = _rows_to_markdown_table(rows)
         return log(f"📊 **Result** — **{row_count}** row(s), {ms} ms\n\n{table}")
 
+    # run_query for this user: the session context goes to the MCP server (so
+    # the view my_scratchpad shows this user's items).
+    scratch_focus: list[str] = []
+    scratch_last = [False]  # was the latest tool call a scratchpad change?
+    last_query_raw = [""]   # full result of the latest run_query (for the attached list)
+
+    def _run_query_tool(sql: str) -> str:
+        raw = run_tool_sync("run_query", {"sql": sql}, ctx=ctx.to_tool_ctx())
+        scratch_last[0] = False
+        last_query_raw[0] = raw
+        return raw
+
+    # The scratchpad tools: MCP tool calls with this user's context, offered
+    # to the model next to run_query.
+    def _scratch_tool(name: str):
+        def run(args: dict) -> str:
+            raw = run_tool_sync(name, args, ctx=ctx.to_tool_ctx())
+            scratch_last[0] = note_scratch_result(raw, scratch_focus)
+            last_query_raw[0] = ""  # the answer is about the tool call, not an earlier list
+            return raw
+        return run
+
+    extra_tools = {spec["function"]["name"]: {"spec": spec, "run": _scratch_tool(spec["function"]["name"])}
+                   for spec in scratchpad_tool_specs()}
+
     # ── Main agentic loop (single dispatcher call) ─────────────────────────────
     try:
         for event, data in stream_chat_turn(
@@ -970,9 +1155,12 @@ def chat_stream(
                 enable_thinking=enable_thinking,
                 prompt_mode=prompt_mode,
                 num_ctx=num_ctx,
+                full_lists=bool(full_lists),
             ),
             messages,
-            tool_executor=lambda sql: run_tool_sync("run_query", {"sql": sql}),
+            tool_executor=_run_query_tool,
+            turn=turn,
+            extra_tools=extra_tools,
         ):
             collected_events.append((event, data))
 
@@ -1020,7 +1208,13 @@ def chat_stream(
                 sql = data.get("args", {}).get("sql", "")
                 _pending_sql = sql
                 it = data.get("iteration", 0)
-                trace_md = _render_tool_call(sql, it)
+                if data.get("tool", "run_query") != "run_query":
+                    _pending_sql = ""
+                    trace_md = log(
+                        f"🔧 **Calling** `{data['tool']}` — iteration {it + 1}\n\n"
+                        f"```json\n{json.dumps(data.get('args', {}), ensure_ascii=False, indent=1)[:3000]}\n```")
+                else:
+                    trace_md = _render_tool_call(sql, it)
                 history[-1][1] = (
                     (accumulated + " *(running query…)*") if accumulated else "*Running query…*"
                 )
@@ -1028,7 +1222,7 @@ def chat_stream(
 
             elif event == "tool_result":
                 trace_md = _render_tool_result(data)
-                if not data.get("error"):
+                if not data.get("error") and data.get("tool", "run_query") == "run_query":
                     new_cache = _build_tool_cache(
                         sql=_pending_sql,
                         all_rows=data.get("all_rows") or data.get("preview_rows") or [],
@@ -1041,7 +1235,13 @@ def chat_stream(
             else:  # "final"
                 got_content = True
                 accumulated += data
-                history[-1][1] = accumulated + " ▌"
+                # Throttle: each yield re-renders the whole bubble (markdown,
+                # KaTeX, mermaid); per-token yields make formulas flicker.
+                _now = time.monotonic()
+                if _now - _last_answer_yield < 0.15:
+                    continue
+                _last_answer_yield = _now
+                history[-1][1] = _stream_safe_math(accumulated) + " ▌"
                 yield history, history, trace_md, "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
 
     except Exception as exc:
@@ -1082,6 +1282,26 @@ def chat_stream(
             # No id column in the last result: look for ids in the answer text.
             # The resolver drops anything that is not a real objectid.
             highlight_payload = build_highlight_payload(fallback_regex_extract(accumulated))
+        flood_scene = extract_flood_scene(collected_events)
+        if flood_scene and scratch_last[0]:
+            # A save's rows are only a preview of the saved set, not buildings
+            # to focus on (that would start the route view).
+            flood_scene["focus"] = []
+        if flood_scene:
+            flood_payload = build_flood_payload(flood_scene)
+            if flood_payload:
+                highlight_payload = {**highlight_payload, "flood": flood_payload}
+            print(f"[viz] flood scene: level={flood_scene['level']} protection={flood_scene['protection']} "
+                  f"focus={len(flood_scene['focus'])} "
+                  f"buildings={len(flood_payload['buildings']) if flood_payload else 'FAILED'}", flush=True)
+        # After a save the item shows the full result; highlighting the few
+        # preview rows on top of it would only confuse.
+        if scratch_last[0]:
+            highlight_payload = {**highlight_payload, "buildings": []}
+        # The user's saved items, every turn: the viewer mirrors the table.
+        scratch_payload = build_scratchpad_payload(ctx.user_id, scratch_focus)
+        if scratch_payload is not None:
+            highlight_payload = {**highlight_payload, "scratchpad": scratch_payload}
     else:
         highlight_payload = _NO_HL
 
@@ -1133,7 +1353,9 @@ def chat_stream(
     clean = _self_story.split(accumulated, maxsplit=1)[0].rstrip()
     if clean != accumulated:
         print("[chat] stripped self-generated story section from history", flush=True)
-    history[-1][1] = clean
+    # Long result: the model showed 5 rows (RULE 1); attach the whole list.
+    full_result = format_full_result(last_query_raw[0])
+    history[-1][1] = clean + full_result
     updated_log_history = list(log_history) + [{"query": user_message, "trace": trace_md}]
     display_history = _history_with_duration(history, answer_started)
     _n = len(updated_log_history)
@@ -2911,6 +3133,24 @@ async (_win, _event_data) => {
         not_tileable: (payload && payload.not_tileable) || [] },
       window.location.origin
     );
+    // Flood scene (flood-bridge.js): sent after the highlight so the scene
+    // can colour on top of it and own the camera for focus buildings.
+    if (payload && payload.flood) {
+      console.log("[chat] sending flood scene to the viewer:", payload.flood.level);
+      target.postMessage(
+        Object.assign({ type: "flood", centroid: payload.centroid || null }, payload.flood),
+        window.location.origin
+      );
+    }
+    if (payload && payload.scratchpad) window._sendScratchpad(payload.scratchpad);
+  };
+  // Spatial scratchpad (scratchpad-bridge.js): the user's saved items. The
+  // last list is kept, so a viewer that loads later can ask for it again.
+  window._sendScratchpad = function (payload) {
+    window.__citydbScratchpad = payload;
+    var target = vizWindow();
+    if (!target) return;
+    target.postMessage(Object.assign({ type: "scratchpad" }, payload), window.location.origin);
   };
   window._reloadTiles = function () {
     var f = document.getElementById("cesium-iframe");
@@ -2939,6 +3179,13 @@ async (_win, _event_data) => {
       if (!ta) return;
       ta.value = JSON.stringify(data);
       ta.dispatchEvent(new Event("input", { bubbles: true }));
+    } else if (data.type === "scratchpad-ready") {
+      if (window.__citydbScratchpad) window._sendScratchpad(window.__citydbScratchpad);
+    } else if (data.type === "scratchpad-action") {
+      var sink = document.querySelector("#scratch-sink textarea");
+      if (!sink) return;
+      sink.value = JSON.stringify({ action: data.action, name: data.name, t: data.t });
+      sink.dispatchEvent(new Event("input", { bubbles: true }));
     } else if (data.type === "selection_done") {
       // "Finish" in the viewer's selection panel: the selection itself was
       // already synced (every add/remove posts immediately), this is just
@@ -3025,7 +3272,7 @@ def build_ui() -> gr.Blocks:
            DOM. select-bridge.js's reverse channel needs a real, queryable
            textarea to write into, so selection-sink is visible=True and
            hidden this way instead: present in the DOM, invisible to the eye. */
-        #selection-sink { position: absolute !important; width: 1px !important; height: 1px !important;
+        #selection-sink, #scratch-sink, #scratch-state { position: absolute !important; width: 1px !important; height: 1px !important;
           padding: 0 !important; margin: -1px !important; overflow: hidden !important; opacity: 0 !important; }
         .header-bar { background: #1e293b; padding: 16px 24px; border-radius: 8px; margin-bottom: 8px; }
         .header-bar h1 { color: #f8fafc; margin: 0; font-size: 1.4rem; }
@@ -3278,6 +3525,14 @@ def build_ui() -> gr.Blocks:
                          "into later turns, so follow-ups can adapt earlier queries. "
                          "Adds one extra blocking generation per tool-using turn.",
                 )
+                full_lists_checkbox = gr.Checkbox(
+                    label="Show every row in result tables",
+                    value=True,
+                    info="Lists all rows (e.g. every building ID) in the answer's table. "
+                         "Unchecked: results with more than 10 rows show 5 example rows, which "
+                         "answers faster. The full result is attached below the answer as "
+                         "CSV and JSON either way.",
+                )
                 reasoning_replay_checkbox = gr.Checkbox(
                     label="Include all reasoning steps in context",
                     value=False,
@@ -3438,6 +3693,9 @@ def build_ui() -> gr.Blocks:
                                 agent_trace = gr.Markdown(
                                     value="*Idle — waiting for first query.*",
                                     elem_id="agent-trace",
+                                    # Keep TeX raw here (also the JS demotion below):
+                                    # rendering it on every streamed token flickers.
+                                    latex_delimiters=[],
                                 )
 
                     else:
@@ -3486,6 +3744,9 @@ def build_ui() -> gr.Blocks:
                                 agent_trace = gr.Markdown(
                                     value="*Idle — waiting for first query.*",
                                     elem_id="agent-trace",
+                                    # Keep TeX raw here (also the JS demotion below):
+                                    # rendering it on every streamed token flickers.
+                                    latex_delimiters=[],
                                 )
 
                 if VARIANT == "fullstack":
@@ -3666,6 +3927,18 @@ def build_ui() -> gr.Blocks:
             # Gradio does not mount an invisible component's <textarea> at
             # all, and outside JS needs a real element to write into.
             selection_sink = gr.Textbox(visible=True, elem_id="selection-sink", label="")
+            # Spatial scratchpad: the user's items for the viewer (on load and
+            # after a click in its list), and the sink for those clicks.
+            # A JSON string in a (CSS-hidden) textbox: a gr.JSON output of a
+            # load event reached the browser as a Python repr string.
+            scratch_state = gr.Textbox(visible=True, elem_id="scratch-state", label="", value="")
+            scratch_state.change(
+                fn=None, inputs=[scratch_state], outputs=[],
+                js="(raw) => { if (raw) window._sendScratchpad(JSON.parse(raw)); }",
+            )
+            scratch_sink = gr.Textbox(visible=True, elem_id="scratch-sink", label="")
+            scratch_sink.change(fn=_on_scratch_sink, inputs=[scratch_sink],
+                                outputs=[scratch_state], queue=False)
             selection_sink.change(
                 fn=_on_selection_sink,
                 inputs=[selection_sink],
@@ -3679,16 +3952,17 @@ def build_ui() -> gr.Blocks:
             thinking_dropdown, prompt_mode_radio, num_ctx_dropdown,
             log_history_state, tool_cache_state,
             reasoning_replay_checkbox, story_checkbox,
-            reasoning_state, story_state, selection_state,
+            reasoning_state, story_state, selection_state, full_lists_checkbox,
         ]
         send_outputs = [chatbot, history_state, agent_trace, msg_input, stop_btn, highlight_state, context_bar, log_history_state, log_page_state, log_page_label, log_prev_btn, log_next_btn, tool_cache_state, reasoning_state, story_state]
 
         submit_event = msg_input.submit(fn=chat_stream, inputs=send_inputs, outputs=send_outputs)
         click_event = send_btn.click(fn=chat_stream, inputs=send_inputs, outputs=send_outputs)
 
-        def _on_stop_click():
-            print("[app] Stop button clicked", flush=True)
-            request_stop()
+        def _on_stop_click(request: gr.Request):
+            session_id = getattr(request, "session_hash", None) or "local"
+            stopped = stop_session(session_id)
+            print(f"[app] Stop button clicked (session={session_id[:8]}, running={stopped})", flush=True)
             return gr.update(visible=False)
 
         stop_btn.click(fn=_on_stop_click, outputs=[stop_btn], queue=False)
@@ -3912,6 +4186,19 @@ def build_ui() -> gr.Blocks:
         # stream directly (handler wired in the System Prompt tab, right next
         # to the button's own wiring) and only uses a js hook to switch to
         # that tab. Nothing else to wire here.
+
+        # Session layer: the browser keeps a durable user id in localStorage
+        # (made on the first visit) and hands it over once per page load; the
+        # server binds it to this tab's session. See webui/session.py.
+        user_id_box = gr.Textbox(visible=False)
+        demo.load(
+            fn=_on_register_user,
+            inputs=[user_id_box],
+            outputs=[scratch_state] if ENABLE_VIZ else [],
+            js=_USER_ID_JS,
+            queue=False,
+        )
+        demo.unload(_on_unload)
         demo.load(
             fn=_on_load,
             inputs=[provider_radio, model_dropdown, prompt_mode_radio, num_ctx_dropdown],
@@ -3931,6 +4218,8 @@ if __name__ == "__main__":
 
     detected = detect_default_provider()
 
+    _start_scratchpad()
+    start_purge_timer()
     demo = build_ui()
 
     if ENABLE_VIZ:
@@ -3939,8 +4228,10 @@ if __name__ == "__main__":
         from fastapi.staticfiles import StaticFiles
 
         class _NoCacheStaticFiles(StaticFiles):
-            # Tiles are regenerated in place (same file names, new content), so
-            # the browser must revalidate instead of serving a stale tileset.
+            # Tiles are regenerated in place (same file names, new content), and
+            # the viewer's overlay scripts change with every update, so the
+            # browser must revalidate (a cheap 304 when unchanged) instead of
+            # serving a stale tileset or an old flood/scratchpad bridge.
             async def get_response(self, path, scope):
                 response = await super().get_response(path, scope)
                 response.headers["Cache-Control"] = "no-cache"
@@ -3956,7 +4247,7 @@ if __name__ == "__main__":
         else:
             print(f"[viz] WARNING: tiles directory not found at {_tiles_dir} — /tiles will 404", flush=True)
         if os.path.isdir(_webmap_dir):
-            fastapi_app.mount("/webmap", StaticFiles(directory=_webmap_dir, html=True), name="webmap")
+            fastapi_app.mount("/webmap", _NoCacheStaticFiles(directory=_webmap_dir, html=True), name="webmap")
         else:
             print(f"[viz] WARNING: web map client not found at {_webmap_dir} — /webmap will 404", flush=True)
 
@@ -3986,7 +4277,7 @@ if __name__ == "__main__":
                 print(f"[viz] /api/selection-info failed: {exc}", flush=True)
                 return JSONResponse({"error": str(exc)})
 
-        demo.queue()
+        demo.queue(default_concurrency_limit=_WEBUI_CONCURRENCY)
         fastapi_app = gr.mount_gradio_app(fastapi_app, demo, path="/")
 
         uvicorn.run(
@@ -3995,6 +4286,7 @@ if __name__ == "__main__":
             port=int(os.environ.get("GRADIO_PORT", "7860")),
         )
     else:
+        demo.queue(default_concurrency_limit=_WEBUI_CONCURRENCY)
         demo.launch(
             server_name="0.0.0.0",
             server_port=int(os.environ.get("GRADIO_PORT", "7860")),

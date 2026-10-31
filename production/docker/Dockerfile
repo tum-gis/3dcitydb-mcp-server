@@ -48,7 +48,7 @@ RUN rm -rf /app/webmap/examples /app/webmap/demos /app/webmap/node_modules /app/
 COPY production/webmap-overlay/ /app/webmap/3dwebclient/
 RUN set -e; f=/app/webmap/3dwebclient/index.html; \
     grep -q 'script.js' "$f"; \
-    sed -i 's#</body>#<script src="highlight-bridge.js"></script><script src="select-bridge.js"></script><script src="auto-load-tileset.js"></script><script src="auto-load-terrain.js"></script><script src="auto-load-basemap.js"></script></body>#' "$f"; \
+    sed -i 's#</body>#<script src="highlight-bridge.js"></script><script src="select-bridge.js"></script><script src="flood-bridge.js"></script><script src="scratchpad-bridge.js"></script><script src="auto-load-tileset.js"></script><script src="auto-load-terrain.js"></script><script src="auto-load-basemap.js"></script></body>#' "$f"; \
     grep -q 'highlight-bridge.js' "$f"; \
     grep -q 'select-bridge.js' "$f"; \
     grep -q 'auto-load-basemap.js' "$f"

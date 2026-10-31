@@ -4,21 +4,19 @@ import json
 import time as _time
 from typing import Callable, Generator
 
+from webui.session import TurnControl
+from webui.llm_utils import long_result_note, scratch_tool_hint, scratch_tool_result, wants_scratchpad
 from webui.llm_utils import (
     MAX_ITERATIONS,
     RUN_QUERY_TOOL,
     _SQL_FENCE_RE,
-    _cancel_active_future,
     _executor,
     _is_all_null_result,
-    _is_stopped,
     _litellm_kwargs,
     _log_context_usage,
     safe_completion,
     _parse_tool_result,
     _post_process_markdown,
-    _set_active_future,
-    _stop_event,
     _strip_reasoning_tags,
     _truncate_result,
 )
@@ -74,11 +72,20 @@ def native_tool_stream(
     tool_executor: Callable[[str], str],
     *,
     enable_thinking: bool | str = True,
+    turn: TurnControl | None = None,
+    extra_tools: dict | None = None,
+    full_lists: bool = True,
 ) -> Generator[tuple, None, None]:
     """Agentic loop using native tool calling (Anthropic, OpenAI).
 
-    Yields the shared event protocol tuples defined in events.py.
+    Yields the shared event protocol tuples defined in events.py. ``turn``
+    carries this turn's stop flag (a fresh one when the caller passes none).
+    ``extra_tools`` ({name: {"spec": openai_spec, "run": fn(args) -> str}})
+    are offered next to run_query, e.g. the scratchpad tools.
     """
+    turn = turn or TurnControl()
+    extra_tools = extra_tools or {}
+    all_tools = [RUN_QUERY_TOOL] + [t["spec"] for t in extra_tools.values()]
     kw = _litellm_kwargs(
         provider, model, temperature, enable_thinking=enable_thinking
     )
@@ -97,7 +104,7 @@ def native_tool_stream(
     _last_tool_sql: str = ""
 
     for iteration in range(MAX_ITERATIONS):
-        if _is_stopped():
+        if turn.stopped():
             print("[cloud] stop flag set at iteration boundary — exiting", flush=True)
             yield ("stopped", "")
             return
@@ -122,7 +129,7 @@ def native_tool_stream(
                 safe_completion,
                 kw,
                 messages=working_messages,
-                tools=[RUN_QUERY_TOOL],
+                tools=all_tools,
                 tool_choice="none",
             )
         else:
@@ -130,14 +137,14 @@ def native_tool_stream(
                 safe_completion,
                 kw,
                 messages=working_messages,
-                tools=[RUN_QUERY_TOOL],
+                tools=all_tools,
                 tool_choice="auto",
             )
-        _set_active_future(_fut)
+        turn.set_future(_fut)
         try:
             yield ("status", _status)
             while not _fut.done():
-                if _stop_event.is_set():
+                if turn.stopped():
                     print("[cloud] stop requested — exiting loop", flush=True)
                     yield ("stopped", "")
                     return
@@ -150,7 +157,7 @@ def native_tool_stream(
                 print(f"[cloud] ERROR: {type(exc).__name__}: {exc}", flush=True)
                 raise
         finally:
-            _set_active_future(None)
+            turn.set_future(None)
 
         msg = response.choices[0].message
         content = msg.content or ""
@@ -255,10 +262,38 @@ def native_tool_stream(
             yield ("thinking", reasoning)
 
         for tc in tool_calls:
-            if _is_stopped():
+            if turn.stopped():
                 print("[cloud] stop flag set before tool exec — exiting", flush=True)
                 yield ("stopped", "")
                 return
+
+            tool_name = getattr(tc.function, "name", "") or "run_query"
+            if tool_name in extra_tools:
+                # A scratchpad (or other extra) tool: run it, hand its JSON
+                # result back, and let the model continue (save several items,
+                # then answer).
+                args = {}
+                try:
+                    raw_args = tc.function.arguments or "{}"
+                    if len(raw_args) > 300 * 1024:
+                        raise ValueError(f"tool arguments too large ({len(raw_args)} bytes)")
+                    args = json.loads(raw_args) if raw_args.strip() else {}
+                    if not isinstance(args, dict):
+                        raise ValueError("tool arguments must be an object")
+                    print(f"[cloud] {tool_name} → {json.dumps(args, ensure_ascii=False)[:160]}", flush=True)
+                    yield ("tool_call", {"tool": tool_name, "args": args, "iteration": iteration})
+                    raw_result = str(extra_tools[tool_name]["run"](args))
+                except Exception as exc:
+                    raw_result = json.dumps({"error": str(exc)})
+                result_data = scratch_tool_result(raw_result)
+                last_error = result_data.get("error") or ""
+                last_had_error = bool(last_error)
+                print(f"[cloud] {tool_name} result → {raw_result[:300]}", flush=True)
+                yield ("tool_result", {**result_data, "tool": tool_name, "iteration": iteration})
+                hint = scratch_tool_hint(result_data)
+                working_messages.append({"role": "tool", "tool_call_id": tc.id,
+                                         "content": _truncate_result(raw_result) + "\n" + hint})
+                continue
 
             sql = ""
             raw_result = ""
@@ -327,12 +362,15 @@ def native_tool_stream(
                 )
             elif result_data.get("row_count", 0) > 0 and not _is_all_null_result(result_data):
                 last_had_error = False
-                force_text_response = True
+                # Answer now, unless the user asked to save/manage something
+                # and the scratchpad tools are there to do it with this result.
+                force_text_response = not (extra_tools and wants_scratchpad(_last_user_q))
                 _cached_content = ""  # fresh result; clear cached reasoning
                 tool_content = (
                     "--- FRESH TOOL RESULT FOR CURRENT USER QUESTION ---\n"
                     + _truncate_result(raw_result)
                     + "\n--- END FRESH TOOL RESULT ---\n"
+                    + long_result_note(result_data.get("row_count", 0), full_lists) + "\n"
                     f"The user's question was:\n\"\"\"\n{_last_user_q}\n\"\"\"\n"
                     "Reply in EXACTLY the same language as the user's question above "
                     "(English → English, German → German). Ignore foreign-language proper "
@@ -364,7 +402,7 @@ def native_tool_stream(
                 {"role": "tool", "tool_call_id": tc.id, "content": tool_content}
             )
 
-            if _is_stopped():
+            if turn.stopped():
                 print("[cloud] stop flag set after tool exec — exiting", flush=True)
                 yield ("stopped", "")
                 return
@@ -387,14 +425,14 @@ def native_tool_stream(
         safe_completion,
         kw,
         messages=working_messages,
-        tools=[RUN_QUERY_TOOL],
+        tools=all_tools,
         tool_choice="none",
     )
-    _set_active_future(_fut_fail)
+    turn.set_future(_fut_fail)
     try:
         yield ("status", "Composing response…")
         while not _fut_fail.done():
-            if _stop_event.is_set():
+            if turn.stopped():
                 yield ("stopped", "")
                 return
             yield ("ping", "")
@@ -405,7 +443,7 @@ def native_tool_stream(
             yield ("final", f"I tried {MAX_ITERATIONS} times but couldn't complete this.{error_hint} Could you try rephrasing the question?")
             return
     finally:
-        _set_active_future(None)
+        turn.set_future(None)
 
     fail_answer = r_fail.choices[0].message.content or ""
     if fail_answer:

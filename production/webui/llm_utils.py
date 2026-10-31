@@ -5,45 +5,14 @@ import json
 import os
 import re
 import threading
+import time
 import urllib.request
 
 import litellm
 
 _executor = _cf.ThreadPoolExecutor(max_workers=8)
 
-# ── Stop flag ──────────────────────────────────────────────────────────────────
-_stop_event = threading.Event()
-
-
-def request_stop() -> None:
-    print("[llm] request_stop() called — setting stop flag + cancelling active future", flush=True)
-    _stop_event.set()
-    _cancel_active_future()
-
-
-def _clear_stop() -> None:
-    _stop_event.clear()
-
-
-def _is_stopped() -> bool:
-    return _stop_event.is_set()
-
-
-_active_future: "_cf.Future | None" = None
-_active_future_lock = threading.Lock()
-
-
-def _set_active_future(fut: "_cf.Future | None") -> None:
-    global _active_future
-    with _active_future_lock:
-        _active_future = fut
-
-
-def _cancel_active_future() -> None:
-    with _active_future_lock:
-        fut = _active_future
-    if fut is not None:
-        fut.cancel()
+# Stop handling is per turn: see webui.session.TurnControl.
 
 
 # ── Context-usage estimation & logging ────────────────────────────────────────
@@ -151,7 +120,7 @@ def _log_context_usage(
 
 
 # ── Chat instructions ──────────────────────────────────────────────────────────
-CHAT_INSTRUCTIONS = """\
+_CHAT_INSTRUCTIONS_TEMPLATE = """\
 You are a SQL query assistant for 3DCityDB v5 — a PostgreSQL-based 3D city model database \
 following the CityGML standard. The user is exploring a city dataset and wants \
 natural-language answers backed by real data.
@@ -190,7 +159,7 @@ classes in question.
 extra column naming the source of each value (the attribute name, or the SQL expression \
 for a computed one). Open with one sentence saying the term was ambiguous and which \
 sources you used. The `source` column is additive to RULE 1 below, not a replacement — \
-`objectid` and every row are still required.
+`objectid` and the rows RULE 1 asks for are still required.
 - More than 3 plausible sources, or sources that need genuinely different queries \
 (different joins, different classes, different LoD) → do not guess. Ask which one they \
 mean, as a short bullet list of the available options, and run no query (or just to \
@@ -219,14 +188,10 @@ returned MORE THAN ONE ROW, your final answer MUST be:
     13 Wohngebäude in der Straße Röblingweg mit ihrer jeweiligen Wohnungsanzahl:").
   - Followed by a markdown table with the rows.
 The table MUST include the `objectid` column plus all relevant attribute columns
-from the result. The table MUST contain EVERY row returned by the query — never
-omit, filter out, or truncate rows, even if they have NULL values in some columns
-(show NULL as an empty cell). Do NOT narrate rows as prose. Do NOT group rows by
+from the result. @@LIST_ROWS@@ Do NOT narrate rows as prose. Do NOT group rows by
 shared values and describe them sentence-by-sentence.
 
-RULE 1b: The count you state in the introductory sentence MUST equal the number
-of rows in your table, which MUST equal the number of rows the query returned.
-Never write "10 buildings" if the query returned 15 rows.
+@@LIST_COUNT@@
 
 RULE 2: If the result has ZERO rows, answer in prose only (e.g. "No matching
 buildings were found." in English, or the equivalent in the user's language).
@@ -246,9 +211,7 @@ inside table cells.
 
 RULE 5: Never paste raw JSON; never paste the SQL – unless the user explicitly asks for it. Never include `<think>` / `<thinking>` blocks in your final answer.
 
-RULE 6: Never truncate a table. Never use `...` or `…` or "and X more" to shorten
-the table. Every row from the tool result MUST appear as its own table row.
-If this makes the answer long — that is correct and expected.
+@@LIST_RULE_6@@
 
 RULE 7: Never add a text section like "How I solved it", "verified queries",
 "reasoning", or "adapt these queries" to your answer, and never quote, repeat,
@@ -278,6 +241,51 @@ tried 3 different approaches.
 If you genuinely cannot answer with the available data, say so directly. Do not invent \
 objectclass IDs, property names, or values — use only what's in the assembled schema below.
 """
+
+# How long result tables are written (setting "Show every row in result
+# tables", ChatTurnSettings.full_lists). Full: every row, as before the short
+# mode existed. Short: 5 example rows above FULL_RESULT_MIN_ROWS; both modes
+# attach the complete result as CSV/JSON below the answer (format_full_result).
+_LIST_RULES = {
+    True: {
+        "@@LIST_ROWS@@": """The table MUST contain EVERY row returned by the query — never
+omit, filter out, or truncate rows, even if they have NULL values in some columns
+(show NULL as an empty cell).""",
+        "@@LIST_COUNT@@": """RULE 1b: The count you state in the introductory sentence MUST equal the number
+of rows in your table, which MUST equal the number of rows the query returned.
+Never write "10 buildings" if the query returned 15 rows.""",
+        "@@LIST_RULE_6@@": """RULE 6: Never truncate a table. Never use `...` or `…` or "and X more" to shorten
+the table. Every row from the tool result MUST appear as its own table row.
+If this makes the answer long — that is correct and expected.""",
+    },
+    False: {
+        "@@LIST_ROWS@@": """Up to 10 rows: the table MUST contain EVERY row returned by the
+query — never omit, filter out, or truncate rows, even if they have NULL values in
+some columns (show NULL as an empty cell). MORE THAN 10 rows: the table shows only
+the FIRST 5 rows, followed by one sentence saying these are 5 of N and that the full
+list is attached below the answer (CSV and JSON, ready to copy). The app attaches it
+automatically: never type the full list yourself and never run the query again just
+to see more rows.""",
+        "@@LIST_COUNT@@": """RULE 1b: The count you state in the introductory sentence MUST equal the TOTAL
+number of rows the query returned (row_count / TOTAL ROWS RETURNED), also when the
+table only shows 5 of them. Never write "10 buildings" if the query returned 15 rows.""",
+        "@@LIST_RULE_6@@": """RULE 6: Up to 10 rows, never truncate a table: no `...`, `…` or "and X more"; every
+row from the tool result appears as its own table row. More than 10 rows: show the
+first 5 rows and the sentence from RULE 1 (5 of N, full list attached below) — that
+is the only allowed shortening.""",
+    },
+}
+
+
+def chat_instructions(full_lists: bool = True) -> str:
+    """CHAT_INSTRUCTIONS with the list rules of the chosen mode."""
+    text = _CHAT_INSTRUCTIONS_TEMPLATE
+    for marker, rule in _LIST_RULES[bool(full_lists)].items():
+        text = text.replace(marker, rule)
+    return text
+
+
+CHAT_INSTRUCTIONS = chat_instructions(True)
 
 # ── Provider model lists ───────────────────────────────────────────────────────
 ANTHROPIC_MODELS = [
@@ -788,3 +796,525 @@ def build_highlight_payload(objectids) -> dict:
         "missing": result["missing"],
         "not_tileable": result["not_tileable"],
     }
+
+
+# ── Viz: flood scene ───────────────────────────────────────────────────────────
+#
+# A run_query result with a `flood_level_m` column (optionally `protection_m`)
+# asks the viewer for a flood scene: a water plane at that height over the
+# dataset and every building coloured by whether the water reaches it. The
+# chat query only has to carry the level (typically one COUNT row); the
+# buildings are fetched here with one fixed query, so neither the 500-row
+# run_query cap nor the 200-id highlight cap applies. Rows that also carry
+# objectids are the buildings in focus (e.g. "my house").
+#
+# Payload (sent to webmap-overlay/flood-bridge.js):
+#   {"level": float, "protection": float, "from_level": float|None,
+#    "gauge": {...}|None, "extent": {west, south, east, north, ...}|None,
+#    "buildings": [[objectid, base_m], ...], "extra_ids": {objectid: [tile_id]},
+#    "focus": [objectid, ...]}
+
+FLOOD_SCENE_ENABLED = os.environ.get("FLOOD_SCENE", "false").lower() == "true"
+# Up to this many focus buildings get the "route" view: positions, camera on the
+# first flooded one, lines to the dry ones. Longer lists are only marked.
+FLOOD_ROUTE_MAX_FOCUS = 6
+_FLOOD_LEVEL_COL = "flood_level_m"
+_FLOOD_PROTECTION_COL = "protection_m"
+_FLOOD_CACHE_TTL_S = 300
+_flood_cache: dict = {}
+_flood_cache_lock = threading.Lock()
+
+
+def _env_list(name: str) -> list[str]:
+    return [s.strip() for s in os.environ.get(name, "").split(",") if s.strip()]
+
+
+def _env_floats(name: str) -> list[float]:
+    out = []
+    for s in _env_list(name):
+        try:
+            out.append(float(s))
+        except ValueError:
+            pass
+    return out
+
+
+def _as_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+_FLOOD_LEVEL_VARIANTS = ("flood_level", "water_level", "wasserstand")
+_FLOOD_CONDITION_RE = re.compile(
+    r"ST_ZMin\s*\(\s*(?:\w+\.)?envelope\s*\)\s*<\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+
+
+def _flood_level_column(row: dict) -> str | None:
+    """`flood_level_m`, or a close variant local models sometimes write despite
+    the prompt (`flood_level_nhn`, `water_level_nhn`, `wasserstand_m`, ...)."""
+    if _FLOOD_LEVEL_COL in row:
+        return _FLOOD_LEVEL_COL
+    return next((k for k in row if str(k).lower().startswith(_FLOOD_LEVEL_VARIANTS)), None)
+
+
+def extract_flood_scene(events: list) -> dict | None:
+    """Level, protection and focus ids from the last successful tool result, if it
+    carries a `flood_level_m` column; None otherwise."""
+    if not FLOOD_SCENE_ENABLED:
+        return None
+    last_result, last_sql = None, ""
+    for i in range(len(events) - 1, -1, -1):
+        ev_type, ev_data = events[i]
+        if ev_type == "tool_result" and not ev_data.get("error"):
+            last_result = ev_data
+            last_sql = next((d.get("args", {}).get("sql", "") for t, d in reversed(events[:i])
+                             if t == "tool_call"), "")
+            break
+    rows = (last_result or {}).get("all_rows") or []
+    if not rows:
+        return None
+    level_col = _flood_level_column(rows[0])
+    if level_col is not None:
+        level = _as_float(rows[0].get(level_col))
+    else:
+        # The model left the column out: take the level from the flood
+        # condition itself (ST_ZMin(<alias>.envelope) < <level>).
+        m = _FLOOD_CONDITION_RE.search(last_sql or "")
+        level = _as_float(m.group(1)) if m else None
+    if level is None:
+        return None
+    protection = _as_float(rows[0].get(_FLOOD_PROTECTION_COL)) or 0.0
+    id_key = _pick_id_key(rows[0])
+    focus = []
+    if id_key:
+        focus = list(dict.fromkeys(str(r[id_key]) for r in rows if r.get(id_key)))
+    return {"level": level, "protection": max(protection, 0.0), "focus": focus[:_MAX_HIGHLIGHT_IDS]}
+
+
+def _flood_buildings() -> dict:
+    """All building base heights (cached for a few minutes; one query per import)."""
+    from citydb_mcp.tools.highlight import get_dataset_extent, get_flood_buildings
+
+    exclude = tuple(_env_list("FLOOD_EXCLUDE_FUNCTIONS"))
+    now = time.monotonic()
+    with _flood_cache_lock:
+        hit = _flood_cache.get(exclude)
+        if hit and now - hit[0] < _FLOOD_CACHE_TTL_S:
+            return hit[1]
+    db = _get_resolver_db()
+    data = get_flood_buildings(db, exclude)
+    data["extent"] = get_dataset_extent(db)
+    with _flood_cache_lock:
+        _flood_cache[exclude] = (now, data)
+    return data
+
+
+def build_flood_payload(scene: dict) -> dict | None:
+    """Expand an extracted flood scene into the viewer payload; None on failure."""
+    try:
+        data = _flood_buildings()
+    except Exception as exc:
+        print(f"[viz] flood scene query failed: {exc}", flush=True)
+        return None
+    gauge = flood_gauge_info()
+    from_level = None
+    if data["buildings"]:
+        from_level = min(b[1] for b in data["buildings"]) - 1.0
+    anchor, positions = _focus_route(scene, data)
+    return {
+        "level": scene["level"],
+        "protection": scene["protection"],
+        "from_level": from_level,
+        "gauge": gauge,
+        "extent": data["extent"],
+        "buildings": data["buildings"],
+        "extra_ids": data["extra_ids"],
+        "focus": scene["focus"],
+        "anchor": anchor,
+        "focus_positions": positions,
+    }
+
+
+def _focus_route(scene: dict, data: dict) -> tuple[str | None, dict]:
+    """Anchor (the first flooded focus building, e.g. "my house") and the focus
+    buildings' positions, for a short focus list only."""
+    focus = scene["focus"]
+    if not focus or len(focus) > FLOOD_ROUTE_MAX_FOCUS:
+        return None, {}
+    bases = {oid: base for oid, base in data["buildings"]}
+    anchor = next((o for o in focus if bases.get(o) is not None and bases[o] < scene["level"]), focus[0])
+    try:
+        from citydb_mcp.tools.highlight import get_focus_positions
+        return anchor, get_focus_positions(_get_resolver_db(), focus, anchor)
+    except Exception as exc:
+        print(f"[viz] focus positions failed: {exc}", flush=True)
+        return anchor, {}
+
+
+# ── Gauge reference (viewer only) ─────────────────────────────────────────────
+#
+# Optional settings for the viewer's gauge widget: FLOOD_GAUGE_NAME,
+# FLOOD_GAUGE_ZERO_M (gauge zero in the data's height system), FLOOD_STAGES
+# (warning levels, cm) and FLOOD_REFERENCE_CM / FLOOD_REFERENCE_LABEL (a
+# historic flood). They only draw marks next to the water level; they are not
+# added to the prompt — tell the chatbot about a gauge in the conversation.
+
+def flood_gauge_info() -> dict | None:
+    """Configured gauge reference; None when no gauge zero is set."""
+    zero = _as_float(os.environ.get("FLOOD_GAUGE_ZERO_M"))
+    if zero is None:
+        return None
+    return {
+        "name": os.environ.get("FLOOD_GAUGE_NAME", "").strip() or None,
+        "zero_m": zero,
+        "stages_cm": _env_floats("FLOOD_STAGES"),
+        "reference_cm": _as_float(os.environ.get("FLOOD_REFERENCE_CM")),
+        "reference_label": os.environ.get("FLOOD_REFERENCE_LABEL", "").strip() or None,
+    }
+
+
+FLOOD_SCENE_INSTRUCTIONS = """\
+[FLOOD SCENE]
+The 3D viewer can show a flood. Add a constant column `flood_level_m` (water level in the \
+height system of the data, e.g. `305.0 AS flood_level_m`) to the query that answers a flood \
+question, and optionally `protection_m` (height of a property-level flood barrier). Use exactly \
+these names (not water_level, not *_nhn): with any other name the viewer shows nothing. The viewer \
+then draws the water at that height and colours EVERY building itself (red = flooded, \
+green = protected by the barrier).
+- A building is flooded ("betroffen", "affected", "unter Wasser") when ST_ZMin(feature.envelope) < \
+water level (its lowest point). Always filter on this condition when the user asks which \
+buildings are affected, also when searching by name or type; count Buildings (objectclass \
+Building) this way so your numbers match the viewer.
+- Exception to RULE 1: for "which buildings are flooded" questions do NOT list the buildings. \
+Return one row with the count plus `flood_level_m` (and `protection_m`), answer with the count \
+and tell the user the 3D view shows every affected building.
+- For questions about specific buildings (an address, the nearest dry buildings, the most \
+endangered facility) select their `objectid` together with `flood_level_m`, the affected building \
+(e.g. the user's house) first. Up to 6 such buildings: the viewer flies to the first flooded one, \
+marks it dark red, the dry ones dark green with a dashed line and the straight-line distance to \
+each, and fades all other buildings. More than 6: it marks them all in orange.
+- Exception to RULE 1 for more than 10 such buildings: keep every row (with `objectid`) in the \
+query result so the viewer marks them all, but do NOT print one table row per building. Answer \
+with a short summary instead: the number of buildings, grouped by name or function, with the \
+greatest water depth of each group, and say that the 3D view marks all of them."""
+
+
+# SQL examples appended to the [FLOOD SCENE] block. {L} = example water level,
+# {X}/{Xd} = the non-building exclusion for alias f/d (empty without FLOOD_EXCLUDE_FUNCTIONS).
+# Every example is a plain run_query: the flood column makes the viewer draw it.
+_FLOOD_EXAMPLES = """\
+Flood examples (water level 305.0 is a placeholder: always use the user's level; keep `flood_level_m`):
+1. Number of flooded buildings:
+SELECT count(*) AS flooded, {L} AS flood_level_m
+FROM feature f
+WHERE f.objectclass_id = 901 AND ST_ZMin(f.envelope) < {L}{X};
+2. Flooded buildings of given types (codes from the schema's function codelist) or names, with water depth:
+SELECT f.objectid, fn.val_string AS function, n.val_string AS name,
+       round(({L} - ST_ZMin(f.envelope))::numeric, 2) AS water_depth_m, {L} AS flood_level_m
+FROM feature f
+JOIN property fn ON fn.feature_id = f.id AND fn.name = 'function'
+LEFT JOIN property n ON n.feature_id = f.id AND n.name = 'name'
+WHERE f.objectclass_id = 901 AND ST_ZMin(f.envelope) < {L}
+  AND (fn.val_string IN ('<code1>', '<code2>') OR n.val_string ILIKE '%<facility name>%'){X}
+ORDER BY water_depth_m DESC;
+3. Facade area under water (m², 3D area of each wall times its flooded share):
+SELECT round(sum(ST_3DArea(g.geometry) * LEAST(GREATEST(({L} - ST_ZMin(g.geometry))
+         / NULLIF(ST_ZMax(g.geometry) - ST_ZMin(g.geometry), 0), 0), 1))::numeric) AS facade_under_water_m2,
+       {L} AS flood_level_m
+FROM feature w JOIN geometry_data g ON g.feature_id = w.id
+WHERE w.objectclass_id = 709 AND ST_ZMin(g.geometry) < {L};
+4. Effect of a property-level barrier of 1.0 m:
+SELECT count(*) FILTER (WHERE ST_ZMin(f.envelope) < {L}) AS affected,
+       count(*) FILTER (WHERE ST_ZMin(f.envelope) < {L} AND ST_ZMin(f.envelope) + 1.0 >= {L}) AS protected,
+       count(*) FILTER (WHERE ST_ZMin(f.envelope) + 1.0 < {L}) AS still_flooded,
+       {L} AS flood_level_m, 1.0 AS protection_m
+FROM feature f
+WHERE f.objectclass_id = 901{X};
+5. Building at an address and the nearest dry building (match the address as the schema describes):
+WITH me AS (
+  SELECT f.objectid, f.envelope FROM feature f
+  JOIN property p ON p.feature_id = f.id AND p.name = 'address'
+  JOIN address a ON a.id = p.val_address_id
+  WHERE a.street = '<street and house number>')
+SELECT me.objectid, 'address' AS role, round(({L} - ST_ZMin(me.envelope))::numeric, 2) AS water_depth_m,
+       NULL::numeric AS distance_m, NULL::numeric AS azimuth_deg, {L} AS flood_level_m
+FROM me
+UNION ALL
+SELECT * FROM (
+  SELECT d.objectid, 'nearest dry building', NULL::numeric,
+         round(ST_Distance(d.envelope, me.envelope)::numeric),
+         round(degrees(ST_Azimuth(ST_Centroid(me.envelope), ST_Centroid(d.envelope)))::numeric), {L}
+  FROM feature d CROSS JOIN me
+  WHERE d.objectclass_id = 901 AND ST_ZMin(d.envelope) > {L}{Xd}
+  ORDER BY d.envelope <-> me.envelope LIMIT 1) dry;
+(azimuth: 0 = north, 90 = east, 180 = south, 270 = west; LIMIT 3 for the three nearest dry buildings)
+6. Flooded buildings per water level (draw as a mermaid xychart-beta line chart):
+SELECT l AS water_level_m, count(*) FILTER (WHERE ST_ZMin(f.envelope) < l) AS flooded
+FROM feature f, generate_series(300.0, 306.0, 0.5) AS l
+WHERE f.objectclass_id = 901{X}
+GROUP BY l ORDER BY l;"""
+
+
+def _flood_exclusion_sql(alias: str = "f") -> str:
+    codes = _env_list("FLOOD_EXCLUDE_FUNCTIONS")
+    if not codes:
+        return ""
+    quoted = ", ".join("'" + c.replace("'", "''") + "'" for c in codes)
+    return (f"\n  AND NOT EXISTS (SELECT 1 FROM property x WHERE x.feature_id = {alias}.id"
+            f" AND x.name = 'function' AND x.val_string IN ({quoted}))")
+
+
+def flood_scene_examples(level: str = "305.0") -> str:
+    """The SQL examples of the [FLOOD SCENE] block for an example water level."""
+    return (_FLOOD_EXAMPLES.replace("{L}", level)
+            .replace("{Xd}", _flood_exclusion_sql("d"))
+            .replace("{X}", _flood_exclusion_sql("f")))
+
+
+def flood_scene_instructions() -> str:
+    """The [FLOOD SCENE] prompt block: convention, exclusions and SQL examples."""
+    text = FLOOD_SCENE_INSTRUCTIONS
+    exclude = _env_list("FLOOD_EXCLUDE_FUNCTIONS")
+    if exclude:
+        codes = ", ".join(f"'{c}'" for c in exclude)
+        text += ("\n- Not buildings (bridges, walls, roofs without walls, ...): always exclude features "
+                 f"whose `function` is one of {codes}, as in the examples; the viewer excludes them too.")
+    return text + "\n\n" + flood_scene_examples()
+
+
+def extra_prompt_blocks() -> str:
+    """Prompt additions of optional features (flood scene, scratchpad).
+
+    Appended after the assembled system prompt by every chat entry point
+    (web UI and benchmark CLI) so both see the same prompt. Empty by default.
+    Dataset knowledge (a gauge, local codes, recipes) belongs in the
+    conversation, not here.
+    """
+    blocks = []
+    if FLOOD_SCENE_ENABLED:
+        blocks.append(flood_scene_instructions())
+    if scratchpad_enabled():
+        blocks.append(SCRATCHPAD_TOOLS_INSTRUCTIONS)
+    return "\n\n".join(blocks)
+
+
+# ── Spatial scratchpad (per-user saved results) ───────────────────────────────
+# The model saves, changes and deletes items with the MCP tools
+# save_to_scratchpad / update_scratchpad_item / scratchpad_action /
+# list_scratchpad (see production/docs/scratchpad.md), and reuses them in
+# run_query through the view my_scratchpad.
+
+def scratchpad_enabled() -> bool:
+    from citydb_mcp.tools import scratchpad
+
+    return scratchpad.enabled()
+
+
+def scratchpad_tool_specs() -> list[dict]:
+    """The scratchpad tools in OpenAI function format ([] unless the scratchpad is on)."""
+    if not scratchpad_enabled():
+        return []
+    from citydb_mcp.tools import scratchpad
+
+    return [{"type": "function",
+             "function": {"name": n, "description": spec["description"],
+                          "parameters": spec["inputSchema"]}}
+            for n, spec in scratchpad.TOOL_SCHEMAS.items()]
+
+
+SCRATCHPAD_TOOLS_INSTRUCTIONS = """[SCRATCHPAD] The user's personal saved items, shown in the 3D viewer
+- Tools: save_to_scratchpad (save a result under a name), update_scratchpad_item (change label,
+  color, opacity, class or size of a saved item in place), scratchpad_action (show, hide, delete,
+  goto), list_scratchpad (what is saved). Use them whenever the user asks to save, store, mark,
+  pin, remember, recolour, show/hide or delete something ("speichern", "merken", "markieren",
+  "umfärben", ...).
+- Deleting SEVERAL items: first ask the user to confirm the list; call scratchpad_action with
+  confirm=true only after a yes. Deleting one item needs no confirmation.
+- Names: letters, digits and underscore, no spaces (e.g. affected_2013). Pick a short name
+  yourself if the user gives none, and tell it.
+- save_to_scratchpad with `sql`: a SELECT returning objectid rows (a set of features, coloured in
+  the viewer) OR a geom column (a geometry in the data's CRS; several rows become one item).
+  With `geojson`: a GeoJSON geometry/Feature/FeatureCollection in lon/lat (e.g. points the user
+  pasted); it is converted to the data's CRS. Optional: label, color ('#rrggbb'), clamp,
+  class (how to draw a geometry; derived otherwise: 2Dmarker/3Dmarker pin, Point3D sphere,
+  LineString3D pipe, Polygon2D/3D, Solid3D, ...), size_m (sphere/pipe radius).
+  The tool runs the SQL itself and reports the saved count; report name and count.
+- 2D/3D: the class and the stored geometry always match ("POLYGON Z" = with heights). To give a
+  saved item a height ("add height", "make it 3D", "20 m hoch") call update_scratchpad_item with
+  height_m (metres above ground: 2Dmarker -> 3Dmarker, Polygon2D -> Polygon3D); to turn an area
+  into a solid ("Körper", "solid", "extrudieren") use extrude_m (Polygon2D -> Solid3D).
+  base_z = absolute height instead of the ground. Changing only the class does not add a height.
+- Bounding boxes: 3D box `ST_3DExtent(f.envelope) AS geom` (saved as a closed box, Solid3D);
+  2D `ST_Extent(f.envelope) AS geom`. ST_MakeEnvelope has no heights.
+- REUSE saved items in run_query through the view my_scratchpad(name, label, kind, class, color, geom,
+  objectids text[], is_visible, data, created_at). There is no other scratchpad table. Select
+  cardinality(objectids) and GeometryType(geom) rather than the raw columns when listing.
+
+Scratchpad examples:
+save_to_scratchpad {"name": "tall_buildings", "color": "#dc2626", "sql":
+  "SELECT f.objectid FROM feature f WHERE f.objectclass_id = 901 AND ST_ZMax(f.envelope) - ST_ZMin(f.envelope) > 30"}
+save_to_scratchpad {"name": "meeting_point", "label": "Meeting point",
+  "geojson": {"type": "Point", "coordinates": [13.4735, 48.5740]}}
+save_to_scratchpad {"name": "cluster_hull", "sql":
+  "SELECT CG_3DConvexHull(ST_Collect(f.envelope)) AS geom FROM feature f WHERE f.objectid IN ('<id1>', '<id2>')"}
+update_scratchpad_item {"name": "meeting_point", "height_m": 20}
+save_to_scratchpad {"name": "set_box", "sql": "SELECT ST_3DExtent(f.envelope) AS geom FROM feature f
+  JOIN my_scratchpad p ON f.objectid = ANY(p.objectids) WHERE p.name = 'tall_buildings'"}
+run_query: buildings within 100 m of a saved point
+  SELECT count(*) FROM feature f, my_scratchpad p WHERE p.name = 'meeting_point'
+    AND f.objectclass_id = 901 AND ST_DWithin(f.envelope, p.geom, 100)"""
+
+
+def note_scratch_result(raw_result: str, focus: list) -> bool:
+    """Read the "scratchpad" entry of a scratchpad tool result. Collects names the
+    viewer should fly to (new items, goto) and returns True if anything changed."""
+    try:
+        report = json.loads(raw_result).get("scratchpad")
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return False
+    if not report:
+        return False
+    changed = False
+    for r in report if isinstance(report, list) else [report]:
+        if not isinstance(r, dict) or not r.get("ok"):
+            continue
+        changed = True
+        if r.get("kind") in ("geometry", "featureset"):  # a new item: show it
+            focus.append(r["name"])
+        elif r.get("action") == "goto":
+            focus.extend(r.get("found") or [])
+    return changed
+
+
+def build_scratchpad_payload(user_id: str, focus=()) -> dict | None:
+    """The user's items for the viewer (scratchpad-bridge.js); None on error."""
+    if not scratchpad_enabled():
+        return None
+    from citydb_mcp.tools import scratchpad
+
+    try:
+        items = scratchpad.list_items(_get_resolver_db(), user_id)
+    except Exception as exc:
+        print(f"[scratchpad] could not list items: {exc}", flush=True)
+        return None
+    return {"items": items, "focus": [n for n in dict.fromkeys(focus or [])]}
+
+
+# Questions after which the model may still call a scratchpad tool once it has
+# a query result (the cloud backend otherwise forces a text answer then).
+_SCRATCH_INTENT_RE = re.compile(
+    r"speicher|merk|markier|notier|lösch|losch|ausblend|einblend|blende|gespeichert|"
+    r"\bsave|\bstore|remember|\bmark|\bpin\b|delete|\bhide|\bshow\b.*\b(saved|my)\b|scratchpad",
+    re.IGNORECASE)
+
+
+def wants_scratchpad(question: str) -> bool:
+    return bool(_SCRATCH_INTENT_RE.search(question or ""))
+
+
+def scratch_tool_result(raw: str) -> dict:
+    """tool_result event data for a scratchpad tool: the report as preview rows
+    (shown in Agent activity), no all_rows (nothing to highlight), the error
+    if the tool reported one."""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        data = {"error": str(raw)[:300]}
+    if not isinstance(data, dict):
+        data = {"result": data}
+    if "items" in data:
+        rows = data["items"] if isinstance(data["items"], list) else []
+    else:
+        report = data.get("scratchpad", data)
+        rows = report if isinstance(report, list) else [report]
+    rows = [r for r in rows if isinstance(r, dict)]
+    errors = [str(r["error"]) for r in rows if r.get("ok") is False and r.get("error")]
+    if data.get("error"):
+        errors.append(str(data["error"]))
+    return {"row_count": len(rows), "execution_time_ms": 0, "preview_rows": rows[:10],
+            "all_rows": [], "error": "; ".join(errors) or None,
+            "needs_confirmation": any(r.get("needs_confirmation") for r in rows)}
+
+
+def scratch_tool_hint(result_data: dict) -> str:
+    """What the model is told after a scratchpad tool call."""
+    if result_data.get("needs_confirmation"):
+        return ("Do NOT call the tool again now. Ask the user to confirm deleting these items and "
+                "stop; only after the user says yes, call it again with confirm=true.")
+    if result_data.get("error"):
+        return f"The tool reported an error: {result_data['error']}. Fix the arguments and call it again."
+    return "Tell the user briefly what was done (name and count)."
+
+
+
+# ── Full result attached under long answers ───────────────────────────────────
+# Above FULL_RESULT_MIN_ROWS rows the app attaches the complete result of the
+# last query as collapsible CSV and JSON, ready to copy (in both list modes,
+# see _LIST_RULES). It stays in the chat, but strip_full_result() removes it
+# before the history goes back to the model.
+
+FULL_RESULT_MIN_ROWS = 10
+_FULL_RESULT_RE = re.compile(r"\s*<details data-full-result>.*?</details>", re.DOTALL)
+
+
+def _long_result_rows(raw_result: str) -> list[dict]:
+    """The rows of a run_query result with more than FULL_RESULT_MIN_ROWS rows; [] otherwise."""
+    try:
+        data = json.loads(raw_result)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    rows = data.get("results") if isinstance(data, dict) and data.get("success") else None
+    if not rows or len(rows) <= FULL_RESULT_MIN_ROWS or not isinstance(rows[0], dict):
+        return []
+    return rows
+
+
+def _rows_to_csv(rows: list[dict]) -> str:
+    import csv
+    import io
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()), extrasaction="ignore",
+                            lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue().rstrip()
+
+
+def full_result_csv(raw_result: str) -> str:
+    """Plain-text full list for the terminal (CLI short-list mode); "" if not long."""
+    rows = _long_result_rows(raw_result)
+    if not rows:
+        return ""
+    return f"\n\nFull list ({len(rows)} rows, CSV):\n{_rows_to_csv(rows)}"
+
+
+def format_full_result(raw_result: str) -> str:
+    """Collapsible CSV + JSON of a run_query result with more than
+    FULL_RESULT_MIN_ROWS rows; "" otherwise."""
+    rows = _long_result_rows(raw_result)
+    if not rows:
+        return ""
+    capped = " (first rows only: the query hit the row limit)" if len(rows) >= 500 else ""
+    js = json.dumps(rows, ensure_ascii=False, default=str, indent=1)
+    out = []
+    for fmt, body in (("CSV", _rows_to_csv(rows)), ("JSON", js)):
+        out.append(f"<details data-full-result>\n<summary>📋 Full list as {fmt} ({len(rows)} rows){capped}"
+                   f"</summary>\n\n```{fmt.lower()}\n{body}\n```\n\n</details>")
+    return "\n\n" + "\n\n".join(out)
+
+
+def long_result_note(count: int, full_lists: bool = True) -> str:
+    """Reminder placed right in a long tool result (RULE 1, short lists only):
+    local models follow the freshest text more than the system prompt."""
+    if full_lists or (count or 0) <= FULL_RESULT_MIN_ROWS:
+        return ""
+    return (f"\nLONG RESULT ({count} rows): in your answer show ONLY the first 5 rows in the table, "
+            f"then one sentence that these are 5 of {count} and the full list is attached below "
+            "the answer (CSV/JSON). Do not write the other rows and do not query again for them.")
+
+
+def strip_full_result(text: str) -> str:
+    return _FULL_RESULT_RE.sub("", text or "")

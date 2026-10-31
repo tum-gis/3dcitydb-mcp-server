@@ -101,6 +101,25 @@
     function applyCombinedStyle() {
         var tilesets = getTilesets();
         if (!tilesets.length) return;
+        // A flood scene (flood-bridge.js) colours per feature and draws the
+        // highlight and selection on top itself; a style would override it.
+        var flood = window._citydbFlood;
+        if (flood && flood.active()) {
+            tilesets.forEach(function (ts) { ts.style = undefined; });
+            flood.recolor();
+            return;
+        }
+        // Saved building sets (scratchpad-bridge.js) colour per feature too.
+        var scratch = window._citydbScratchpad;
+        if (scratch && scratch.active()) {
+            // recolor() removes the style itself: it must see that one was set,
+            // since Cesium resets the colours a few frames after the removal.
+            scratch.recolor();
+            return;
+        }
+        // Sets paused (a highlight is shown) or gone: remove their per-feature
+        // colours before the style below takes over.
+        if (scratch && scratch.release) scratch.release();
         var highlightIds = last ? collectIds(last) : [];
         if (!highlightIds.length && !selectionIds.length) {
             tilesets.forEach(function (ts) {
@@ -323,6 +342,9 @@
         buildMatchExpression: buildMatchExpression,
         ID_PROPERTIES: ID_PROPERTIES,
         setSelection: setSelection,
+        applyCombinedStyle: applyCombinedStyle,
+        getHighlightIds: function () { return last ? collectIds(last) : []; },
+        getSelectionIds: function () { return selectionIds.slice(); },
     };
 
     // Embedded in the chat page, the client's "Introduction" splash window would

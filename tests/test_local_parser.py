@@ -150,6 +150,16 @@ def test_final_answer_unaffected() -> None:
     assert "13 buildings" in result.return_values["output"]
 
 
+def test_final_answer_strips_empty_action_tail() -> None:
+    """A model appended empty `Action:` / `Action Input:` lines after its Final
+    Answer; they must not reach the chat reply."""
+    p, _ = _parser(tools_called=1)
+    text = "Final Answer: Total is **1,423,369 m²**.\n\nNote: footprint.\nAction:\nAction Input:"
+    result = p.parse(text)
+    assert isinstance(result, AgentFinish)
+    assert result.return_values["output"] == "Total is **1,423,369 m²**.\n\nNote: footprint."
+
+
 def test_dict_tool_input_serialised() -> None:
     """If a subclass ever passes a dict tool_input, coercion stringifies it."""
     p, _ = _parser()

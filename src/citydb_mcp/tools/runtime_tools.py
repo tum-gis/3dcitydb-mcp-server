@@ -42,7 +42,45 @@ _sessions_lock = threading.Lock()
 # run_query
 # ============================================================
 
-def run_query(db: DatabaseConnection, sql: str, row_limit: int = 500) -> dict:
+# Geometry values come back as EWKB hex: thousands of characters the model
+# cannot read. They are replaced by a short description; use ST_AsText /
+# ST_AsGeoJSON when the coordinates themselves are needed.
+_EWKB_RE = re.compile(r"^0[01][0-9A-Fa-f]{16,}$")
+_WKB_TYPES = {1: "POINT", 2: "LINESTRING", 3: "POLYGON", 4: "MULTIPOINT", 5: "MULTILINESTRING",
+              6: "MULTIPOLYGON", 7: "GEOMETRYCOLLECTION", 15: "POLYHEDRALSURFACE", 16: "TIN",
+              17: "TRIANGLE"}
+
+
+def _describe_ewkb(value: str) -> str | None:
+    if len(value) < 42 or not _EWKB_RE.match(value):
+        return None
+    try:
+        raw = bytes.fromhex(value[2:10])
+        code = int.from_bytes(raw, "little" if value[:2] == "01" else "big")
+    except ValueError:
+        return None
+    has_z = bool(code & 0x80000000) or (code & 0x0FFFFFFF) // 1000 in (1, 3)
+    base = (code & 0x0FFFFFFF) % 1000
+    name = _WKB_TYPES.get(base)
+    if name is None:
+        return None
+    size = len(value) // 2
+    size_txt = f"{size / 1024:.1f} kB" if size >= 1024 else f"{size} B"
+    return f"<geometry {name}{' Z' if has_z else ''}, {size_txt}>"
+
+
+def _shorten_geometries(rows: list[dict]) -> list[dict]:
+    for row in rows:
+        for key, value in row.items():
+            if isinstance(value, str):
+                short = _describe_ewkb(value)
+                if short:
+                    row[key] = short
+    return rows
+
+
+def run_query(db: DatabaseConnection, sql: str, row_limit: int = 500,
+              settings: dict | None = None, guard=None) -> dict:
     """
     Executes read-only SQL against 3DCityDB.
     Returns results as JSON with column names, rows, execution time.
@@ -68,13 +106,24 @@ def run_query(db: DatabaseConnection, sql: str, row_limit: int = 500) -> dict:
             "execution_time_ms": 0,
         }
 
+    # Optional extra check (the scratchpad guard when its query role is missing).
+    blocked = guard(sql) if guard else None
+    if blocked:
+        return {
+            "success": False,
+            "error": blocked,
+            "results": [],
+            "row_count": 0,
+            "execution_time_ms": 0,
+        }
+
     # Enforce row limit if not already present
     if "LIMIT" not in sql_stripped:
         sql = f"{sql.rstrip(';')} LIMIT {row_limit};"
 
     start = time.time()
     try:
-        results = db.execute(sql)
+        results = _shorten_geometries(db.execute(sql, settings=settings) if settings else db.execute(sql))
         elapsed_ms = int((time.time() - start) * 1000)
 
         return {

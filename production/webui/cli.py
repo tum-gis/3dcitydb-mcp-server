@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from typing import TextIO
@@ -32,7 +33,13 @@ from webui.chat_runtime import (  # noqa: E402
     summarize_story_ollama,
     summarize_story_openai,
 )
-from webui.llm_utils import default_model, detect_default_provider  # noqa: E402
+from webui.llm_utils import (  # noqa: E402
+    default_model,
+    detect_default_provider,
+    full_result_csv,
+    scratchpad_enabled,
+    scratchpad_tool_specs,
+)
 from webui.mcp_client import (  # noqa: E402
     assemble_system_prompt_sync,
     run_tool_sync,
@@ -227,6 +234,54 @@ class ChatConsole:
     last_trimmed_turns: int | None = None
     last_elapsed_seconds: float = 0.0
     last_story: str = ""
+    # Scratchpad (CITYDB_SCRATCHPAD=true): every console has its own user, so
+    # benchmark conversations do not see each other's items. A given id (e.g.
+    # the web UI's, from the browser's localStorage) shares that scratchpad;
+    # a generated one is removed again by close().
+    scratchpad_user: str | None = None
+    keep_scratchpad: bool = False
+    turn_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.scratchpad_user:
+            self.keep_scratchpad = True
+        else:
+            self.scratchpad_user = str(uuid.uuid4())
+        self.session_id = f"cli-{uuid.uuid4().hex[:12]}"
+        self._last_query_raw = ""
+
+    def tool_ctx(self) -> dict:
+        return {"user_id": self.scratchpad_user, "session_id": self.session_id,
+                "turn_id": str(self.turn_count)}
+
+    def _run_query(self, sql: str) -> str:
+        raw = run_tool_sync("run_query", {"sql": sql}, stderr=self.stderr, ctx=self.tool_ctx())
+        self._last_query_raw = raw
+        return raw
+
+    def _extra_tools(self) -> dict:
+        """The scratchpad tools for the backends ({} unless the scratchpad is on)."""
+        def tool(name: str):
+            def run(args: dict) -> str:
+                self._last_query_raw = ""  # the answer is about the tool call, not an earlier list
+                return run_tool_sync(name, args, stderr=self.stderr, ctx=self.tool_ctx())
+            return run
+
+        return {spec["function"]["name"]: {"spec": spec, "run": tool(spec["function"]["name"])}
+                for spec in scratchpad_tool_specs()}
+
+    def close(self) -> None:
+        """Remove the items of a generated scratchpad user (not of a given one)."""
+        if self.keep_scratchpad or not scratchpad_enabled():
+            return
+        try:
+            from citydb_mcp.tools import scratchpad
+
+            removed = scratchpad.delete_user(self.scratchpad_user)
+            if removed:
+                print(f"Scratchpad: removed {removed} item(s) of this run.", file=self.stderr)
+        except Exception as exc:
+            print(f"Scratchpad cleanup failed: {exc}", file=self.stderr)
 
     def reset(self) -> None:
         self.history.clear()
@@ -284,22 +339,23 @@ class ChatConsole:
         events: list[tuple[str, object]] = []
         answer_parts: list[str] = []
         pending_sql = ""
+        self._last_query_raw = ""
+        self.turn_count += 1
         started = time.monotonic()
         with redirect_stdout(self.stderr):
             try:
                 for event, data in stream_chat_turn(
                     self.settings,
                     prepared.messages,
-                    tool_executor=lambda sql: run_tool_sync(
-                        "run_query",
-                        {"sql": sql},
-                        stderr=self.stderr,
-                    ),
+                    tool_executor=self._run_query,
+                    extra_tools=self._extra_tools(),
                 ):
                     events.append((event, data))
                     if event == "tool_call":
-                        pending_sql = data.get("args", {}).get("sql", "")
-                    elif event == "tool_result" and not data.get("error"):
+                        # Only run_query results are reusable as a tool cache.
+                        is_query = data.get("tool", "run_query") == "run_query"
+                        pending_sql = data.get("args", {}).get("sql", "") if is_query else ""
+                    elif event == "tool_result" and not data.get("error") and pending_sql:
                         cached = build_tool_cache(
                             pending_sql,
                             data.get("all_rows") or data.get("preview_rows") or [],
@@ -354,6 +410,10 @@ class ChatConsole:
 
         answer = _SELF_STORY.split("".join(answer_parts), maxsplit=1)[0].rstrip()
         self.history.append([question, answer])
+        if not self.settings.full_lists:
+            # short lists: the model shows 5 rows and points to the full list,
+            # which is printed here (kept out of the history, like the web UI's)
+            answer += full_result_csv(self._last_query_raw)
         if self.show_reasoning:
             activity = _format_activity(events)
             if activity:
@@ -365,6 +425,13 @@ class ChatConsole:
                     file=self.stderr,
                 )
         return answer
+
+
+def _scratchpad_user(value: str) -> str:
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not a uuid: {value!r}") from exc
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -400,6 +467,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Ollama context limit; defaults to the WebGUI's 131072",
     )
     chat.add_argument(
+        "--full-lists",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="list every row in result tables; --no-full-lists shows 5 example rows above "
+             "10 rows (default: enabled)",
+    )
+    chat.add_argument(
         "--keep-story",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -423,6 +497,15 @@ def _build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--question",
         help="answer one question and exit; otherwise read stdin or run interactively",
+    )
+    chat.add_argument(
+        "--scratchpad-user",
+        type=_scratchpad_user,
+        help=(
+            "with CITYDB_SCRATCHPAD=true: use this user's scratchpad (a uuid, e.g. the web UI's "
+            "citydb_user_id from the browser) and keep its items; by default each run gets its "
+            "own scratchpad, removed at exit"
+        ),
     )
 
     benchmark = subparsers.add_parser(
@@ -469,6 +552,13 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         choices=_CTX_CHOICES,
         help="Ollama context limit; defaults to the WebGUI's 131072",
+    )
+    benchmark.add_argument(
+        "--full-lists",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="list every row in result tables; --no-full-lists shows 5 example rows above "
+             "10 rows (default: enabled)",
     )
     benchmark.add_argument(
         "--keep-story",
@@ -539,6 +629,7 @@ def _resolve_settings(args: argparse.Namespace, parser: argparse.ArgumentParser)
             if provider == "ollama"
             else None
         ),
+        full_lists=getattr(args, "full_lists", True),
     )
 
 
@@ -590,8 +681,31 @@ def run_chat(
         show_reasoning=args.show_reasoning,
         stderr=stderr,
         stdout=stdout,
+        scratchpad_user=getattr(args, "scratchpad_user", None),
     )
+    scratchpad_user = getattr(console, "scratchpad_user", None)
+    if scratchpad_user and scratchpad_enabled():
+        mode = "kept" if getattr(console, "keep_scratchpad", False) else "removed at exit"
+        print(f"Scratchpad user: {scratchpad_user} (items {mode})", file=stderr)
+    try:
+        return _converse(console, args, interactive, piped_lines, stdin=stdin, stdout=stdout,
+                         stderr=stderr)
+    finally:
+        close = getattr(console, "close", None)
+        if close:
+            close()
 
+
+def _converse(
+    console: ChatConsole,
+    args: argparse.Namespace,
+    interactive: bool,
+    piped_lines: list[str] | None,
+    *,
+    stdin: TextIO,
+    stdout: TextIO,
+    stderr: TextIO,
+) -> int:
     def process(question: str) -> None:
         answer = console.answer(question)
         if interactive:

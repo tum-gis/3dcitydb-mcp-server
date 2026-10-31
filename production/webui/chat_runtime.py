@@ -7,11 +7,14 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Generator
 
+from webui.llm_utils import strip_full_result
 from webui.llm_utils import (
     CHAT_INSTRUCTIONS,
+    chat_instructions,
     _estimate_tokens,
     _get_provider_ctx_limit,
     _litellm_kwargs,
+    extra_prompt_blocks,
     safe_completion,
     should_use_compact,
 )
@@ -38,6 +41,9 @@ class ChatTurnSettings:
     enable_thinking: bool | str = False
     prompt_mode: str = "auto"
     num_ctx: int | None = None
+    # True: result tables list every row; False: 5 example rows above 10 rows
+    # (the full result is attached as CSV/JSON either way).
+    full_lists: bool = True
 
 
 @dataclass(frozen=True)
@@ -166,8 +172,12 @@ def build_messages(
     reasoning_replay: bool = False,
     add_story: bool = False,
     leading_system_notes: list[str] | None = None,
+    full_lists: bool = True,
 ) -> list[dict]:
     """Build provider-neutral messages for a new user turn.
+
+    ``full_lists`` picks the table rules of CHAT_INSTRUCTIONS (see
+    ``chat_instructions``).
 
     ``history`` uses the WebGUI's ``[user, assistant]`` turn representation.
     Optional notes are inserted immediately after the main system prompt, in
@@ -175,9 +185,11 @@ def build_messages(
     """
     reasoning_history = reasoning_history or []
     story_history = story_history or []
-    messages: list[dict] = [
-        {"role": "system", "content": CHAT_INSTRUCTIONS + "\n\n" + system_prompt}
-    ]
+    system_content = chat_instructions(full_lists) + "\n\n" + system_prompt
+    extra = extra_prompt_blocks()
+    if extra:
+        system_content += "\n\n" + extra
+    messages: list[dict] = [{"role": "system", "content": system_content}]
 
     for index, (user_msg, assistant_msg) in enumerate(history):
         if user_msg:
@@ -189,7 +201,7 @@ def build_messages(
         ):
             if _COUNT_PATTERN.match(assistant_msg.strip()) and len(assistant_msg) < 200:
                 continue
-            content = assistant_msg
+            content = strip_full_result(assistant_msg)  # the attached CSV/JSON is for the user only
             if (
                 reasoning_replay
                 and index < len(reasoning_history)
@@ -246,6 +258,7 @@ def prepare_chat_turn(
         reasoning_replay=reasoning_replay,
         add_story=add_story,
         leading_system_notes=leading_system_notes,
+        full_lists=settings.full_lists,
     )
     context_limit = settings.num_ctx or _get_provider_ctx_limit(
         settings.provider, settings.model
@@ -265,8 +278,14 @@ def stream_chat_turn(
     settings: ChatTurnSettings,
     messages: list[dict],
     tool_executor: Callable[[str], str],
+    turn=None,
+    extra_tools: dict | None = None,
 ) -> Generator[tuple, None, None]:
-    """Run a prepared turn through the production provider/backend dispatcher."""
+    """Run a prepared turn through the production provider/backend dispatcher.
+
+    ``turn`` (a ``webui.session.TurnControl``) lets the caller stop this turn
+    only; without one the backend creates its own, which nobody stops.
+    ``extra_tools`` ({name: {"spec", "run"}}) are offered next to run_query."""
     from webui.backends import stream
 
     enable_thinking = settings.enable_thinking
@@ -280,6 +299,9 @@ def stream_chat_turn(
         tool_executor=tool_executor,
         enable_thinking=enable_thinking,
         num_ctx=settings.num_ctx,
+        turn=turn,
+        extra_tools=extra_tools,
+        full_lists=settings.full_lists,
     )
 
 

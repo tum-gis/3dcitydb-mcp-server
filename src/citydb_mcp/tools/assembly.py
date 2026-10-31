@@ -774,6 +774,20 @@ def _render_address_vocabulary(vocab, compact: bool = False) -> str:
             lines.append(f"Names (ordered by frequency): {parts}.")
         lines.append("Use `ILIKE '%street%'` for matching (handles umlauts and partial names).")
 
+    if getattr(vocab, "numbers_in_street", False):
+        example = vocab.street_example or "Hauptstraße 5"
+        lines.append(
+            f"⚠️ **House numbers are part of `street`** in this dataset (e.g. `'{example}'`); "
+            "`house_number` is empty. Match street and number together as one string, e.g. "
+            f"`a.street = '{example}'` — a pattern like `ILIKE '%{example}%'` would also match "
+            f"`'{example}a'`."
+        )
+    else:
+        lines.append(
+            "If `house_number` finds nothing for an address, the number may be part of `street` "
+            "(e.g. `'Hauptstraße 5'`): then match `street` against the street name and number together."
+        )
+
     if vocab.city_count > 1:
         lines.append(
             f"⚠️ **This dataset spans {vocab.city_count} different cities.** The same street "
