@@ -13,7 +13,7 @@ a purely **client-side, visual** operation on the Cesium tileset. The only datab
 new boolean column on the existing scratchpad table used to *persist* the hidden set (section 3).
 
 > **Availability:** MCP-controlled hiding/unhiding is **only available when the scratchpad is
-> enabled** (`SCRATCHPAD_ENABLED=true`). The hidden set is stored as scratchpad items (section 3),
+> enabled** (`CITYDB_SCRATCHPAD=true`). The hidden set is stored as scratchpad items (section 3),
 > so without the scratchpad there is nowhere to persist it and the tools are not offered.
 
 ---
