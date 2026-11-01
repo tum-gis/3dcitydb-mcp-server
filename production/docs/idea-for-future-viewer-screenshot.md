@@ -70,26 +70,37 @@ keyed by user id, no broker):
 sequenceDiagram
     participant L as LLM agent
     participant T as MCP tool (same process)
-    participant P as page JS (this tab)
-    participant B as viewer bridge (iframe)
-    L->>T: fly_to([building A])
-    T->>T: enqueue {type:fly, centroid}, block on Event (30 s timeout)
-    P-->>B: postMessage (picked up via GET /viz/commands)
-    B->>B: camera.flyTo …; wait for camera.moveEnd
-    B-->>P: postMessage {done, cmd_id}
-    P->>T: POST /viz/ack {cmd_id, ok}
-    T-->>L: "flew to building A"
-    L->>T: capture_viewer_screenshot()
-    T->>T: enqueue {type:screenshot}, block
-    P-->>B: postMessage
-    B->>B: viewer.render(); canvas → 1024 px JPEG
-    B-->>P: data URL (scratchpad-bridge-style round-trip)
-    P->>T: POST /viz/ack {cmd_id, image: <data URL>}
-    T->>T: save ./data/screenshots/<user>/<turn>-1.jpg
-    T-->>L: "screenshot 1 saved: /screenshots/<user>/<turn>-1.jpg"
-    Note over L,B: …repeats for B and C…
-    L->>L: final answer text
-    Note over T,P: turn end → normal {type:highlight} fly-to (unchanged)
+    participant P as Page JS (this tab)
+    participant B as Viewer bridge (iframe)
+
+    L->>T: fly_to building A
+    T->>T: Enqueue fly command with centroid
+    Note over T: Block on Event, 30 second timeout
+
+    P-->>B: postMessage via GET viz commands
+    B->>B: camera.flyTo
+    B->>B: Wait for camera.moveEnd
+    B-->>P: postMessage done with cmd_id
+    P->>T: POST viz ack with cmd_id and ok
+    T-->>L: Flew to building A
+
+    L->>T: capture_viewer_screenshot
+    T->>T: Enqueue screenshot command
+    Note over T: Block until acknowledgement
+
+    P-->>B: postMessage screenshot command
+    B->>B: viewer.render
+    B->>B: Canvas to 1024px JPEG
+    B-->>P: Data URL via bridge round-trip
+    P->>T: POST viz ack with cmd_id and image data
+
+    T->>T: Save screenshot to data/screenshots
+    T-->>L: Screenshot saved
+
+    Note over L,B: Repeat for buildings B and C
+
+    L->>L: Generate final answer text
+    Note over T,P: Turn end: normal highlight fly-to unchanged
 ```
 
 Properties:
