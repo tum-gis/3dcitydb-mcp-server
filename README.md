@@ -876,6 +876,7 @@ documents:
 - [`idea-for-future-write-access.md`](production/docs/idea-for-future-write-access.md) — opt-in write access (DML / DDL) to the database for experimentation, off by default.
 - [`idea-for-future-memory-rag.md`](production/docs/idea-for-future-memory-rag.md) — persistent chat memory (question / answer / distilled story) with RAG retrieval of similar past turns via pgvector, off by default.
 - [`idea-for-future-speech-interaction.md`](production/docs/idea-for-future-speech-interaction.md) — let users talk to the ChatBot: voice input/output and a wake word ("Hello CityBot") via an optional local `citydb-voice` sidecar (offline STT/TTS, English + German, no API keys), off by default.
+- [`idea-for-future-viewer-hide-objects.md`](production/docs/idea-for-future-viewer-hide-objects.md) — MCP tools to hide and unhide 3D objects by their objectid in the Webmap Client, so the agent can visually declutter the scene (e.g. hide a building's roof while inspecting its walls).
 
 These new features are already implemented (to full extent or partially):
 - [`idea-for-future-spatial-scratchpad.md`](production/docs/idea-for-future-spatial-scratchpad.md) — a per-user "spatial scratchpad" table + MCP tools to create, store, style, navigate to, visualize (in the 3D viewer) and delete temporary/derived spatial objects (markers, 2D overlays, 3D solids/pipes), isolated via row-level security, off by default. *Implemented in a slightly modified form, see [`scratchpad.md`](production/docs/scratchpad.md).*
