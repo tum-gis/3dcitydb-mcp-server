@@ -199,7 +199,7 @@ blind to this because nothing is failing.
 identical action is parsed, `_RobustReActParser.parse` (via
 `_check_repetition`) raises an `OutputParserException` that aborts the agent
 loop with a clean `Agent error: The model kept re-running the exact same query
-without making progress…` instead of burning the whole `max_iterations=10`
+without making progress…` instead of burning the whole `max_iterations`
 budget (and, in the earlier unbounded form, an effectively infinite loop).
 
 **Ordering note:** the executor calls `parser.parse()` *before* each tool runs,
