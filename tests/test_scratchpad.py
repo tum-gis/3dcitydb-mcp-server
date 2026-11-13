@@ -108,7 +108,7 @@ def test_save_geometry_keeps_it_out_of_the_model():
 
 
 @pytest.mark.parametrize("name,sql,error", [
-    ("bad name", "SELECT 1 AS objectid", "invalid name"),
+    ("!!!", "SELECT 1 AS objectid", "invalid name"),
     ("ok", "DELETE FROM feature", "only SELECT"),
     ("ok", "SELECT 1 AS objectid; SELECT 2", "single statement"),
     ("ok", "SELECT * FROM citydb.scratchpad", "my_scratchpad"),
@@ -255,6 +255,36 @@ def test_classify_checks_a_requested_class():
     assert set(sp.CLASSES) - set(sp.GEOMETRY_CLASSES) == {"FeatureSet"} and len(sp.GEOMETRY_CLASSES) == 15
 
 
+@pytest.mark.parametrize("gtype,ndims,requested,expected", [
+    ("MULTIPOLYGON", 2, "Polygon2D", "MultiPolygon2D"),  # e.g. CG_OptimalAlphaShape
+    ("MULTIPOLYGON", 3, "Polygon3D", "MultiPolygon3D"),
+    ("MULTILINESTRING", 3, "LineString3D", "MultiLineString3D"),  # e.g. ST_Collect of rings
+    ("MULTILINESTRING", 2, "LineString2D", "MultiLineString2D"),
+    ("POLYGON", 2, "Polygon2D", "Polygon2D"),
+])
+def test_classify_promotes_a_single_class_to_its_multi_variant(gtype, ndims, requested, expected):
+    assert sp.classify(gtype, ndims, requested=requested) == expected
+
+
+@pytest.mark.parametrize("gtype", ["POLYHEDRALSURFACE", "TIN", "GEOMETRYCOLLECTION"])
+def test_flat_class_on_a_3d_surface_explains_the_2d_way(gtype):
+    with pytest.raises(ValueError) as err:
+        sp.classify(gtype, 3, requested="Polygon2D")
+    text = str(err.value)
+    assert f"class Polygon2D is 2D, but the SELECT returned a 3D {gtype}" in text
+    assert "CG_OptimalAlphaShape(ST_Force2D(" in text and "ST_ConcaveHull" in text
+    assert "ST_Buffer(ST_Force2D(" in text and "save again" in text
+    # other mismatches keep the short message
+    with pytest.raises(ValueError, match=r"^class Solid3D does not fit a POINT geometry$"):
+        sp.classify("POINT", 3, requested="Solid3D")
+
+
+@pytest.mark.parametrize("value", ["abc", "", True, -0.1, 2000, "150%", None])
+def test_alpha_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="alpha"):
+        sp._check_alpha(value)
+
+
 def test_featureset_rejects_a_geometry_class():
     qdb = FakeDb({"LIMIT 1": [{"objectid": "B1"}], "array_agg(DISTINCT": [{"n": 1, "ids": ["B1"]}]})
     out = sp.save_item(UID, "s", "SELECT 'B1' AS objectid", item_class="Solid3D", qdb=qdb, wdb=FakeDb())
@@ -324,6 +354,163 @@ def test_scratch_tool_result_and_intent():
     assert listed["row_count"] == 2
     assert llm_utils.wants_scratchpad("Speichere die Gebäude als x") and llm_utils.wants_scratchpad("hide x")
     assert not llm_utils.wants_scratchpad("Wie viele Gebäude gibt es?")
+
+
+@pytest.mark.parametrize("question", [
+    "Most buildings have energy classes. Create one group per class and put all corresponding buildings in them.",
+    "Create a single 3D alpha-wrapping around the residential buildings of Röblingweg and show it in red.",
+    'Extract all points from the lod2Solid of building B1 and show the pointset as "cornerpoints" in green.',
+    "Put a marker on top of the 5 tallest buildings with the height as labels.",
+    "Add a 2m buffer (in 2D) around that alpha-wrapping.",
+    "Create closed rings (3D lines) delineating the boundaries for each floor.",
+    "Erstelle pro Klasse eine Gruppe und ordne alle dazugehörigen Gebäude diesen Gruppen zu.",
+    "Setze auf die fünf höchsten Gebäude jeweils oben drauf einen Marker beschriftet mit der Höhe.",
+    "Füge einen 2m breiten Puffer (in 2D) um diese Umhüllung hinzu.",
+    "Stelle sie in gelb mit 30% Transparenz dar.",
+])
+def test_create_and_draw_requests_count_as_scratchpad_intent(question):
+    from webui import llm_utils
+
+    assert llm_utils.wants_scratchpad(question)
+    assert "save_to_scratchpad" in llm_utils.scratch_save_reminder(question)
+
+
+@pytest.mark.parametrize("question", [
+    "How many buildings are there?", "Show me all residential buildings in Röblingweg",
+    "List the 5 tallest buildings", "Welche Gebäude haben ein Flachdach?", "Wie hoch ist das Gebäude?",
+    "What is the total roof area per street?",
+])
+def test_plain_questions_are_no_scratchpad_intent(question):
+    from webui import llm_utils
+
+    assert not llm_utils.wants_scratchpad(question) and llm_utils.scratch_save_reminder(question) == ""
+
+
+def test_prompt_block_teaches_compute_in_sql_and_the_recipes():
+    from webui import llm_utils
+
+    block = llm_utils.SCRATCHPAD_TOOLS_INSTRUCTIONS
+    assert "PostGIS computes, the scratchpad draws" in block
+    assert "alpha = 1 - X/100" in block and "30 % -> 0.7" in block
+    assert "N save_to_scratchpad calls" in block
+    assert "A `label` column sets the" in block and block.count("' m' AS label") == 2
+    for recipe in ("CG_3DConvexHull", "CG_OptimalAlphaShape", "ST_DumpPoints", "ST_ZMax(b.envelope)",
+                   "ST_3DShortestLine", "ST_Buffer(ST_Force2D(p.geom)", "generate_series", "ST_3DExtent"):
+        assert recipe in block, recipe
+    assert len(block) < 6000  # weak models do worse with long prompts
+
+
+def test_sfcgal_functions_that_fail_at_run_time_are_not_advertised():
+    from citydb_mcp.tools import dynamic_tools
+
+    class _Db:
+        def __init__(self, works):
+            self.works = works
+
+        def execute_single(self, query, params=None):
+            if not self.works:
+                raise RuntimeError("compiled against SFCGAL 2.0, requires 2.1")
+            return {"ok": True}
+
+    broken = "\n".join(dynamic_tools._probe_sfcgal_optional(_Db(False)))
+    assert "CG_3DAlphaWrapping is NOT available" in broken and "CG_3DConvexHull" in broken
+    assert "CG_Extrude works on lines only" in broken
+    working = "\n".join(dynamic_tools._probe_sfcgal_optional(_Db(True)))
+    assert working.startswith("CG_3DAlphaWrapping(geom") and "NOT" not in working
+
+
+def test_save_schema_has_alpha_and_says_it_draws():
+    save = sp.TOOL_SCHEMAS["save_to_scratchpad"]
+    assert "alpha" in save["inputSchema"]["properties"]
+    assert "1 - alpha" in save["inputSchema"]["properties"]["alpha"]["description"]
+    assert "DRAWS" in save["description"] and "N calls" in save["description"]
+    assert "1 - alpha" in sp.TOOL_SCHEMAS["update_scratchpad_item"]["inputSchema"]["properties"]["alpha"][
+        "description"]
+
+
+def test_save_stores_alpha():
+    qdb = FakeDb({"LIMIT 1": [{"objectid": "B1"}], "array_agg(DISTINCT": [{"n": 1, "ids": ["B1"]}]})
+    wdb = FakeDb({"count(*) AS n": [{"n": 0}]})
+    out = sp.save_item(UID, "s", "SELECT 'B1' AS objectid", alpha=0.5, qdb=qdb, wdb=wdb)
+    assert out["ok"] and out["alpha"] == 0.5
+    upsert = wdb.calls[-1]
+    assert "alpha = EXCLUDED.alpha" in upsert[0] and upsert[1][-1] == 0.5
+    wdb = FakeDb({"count(*) AS n": [{"n": 0}]})
+    out = sp.save_item(UID, "s", "SELECT 'B1' AS objectid", qdb=qdb, wdb=wdb)
+    assert "alpha" not in out and wdb.calls[-1][1][-1] == sp.DEFAULT_ALPHA
+    bad = sp.save_item(UID, "s", "SELECT 'B1' AS objectid", alpha=2000, qdb=qdb, wdb=FakeDb())
+    assert not bad["ok"] and "alpha" in bad["error"]
+
+
+def test_a_label_column_sets_the_label():
+    """Recipes 5/6: the height or distance is computed in the SELECT, so the label
+    matches the saved marker / line (a separately looked-up value did not)."""
+    qdb = FakeDb({"string_agg(DISTINCT q.label": [{"label": "38.1 m"}],
+                  "LIMIT 1": [{"objectid": "B1", "label": "38.1 m"}],
+                  "array_agg(DISTINCT": [{"n": 1, "ids": ["B1"]}]})
+    wdb = FakeDb({"count(*) AS n": [{"n": 0}]})
+    out = sp.save_item(UID, "line_1", "SELECT 'B1' AS objectid, '38.1 m' AS label", label="19.7 m",
+                       qdb=qdb, wdb=wdb)
+    assert out["ok"] and out["label"] == "38.1 m" and wdb.calls[-1][1][2] == "38.1 m"
+    # without a label column the argument is kept
+    qdb = FakeDb({"LIMIT 1": [{"objectid": "B1"}], "array_agg(DISTINCT": [{"n": 1, "ids": ["B1"]}]})
+    wdb = FakeDb({"count(*) AS n": [{"n": 0}]})
+    out = sp.save_item(UID, "g", "SELECT 'B1' AS objectid", label="Class A", qdb=qdb, wdb=wdb)
+    assert out["label"] == "Class A" and wdb.calls[-1][1][2] == "Class A"
+    assert not any("string_agg" in c[0] for c in qdb.calls)
+
+
+def test_save_notes_joined_labels_and_dropped_heights():
+    """gpt-oss saved the 5 tallest as ONE 2Dmarker item from a 5-row SELECT with a
+    label column: the result now says that the labels were joined and the heights dropped."""
+    qdb = FakeDb({"string_agg(DISTINCT q.label": [{"label": "28.0 m, 32.2 m", "labels": 2}],
+                  "shape_ewkb": _shape_reply("MULTIPOINT", 3),
+                  "ST_HasArc": [{"n": 2, "vertices": 2, "ndims": 3, "ewkb": "01ab"}],
+                  "LIMIT 1": [{"geom": "<geometry>", "label": "32.2 m"}]})
+    out = sp.save_item(UID, "top", "SELECT geom, label FROM x", item_class="2Dmarker", qdb=qdb,
+                       wdb=FakeDb({"count(*) AS n": [{"n": 0}]}))
+    assert out["ok"] and out["class"] == "2Dmarker"
+    assert "2 different labels were joined" in out["note"] and "one item per row" in out["note"]
+    assert "heights of the SELECT were dropped (use 3Dmarker" in out["note"]
+    # one label, kept heights: no note
+    qdb.replies["string_agg(DISTINCT q.label"] = [{"label": "32.2 m", "labels": 1}]
+    out = sp.save_item(UID, "top", "SELECT geom, label FROM x", qdb=qdb,
+                       wdb=FakeDb({"count(*) AS n": [{"n": 0}]}))
+    assert out["ok"] and out["class"] == "3Dmarker" and "note" not in out
+
+
+@pytest.mark.parametrize("raw,fixed", [
+    ("Röblingweg_residential_alpha", "Roeblingweg_residential_alpha"), ("Eckpunkte grün", "Eckpunkte_gruen"),
+    ("Straße-Hülle", "Strasse_Huelle"), ("5_tallest", "_5_tallest"), ("café", "cafe"),
+])
+def test_safe_name_transliterates(raw, fixed):
+    assert sp.safe_name(raw) == fixed and sp.valid_name(fixed)
+
+
+def test_save_renames_an_invalid_name_instead_of_failing():
+    qdb = FakeDb({"LIMIT 1": [{"objectid": "B1"}], "array_agg(DISTINCT": [{"n": 1, "ids": ["B1"]}]})
+    wdb = FakeDb({"count(*) AS n": [{"n": 0}]})
+    out = sp.save_item(UID, "Röblingweg_hull", "SELECT 'B1' AS objectid", qdb=qdb, wdb=wdb)
+    assert out["ok"] and out["name"] == "Roeblingweg_hull" and "saved as 'Roeblingweg_hull'" in out["note"]
+    assert wdb.calls[-1][1][1] == "Roeblingweg_hull"
+    bad = sp.save_item(UID, "äöü", "SELECT 'B1' AS objectid", qdb=qdb, wdb=FakeDb())
+    assert bad["ok"] and bad["name"] == "aeoeue"
+    bad = sp.save_item(UID, "!!!", "SELECT 'B1' AS objectid", qdb=qdb, wdb=FakeDb())
+    assert not bad["ok"] and "invalid name" in bad["error"]
+
+
+@pytest.mark.parametrize("value,alpha", [(0.5, 0.5), ("0.7", 0.7), ("50%", 0.5), (30, 0.3), (1, 1.0), (0, 0.0)])
+def test_alpha_accepts_fractions_and_percent(value, alpha):
+    assert sp._check_alpha(value) == pytest.approx(alpha)
+
+
+def test_run_tool_passes_alpha_to_save(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(sp, "save_item", lambda u, n, q, **kw: seen.update(kw) or {"ok": True})
+    sp.run_tool("save_to_scratchpad", {"name": "w", "sql": "SELECT 1 AS objectid", "alpha": 0.7}, UID)
+    assert seen["alpha"] == 0.7
+    sp.run_tool("save_to_scratchpad", {"name": "w", "sql": "SELECT 1 AS objectid"}, UID)
+    assert seen["alpha"] is None
 
 
 def test_cloud_backend_dispatches_a_scratchpad_tool(monkeypatch):

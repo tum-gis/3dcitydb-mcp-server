@@ -193,8 +193,13 @@ def _format_activity(events: list[tuple[str, object]]) -> str:
         if event == "status":
             lines.append(f"Status: {data}")
         elif event == "tool_call":
-            sql = data.get("args", {}).get("sql", "")
-            lines.append(f"Tool call (run_query):\n```sql\n{sql}\n```")
+            tool = data.get("tool") or "run_query"
+            args = data.get("args") or {}
+            if tool == "run_query":
+                lines.append(f"Tool call (run_query):\n```sql\n{args.get('sql', '')}\n```")
+            else:  # e.g. save_to_scratchpad: show all arguments
+                lines.append(f"Tool call ({tool}):\n```json\n"
+                             f"{json.dumps(args, ensure_ascii=False, indent=1, default=str)}\n```")
         elif event == "tool_result":
             if data.get("error"):
                 lines.append(f"Tool result: ERROR — {data['error']}")

@@ -86,6 +86,15 @@ def test_activity_output_labels_reasoning_and_tool_events():
     assert "SELECT 1" in activity
 
 
+def test_activity_output_names_scratchpad_tools_with_their_arguments():
+    activity = cli._format_activity([
+        ("tool_call", {"tool": "save_to_scratchpad", "args": {"name": "hull", "alpha": 0.5,
+                                                              "sql": "SELECT g AS geom"}}),
+    ])
+    assert "Tool call (save_to_scratchpad)" in activity and "run_query" not in activity
+    assert '"alpha": 0.5' in activity and '"name": "hull"' in activity
+
+
 def test_chat_console_uses_shared_runtime_and_keeps_answer_separate(monkeypatch):
     prepared_calls = []
 

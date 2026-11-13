@@ -23,7 +23,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.agents.output_parsers import ReActSingleInputOutputParser
 
 from webui.session import TurnControl
-from webui.llm_utils import long_result_note, scratch_tool_hint, scratch_tool_result
+from webui.llm_utils import long_result_note, scratch_save_reminder, scratch_tool_hint, scratch_tool_result
 from webui.llm_utils import (
     MAX_ITERATIONS,
     _log_context_usage,
@@ -588,11 +588,18 @@ class _RobustReActParser(ReActSingleInputOutputParser):
                 action = self._action_from_tool_calls(msg)
                 if action is None and content.strip():
                     action = self._action_from_embedded_sql(content)
+            elif not react_markers:
+                # After a tool ran only an explicit native tool call counts (never
+                # SQL quoted in prose): gpt-oss calls save_to_scratchpad after its
+                # run_query this way, and dropping it turned the plan into the answer.
+                action = self._action_from_tool_calls(msg)
+                if action is not None:
+                    self._check_repetition(action)
             else:
                 action = None
             if action is not None:
                 print(
-                    "[local] parser: recovered run_query from Ollama message "
+                    f"[local] parser: recovered {action.tool} from Ollama message "
                     f"(content_chars={len(content)} tool_calls={len(getattr(msg, 'tool_calls', None) or [])})",
                     flush=True,
                 )
@@ -656,9 +663,15 @@ class _RobustReActParser(ReActSingleInputOutputParser):
             if len(starts) >= 2:
                 # Keep only the final "Action Input: ..." onward; the model's
                 # current action is always its newest one. The parser recovers
-                # the tool name from the JSON/SQL payload, so dropping the
-                # preceding "Action:" line is harmless.
-                text = text[starts[-1] :]
+                # the tool name from the JSON/SQL payload for run_query; an
+                # extra tool (save_to_scratchpad) needs its "Action:" line, so
+                # keep the one right before the final input when there is one.
+                cut = starts[-1]
+                actions = [m.start() for m in self._ACTION_LINE_START_RE.finditer(text, starts[-2], cut)
+                           if not text[m.start():].lower().startswith("action input")]
+                if actions:
+                    cut = actions[-1]
+                text = text[cut:]
         elif "Action:" in text:
             starts = [m.start() for m in self._ACTION_LINE_START_RE.finditer(text)]
             if len(starts) >= 2:
@@ -705,6 +718,9 @@ class _RobustReActParser(ReActSingleInputOutputParser):
             if not isinstance(tc, dict):
                 continue
             name = str(tc.get("name") or "").lower()
+            if name not in self._tool_names:
+                # gpt-oss sometimes prefixes the namespace ("functions.save_to_scratchpad")
+                name = next((t for t in self._tool_names if t != "run_query" and t in name), name)
             if name in self._tool_names and name != "run_query":
                 # An extra tool (e.g. save_to_scratchpad): its input is JSON.
                 args = tc.get("args")
@@ -1258,6 +1274,8 @@ def react_stream(
                     "(3) verify the geometry type filter (IN (8, 9)) is correct. "
                     "Retry with a corrected query."
                 )
+            if extra_tools:  # "create/draw ..." questions: save next, do not answer yet
+                result_msg += scratch_save_reminder(_raw_user_q)
             # Keep the language reminder as the very last line of every observation
             # so it's the freshest text the model reads before writing Final Answer.
             result_msg += "\n\n" + _answer_lang_reminder
@@ -1271,7 +1289,9 @@ def react_stream(
         description=(
             "Execute a read-only SQL SELECT query against the connected 3DCityDB database "
             "and return the results as JSON. "
-            'Input: a JSON object with a single key "sql" whose value is the SQL string, '
+            + ("It only looks data up and draws nothing; to create or show something in the "
+               "viewer use save_to_scratchpad. " if extra_tools else "")
+            + 'Input: a JSON object with a single key "sql" whose value is the SQL string, '
             'e.g. {"sql": "SELECT f.objectid FROM feature f WHERE f.objectclass_id = 901"}'
         ),
     )

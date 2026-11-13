@@ -1124,47 +1124,81 @@ def scratchpad_tool_specs() -> list[dict]:
             for n, spec in scratchpad.TOOL_SCHEMAS.items()]
 
 
-SCRATCHPAD_TOOLS_INSTRUCTIONS = """[SCRATCHPAD] The user's personal saved items, shown in the 3D viewer
-- Tools: save_to_scratchpad (save a result under a name), update_scratchpad_item (change label,
-  color, opacity, class or size of a saved item in place), scratchpad_action (show, hide, delete,
-  goto), list_scratchpad (what is saved). Use them whenever the user asks to save, store, mark,
-  pin, remember, recolour, show/hide or delete something ("speichern", "merken", "markieren",
-  "umfärben", ...).
-- Deleting SEVERAL items: first ask the user to confirm the list; call scratchpad_action with
-  confirm=true only after a yes. Deleting one item needs no confirmation.
-- Names: letters, digits and underscore, no spaces (e.g. affected_2013). Pick a short name
-  yourself if the user gives none, and tell it.
-- save_to_scratchpad with `sql`: a SELECT returning objectid rows (a set of features, coloured in
-  the viewer) OR a geom column (a geometry in the data's CRS; several rows become one item).
-  With `geojson`: a GeoJSON geometry/Feature/FeatureCollection in lon/lat (e.g. points the user
-  pasted); it is converted to the data's CRS. Optional: label, color ('#rrggbb'), clamp,
-  class (how to draw a geometry; derived otherwise: 2Dmarker/3Dmarker pin, Point3D sphere,
-  LineString3D pipe, Polygon2D/3D, Solid3D, ...), size_m (sphere/pipe radius).
-  The tool runs the SQL itself and reports the saved count; report name and count.
-- 2D/3D: the class and the stored geometry always match ("POLYGON Z" = with heights). To give a
-  saved item a height ("add height", "make it 3D", "20 m hoch") call update_scratchpad_item with
-  height_m (metres above ground: 2Dmarker -> 3Dmarker, Polygon2D -> Polygon3D); to turn an area
-  into a solid ("Körper", "solid", "extrudieren") use extrude_m (Polygon2D -> Solid3D).
-  base_z = absolute height instead of the ground. Changing only the class does not add a height.
-- Bounding boxes: 3D box `ST_3DExtent(f.envelope) AS geom` (saved as a closed box, Solid3D);
-  2D `ST_Extent(f.envelope) AS geom`. ST_MakeEnvelope has no heights.
-- REUSE saved items in run_query through the view my_scratchpad(name, label, kind, class, color, geom,
-  objectids text[], is_visible, data, created_at). There is no other scratchpad table. Select
-  cardinality(objectids) and GeometryType(geom) rather than the raw columns when listing.
+SCRATCHPAD_TOOLS_INSTRUCTIONS = """[SCRATCHPAD] Drawing results in the user's 3D viewer
+One rule: PostGIS computes, the scratchpad draws. Put the whole computation (hull, buffer, line,
+points, marker position, rings, ...) in the SELECT of the `sql` argument of save_to_scratchpad;
+the tool runs it, stores the result as an item and draws it. run_query only looks things up
+(values, ids, numbers) and draws nothing.
+- When the user asks to create, draw, show, mark, put, add, group or colour something (groups of
+  buildings, marker, line, ring, point set, hull, wrapping, buffer; "erstelle", "zeige", "setze",
+  "füge hinzu", "ordne zu", "stelle dar"), the turn MUST contain save_to_scratchpad call(s).
+  A text answer or run_query alone does not draw anything.
+- Use run_query first only to learn values you need (the distinct classes, the ids of the 5
+  tallest, storeys and height, the nearest building), then save. Compute positions in the SELECT
+  (from the tables or my_scratchpad); do not paste coordinates.
+- One item = one name, colour, alpha and label. N groups, N labels or "one item per line" =
+  N save_to_scratchpad calls, one after the other. "As one object" = ONE call whose SELECT returns
+  all parts (its rows are collected into one item).
+- `sql` returns `objectid` rows (a group of city objects, coloured in the viewer) or a `geom`
+  column (a geometry; heights kept = 3D, ST_Force2D(...) = flat 2D). A `label` column sets the
+  label from a computed value (height, distance), so it always matches the geometry.
+- 2D or 3D: when the user says "2D" or "3D", pass class (2D: Polygon2D, MultiPolygon2D,
+  LineString2D; 3D: Polygon3D, Solid3D, Surface3D, LineString3D) and compute in that dimension.
+  2D = ST_Force2D input and 2D functions (CG_OptimalAlphaShape, ST_ConcaveHull, ST_Buffer,
+  ST_Union). 3D = CG_3D... functions. A 2D "alpha wrapping" is an alpha shape
+  (CG_OptimalAlphaShape), NEVER CG_3DAlphaWrapping. If the tool says the class does not fit,
+  follow its hint and save again.
+- color '#rrggbb' (red #dc2626, green #16a34a, yellow #facc15, orange #f97316, blue #2563eb).
+  alpha = opacity 0-1: "X % transparency" means alpha = 1 - X/100 (50 % -> 0.5, 30 % -> 0.7).
+- name: letters, digits, _ (no spaces); a name the user gives ("as cornerpoints") is the name.
+  After saving, tell the user names and counts in one or two sentences.
+- Also: update_scratchpad_item (label, color, alpha, class, size_m, height_m of a saved item),
+  scratchpad_action (show/hide/delete/goto; deleting several: ask first, then confirm=true),
+  list_scratchpad. Saved items in SQL: view my_scratchpad(name, label, class, color, geom,
+  objectids text[]).
 
-Scratchpad examples:
-save_to_scratchpad {"name": "tall_buildings", "color": "#dc2626", "sql":
-  "SELECT f.objectid FROM feature f WHERE f.objectclass_id = 901 AND ST_ZMax(f.envelope) - ST_ZMin(f.envelope) > 30"}
-save_to_scratchpad {"name": "meeting_point", "label": "Meeting point",
-  "geojson": {"type": "Point", "coordinates": [13.4735, 48.5740]}}
-save_to_scratchpad {"name": "cluster_hull", "sql":
-  "SELECT CG_3DConvexHull(ST_Collect(f.envelope)) AS geom FROM feature f WHERE f.objectid IN ('<id1>', '<id2>')"}
-update_scratchpad_item {"name": "meeting_point", "height_m": 20}
-save_to_scratchpad {"name": "set_box", "sql": "SELECT ST_3DExtent(f.envelope) AS geom FROM feature f
-  JOIN my_scratchpad p ON f.objectid = ANY(p.objectids) WHERE p.name = 'tall_buildings'"}
-run_query: buildings within 100 m of a saved point
-  SELECT count(*) FROM feature f, my_scratchpad p WHERE p.name = 'meeting_point'
-    AND f.objectclass_id = 901 AND ST_DWithin(f.envelope, p.geom, 100)"""
+Recipes for `sql` (b = building, objectclass_id 901; replace <...>):
+1 One group per value (one call per value, own colour, label = the value):
+  SELECT b.objectid FROM feature b JOIN property p ON p.feature_id = b.id AND p.name = '<attr>'
+  WHERE b.objectclass_id = 901 AND p.val_string = '<value>'
+2 3D hull / wrapping around buildings (one closed solid):
+  SELECT CG_3DConvexHull(ST_Collect(g.geometry)) AS geom FROM feature b
+  JOIN property gp ON gp.feature_id = b.id AND gp.name = 'lod2Solid'
+  JOIN geometry_data g ON g.id = gp.val_geometry_id WHERE b.objectid IN (<ids or subquery>)
+  (CG_3DAlphaWrapping(ST_Collect(g.geometry), 10) only if the SFCGAL list above offers it;
+  otherwise tell the user it is a convex hull.)
+3 2D alpha shape / alpha wrapping / concave outline around building footprints (class MultiPolygon2D):
+  SELECT CG_OptimalAlphaShape(ST_Union(ST_Force2D(g.geometry)), false, 1) AS geom FROM feature b
+  JOIN property r ON r.feature_id = b.id AND r.name = 'boundary'
+  JOIN feature s ON s.id = r.val_feature_id AND s.objectclass_id = 710
+  JOIN property sp ON sp.feature_id = s.id AND sp.val_geometry_id IS NOT NULL
+  JOIN geometry_data g ON g.id = sp.val_geometry_id WHERE b.objectclass_id = 901
+4 All points (vertices) of a building's solid as one point set (class "Point3D", size_m 0.3):
+  SELECT ST_Collect(DISTINCT d.geom) AS geom FROM feature b
+  JOIN property gp ON gp.feature_id = b.id AND gp.name = 'lod2Solid'
+  JOIN geometry_data g ON g.id = gp.val_geometry_id, ST_DumpPoints(g.geometry) d
+  WHERE b.objectid = '<id>'
+5 Marker on top of a building with its height (one call per building, name marker_<objectid>):
+  SELECT ST_MakePoint(ST_X(ST_Centroid(b.envelope)), ST_Y(ST_Centroid(b.envelope)), ST_ZMax(b.envelope))
+  AS geom, round((ST_ZMax(b.envelope) - ST_ZMin(b.envelope))::numeric, 1) || ' m' AS label
+  FROM feature b WHERE b.objectid = '<id>'
+6 3D line from a saved item to the nearest other building, distance as label (one call per line):
+  SELECT ST_3DShortestLine(p.geom, g.geometry) AS geom,
+  round(ST_3DDistance(p.geom, g.geometry)::numeric, 1) || ' m' AS label
+  FROM my_scratchpad p, feature o JOIN property gp ON gp.feature_id = o.id AND gp.name = 'lod2Solid'
+  JOIN geometry_data g ON g.id = gp.val_geometry_id WHERE p.name = '<item>'
+  AND o.objectid <> '<its own building>' ORDER BY ST_3DDistance(p.geom, g.geometry) LIMIT 1
+7 Buffer around a saved item (2D, class Polygon2D): SELECT ST_Buffer(ST_Force2D(p.geom), <m>) AS geom
+  FROM my_scratchpad p WHERE p.name = '<item>'
+8 Rings of the footprint at several heights in ONE item (e.g. per storey: h = height / storeys,
+  both from run_query; storeysAboveGround and the nested height value):
+  SELECT ST_Collect(ST_Translate(ST_ExteriorRing(d.geom), 0, 0, i * <h>)) AS geom FROM feature b
+  JOIN property r ON r.feature_id = b.id AND r.name = 'boundary'
+  JOIN feature s ON s.id = r.val_feature_id AND s.objectclass_id = 710
+  JOIN property sp ON sp.feature_id = s.id AND sp.val_geometry_id IS NOT NULL
+  JOIN geometry_data g ON g.id = sp.val_geometry_id, ST_Dump(g.geometry) d,
+  generate_series(0, <storeys> - 1) i WHERE b.objectid = '<id>'
+9 Bounding box: 3D SELECT ST_3DExtent(b.envelope) AS geom (a closed box); 2D ST_Extent(...)."""
 
 
 def note_scratch_result(raw_result: str, focus: list) -> bool:
@@ -1202,12 +1236,32 @@ def build_scratchpad_payload(user_id: str, focus=()) -> dict | None:
     return {"items": items, "focus": [n for n in dict.fromkeys(focus or [])]}
 
 
-# Questions after which the model may still call a scratchpad tool once it has
-# a query result (the cloud backend otherwise forces a text answer then).
+# Questions that ask to create, draw or manage scratchpad items. After a query
+# result the cloud backend lets the model call a tool again for them (instead
+# of forcing a text answer), and both backends remind the model to save.
+# Broad on purpose: a missed request costs the whole answer, a false match
+# only one reminder line.
 _SCRATCH_INTENT_RE = re.compile(
     r"speicher|merk|markier|notier|lösch|losch|ausblend|einblend|blende|gespeichert|"
-    r"\bsave|\bstore|remember|\bmark|\bpin\b|delete|\bhide|\bshow\b.*\b(saved|my)\b|scratchpad",
+    r"erstell|zeichne|setze|füge|fuege|hinzu|ordne|gruppe|darstell|\bstelle\b.*\bdar\b|"
+    r"\bzeige\b.*\b(als|in)\b|beschrift|umhüll|umhuell|hülle|huelle|puffer|linie|\bring|"
+    r"punkte|punktmenge|farbe|transparen|\b(rot|grün|gruen|gelb|blau|orange)\w*\b|"
+    r"\bsave|\bstore|remember|\bmark|\bpin\b|delete|\bhide|\bshow\b.*\b(saved|my|as)\b|scratchpad|"
+    r"\bcreate|\bdraw|\bput\b|\badd\b|\bgroups?\b|\blabel|\bcolou?r|\bbuffer|\bhull|wrapping|"
+    r"\blines?\b|\brings?\b|\bpoints\b|pointset|\bhighlight|\bvisuali[sz]|"
+    r"\b(red|green|yellow|blue|orange)\b",
     re.IGNORECASE)
+
+
+def scratch_save_reminder(question: str) -> str:
+    """Line added to a run_query result when the question asks for an item:
+    weak models otherwise answer in text and never call save_to_scratchpad."""
+    if not wants_scratchpad(question):
+        return ""
+    return ("\nSCRATCHPAD: the user asked to create/draw/mark something. run_query draws nothing: "
+            "now call save_to_scratchpad with a SELECT that computes the geometry (or objectids), "
+            "one call per item (own name, colour, alpha = 1 - transparency, label), and only "
+            "then give the final answer.")
 
 
 def wants_scratchpad(question: str) -> bool:

@@ -5,7 +5,8 @@ import time as _time
 from typing import Callable, Generator
 
 from webui.session import TurnControl
-from webui.llm_utils import long_result_note, scratch_tool_hint, scratch_tool_result, wants_scratchpad
+from webui.llm_utils import (long_result_note, scratch_save_reminder, scratch_tool_hint,
+                              scratch_tool_result, wants_scratchpad)
 from webui.llm_utils import (
     MAX_ITERATIONS,
     RUN_QUERY_TOOL,
@@ -370,7 +371,8 @@ def native_tool_stream(
                     "--- FRESH TOOL RESULT FOR CURRENT USER QUESTION ---\n"
                     + _truncate_result(raw_result)
                     + "\n--- END FRESH TOOL RESULT ---\n"
-                    + long_result_note(result_data.get("row_count", 0), full_lists) + "\n"
+                    + long_result_note(result_data.get("row_count", 0), full_lists)
+                    + (scratch_save_reminder(_last_user_q) if extra_tools else "") + "\n"
                     f"The user's question was:\n\"\"\"\n{_last_user_q}\n\"\"\"\n"
                     "Reply in EXACTLY the same language as the user's question above "
                     "(English → English, German → German). Ignore foreign-language proper "

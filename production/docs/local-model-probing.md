@@ -100,7 +100,10 @@ quote-aware procedural scanner — identifier dots like `g.geometry` never
 terminate the statement; only an unanchored mid-sentence `SELECT` mention is
 skipped). Two guards keep the recovery from hijacking genuine ReAct output: it
 only applies while **no tool has run yet** (`_tools_called == 0`) and the
-content contains **no `Action:` / `Final Answer:` line**.
+content contains **no `Action:` / `Final Answer:` line**. (Later change: after a tool ran, an explicit native
+`tool_calls` entry is still accepted, e.g. gpt-oss's `save_to_scratchpad` after
+its `run_query`; it goes through the repetition guard. SQL in prose is
+recovered on the first step only, as before.)
 
 **Post-fix evidence:** 15/15 unit tests in `tests/test_local_gptoss.py`
 (including the real wire shape: reasoning-in-content + trailing tool_call).

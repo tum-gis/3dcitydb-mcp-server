@@ -56,7 +56,7 @@ and the local ReAct backend.
 
 | Tool | Arguments | Does |
 |------|-----------|------|
-| `save_to_scratchpad` | `name`, and `sql` **or** `geojson`; optional `label`, `color`, `clamp`, `class`, `size_m`, `height_m`, `extrude_m`, `base_z` | Saves an item (replaces an existing name). `sql` is a SELECT with an `objectid` column (featureset) or a `geom` column (geometry); if both are present, `geom` wins. `geojson` is a Geometry, Feature or FeatureCollection in WGS84 lon/lat; it is converted to the database CRS (`_geojson_sql` passes the geometries as quoted literals, never as free SQL). |
+| `save_to_scratchpad` | `name`, and `sql` **or** `geojson`; optional `label`, `color`, `alpha`, `clamp`, `class`, `size_m`, `height_m`, `extrude_m`, `base_z` | Saves an item (replaces an existing name). `sql` is a SELECT with an `objectid` column (featureset) or a `geom` column (geometry); if both are present, `geom` wins. An optional `label` column sets the label. `geojson` is a Geometry, Feature or FeatureCollection in WGS84 lon/lat; it is converted to the database CRS (`_geojson_sql` passes the geometries as quoted literals, never as free SQL). |
 | `update_scratchpad_item` | `name`; optional `label`, `color`, `alpha`, `class`, `size_m`, `clamp`, `height_m`, `extrude_m`, `base_z` | Changes a saved item in place: style, class and height (see below). |
 | `scratchpad_action` | `action` (`show`, `hide`, `delete`, `goto`), `names`; optional `confirm` | Acts on the named items. Deleting more than one needs `confirm: true` (see below). |
 | `list_scratchpad` | none | Name, label, kind, class, colour, visibility, count or geometry type. |
@@ -65,7 +65,9 @@ and the local ReAct backend.
 `{ok: false, error}`. `type` is the stored geometry type with ` Z` when it has heights (`POINT Z`,
 `POLYHEDRALSURFACE Z`); `list_scratchpad` reports `geometry_type` the same way. Numeric arguments
 (`size_m`, `height_m`, `extrude_m`, `base_z`) also accept strings such as `"20"`, `"20 m"` or `"1,5"`
-(`_number`), because local models send those.
+(`_number`), because local models send those. `alpha` (opacity, transparency = 1 - alpha) also takes
+`"50%"` or `50` and scales them to 0.5 (`_check_alpha`); `save_to_scratchpad` accepts it directly, so
+"red with 50 % transparency" is one call, not a save plus an update.
 
 **`update_scratchpad_item`** (`update_item`) changes only the fields that are given; `TOOL_SCHEMAS`
 lists it, so the cloud and ReAct backends offer it automatically. `label` (empty removes it, the map
@@ -103,13 +105,47 @@ same id, so those clients can query `my_scratchpad` too.
   `tool_result` event (preview rows, no highlight rows, the error if any).
 - **Cloud backend** (`backends/cloud.py`): `all_tools` = the standard tools plus `extra_tools`, and
   calls are dispatched by `tc.function.name`. After a successful `run_query` the loop normally forces a
-  text answer (`tool_choice="none"`). It does **not** when extra tools exist and the question has save
-  or manage intent (`wants_scratchpad`), so "query, then save" works in one turn.
+  text answer (`tool_choice="none"`). It does **not** when extra tools exist and the question has save,
+  create/draw or manage intent (`wants_scratchpad`), so "query, then save" works in one turn. The
+  intent pattern also matches "create", "put a marker", "add a buffer", "show ... in red", "erstelle",
+  "setze", "füge hinzu", "stelle ... dar", colour and transparency words; plain questions ("how many",
+  "show me all ... in <street>") do not match.
 - **Local ReAct backend** (`backends/local.py`): each extra tool becomes a LangChain Tool whose Action
   Input is JSON (`_parse_json_input`). The parser's `tool_names` include them, the "unknown tool" error
-  lists the available tools, native Ollama `tool_calls` for extra tools are accepted, and the callback
-  emits `tool_call` / `tool_result` events with the tool name. The prompt's format line explains the
-  JSON input.
+  lists the available tools, native Ollama `tool_calls` for extra tools are accepted (also with
+  gpt-oss's `functions.` prefix, and also after a tool already ran: gpt-oss calls `run_query` first
+  and then `save_to_scratchpad` as a native call next to planning prose; before, that call was dropped
+  and the plan became the answer. Only SQL quoted in prose is still recovered on the first step
+  only), and the callback emits `tool_call` / `tool_result` events with the tool name. The prompt's format line explains the
+  JSON input. The `run_query` tool description says that it draws nothing.
+- **Save reminder (both backends).** When the question has scratchpad intent, every successful
+  `run_query` result ends with `scratch_save_reminder()`: "run_query draws nothing: now call
+  save_to_scratchpad ...". Without it gpt-oss:20b answered every create/draw question with the SQL
+  and a JSON snippet in the text and never called the tool.
+
+### The prompt block: PostGIS computes, the scratchpad draws
+
+Models mixed up "compute a geometry with PostGIS (run_query)" and "store/draw it (scratchpad
+tool)": they computed a hull or a line with `run_query` and then answered in text, or wrote the SQL
+and the tool arguments into the answer. `SCRATCHPAD_TOOLS_INSTRUCTIONS` is therefore built around one
+rule: the whole computation goes into the SELECT of `save_to_scratchpad`'s `sql`, the tool runs it and
+draws the result, `run_query` only looks up values. Then a few short rules (one item = one name,
+colour, alpha and label, so N groups or N labels are N calls; "as one object" is one call whose
+SELECT returns all parts; alpha = 1 - transparency) and nine verified SQL recipes: one group per
+attribute value, 3D hull/wrapping, 2D alpha shape around footprints, the vertices of a solid as a
+point set, a marker on top of a building, a 3D shortest line to the nearest building with the
+distance as label, a buffer around a saved item, footprint rings per storey in one item, and bounding
+boxes. The recipes use placeholders and the standard 3DCityDB v5 ids (901 Building, 710
+GroundSurface), no dataset values. The block is about 5,200 characters; the measurements with
+gpt-oss:20b and qwen3.6:27b, and the SQL behind each recipe, are in
+[scratchpad-prompt-evaluation.md](scratchpad-prompt-evaluation.md).
+
+`CG_3DAlphaWrapping` and `CG_Extrude` on areas are in the PostGIS catalogue of the
+`3dcitydb-v5-docker-sfcgal-patched` image but fail at run time ("compiled against SFCGAL 2.0,
+requires 2.1"). The assembled prompt's SFCGAL list now probes them (`_probe_sfcgal_optional` in
+`dynamic_tools.py`) and, when they fail, says so and names the fallback (`CG_3DConvexHull`; walls from
+`ST_ExteriorRing` or `CG_ExtrudeStraightSkeleton` for a prism). It also lists `CG_3DConvexHull` and
+`CG_OptimalAlphaShape`.
 
 ### Reading saved items
 
@@ -210,7 +246,7 @@ Table `<schema>.scratchpad` (default `citydb.scratchpad`), created by `provision
 | `label` | text | shown on the map, defaults to the name in the viewer |
 | `kind` | text | `featureset` or `geometry` |
 | `class` | text | one of `CLASSES` (see "Classes"); `FeatureSet` for featuresets; CHECK `scratchpad_class_check` |
-| `color`, `alpha` | text, double | `#rrggbb`; alpha 0..1, default 0.8 (`alpha` is set only by `update_scratchpad_item`) |
+| `color`, `alpha` | text, double | `#rrggbb`; alpha = opacity 0..1, default 0.8 (transparency = 1 - alpha; set by `save_to_scratchpad` or `update_scratchpad_item`) |
 | `clamp` | boolean | drape 2D shapes on the terrain (a draped item is stored without heights) |
 | `geom` | geometry | set for `geometry` items only (CHECK), GiST index (`gist_geometry_ops_nd`) |
 | `objectids` | text[] | set for `featureset` items only (CHECK) |
@@ -302,7 +338,16 @@ non-geometry types (raster, topology).
 Rules (constants in `scratchpad.py`):
 
 - Saving an existing name **replaces** it (upsert; the item becomes visible again). Names are unique
-  per user, not globally.
+  per user, not globally. A name that is not valid but can be fixed is saved under the fixed name
+  (`safe_name`: umlauts transliterated, other characters to `_`, e.g. "Röblingweg_hull" ->
+  "Roeblingweg_hull"); the result names it in `note`. Models kept giving up after an "invalid name".
+- A `label` column in a `save_to_scratchpad` SELECT sets the label (distinct values joined with ", ",
+  max 200 characters) and wins over the `label` argument: a height or distance computed next to the
+  geometry always matches it, while a value looked up in a separate query did not (qwen labelled
+  lines with distances of a different metric). When the rows carry several different labels they are joined into the
+  one item label and the result's `note` says to save one item per row instead.
+- A flat class (`2Dmarker`, `Polygon2D`, ...) on a SELECT with heights drops them; the result's
+  `note` says so (for `2Dmarker`: "use 3Dmarker to keep them").
 - `MAX_ITEMS = 100` per user (replacing an existing name is still allowed when full).
 - `MAX_VERTICES = 20,000` per geometry item (`ST_NPoints` after collecting). Larger ones are rejected
   with the hint to simplify first (`ST_Simplify`, `CG_3DConvexHull`).
@@ -536,6 +581,9 @@ kept copy `window.__citydbScratchpad` also has no notice). Import reads the file
 
 ## Limitations
 
+- On a PostGIS built against SFCGAL < 2.1 (the current `3dcitydb-v5-docker-sfcgal-patched` image)
+  `extrude_m` on an area fails with "SFCGAL2LWGEOM: Unknown Type" (`CG_Extrude` returns a solid
+  that PostGIS cannot read), and there is no 3D alpha wrapping; lines still extrude to walls.
 - The ground height for `height_m` / `extrude_m` is an estimate from nearby city objects, not a
   terrain model (see [2D and 3D](#2d-and-3d-heights-solids-boxes)); give `base_z` where it matters.
 - Flattening (a 2D class or `clamp: true` on a 3D item) drops the heights for good.
@@ -584,6 +632,11 @@ kept copy `window.__citydbScratchpad` also has no notice). Import reads the file
 - Web UI side: `scratch_tool_result` / `scratch_tool_hint`, `note_scratch_result` (focus names from the
   tool result), the prompt block (`SCRATCHPAD_TOOLS_INSTRUCTIONS`) only when enabled and no
   `scratch_save` convention in it, and the shape of `list_items`.
+- Prompt and intent: the block keeps the "PostGIS computes" rule, the alpha mapping and all recipes
+  and stays under 6,000 characters; create/draw questions in English and German count as scratchpad
+  intent and get the save reminder, plain questions do not; `alpha` on save (stored, default 0.8,
+  `"50%"` scaled, out of range refused) and in the tool schema; the SFCGAL probe advertises only
+  working functions; the CLI activity names scratchpad tools with their arguments.
 
 ```
 pytest tests/test_scratchpad.py -v

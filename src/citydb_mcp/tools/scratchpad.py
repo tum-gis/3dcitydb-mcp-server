@@ -64,6 +64,24 @@ _SOLID_CLASSES = ("Solid3D", "MultiSolid3D")
 _EXTRUDABLE = ("POLYGON", "MULTIPOLYGON", "LINESTRING", "MULTILINESTRING")
 
 
+_MULTI_OF = {"Polygon": "MultiPolygon", "LineString": "MultiLineString"}
+_SURFACE_TYPES = ("POLYHEDRALSURFACE", "TIN", "GEOMETRYCOLLECTION")
+
+
+def _class_mismatch(requested: str, gtype: str) -> str:
+    """Error text for a class that does not fit the geometry. A flat (2D) class
+    on a 3D surface/solid usually means a 3D function (CG_3DAlphaWrapping,
+    CG_3DConvexHull, CG_Extrude) was used for a 2D request: say how to do it in 2D."""
+    if requested in FLAT_CLASSES and gtype in _SURFACE_TYPES:
+        return (f"class {requested} is 2D, but the SELECT returned a 3D {gtype} (a surface or solid, "
+                "e.g. from CG_3DAlphaWrapping, CG_3DConvexHull or CG_Extrude). Compute it in 2D "
+                "instead: a 2D alpha shape / alpha wrapping / concave outline is "
+                "CG_OptimalAlphaShape(ST_Force2D(ST_Collect(...)), false, 1) or "
+                "ST_ConcaveHull(ST_Force2D(ST_Collect(...)), 0.3); a 2D buffer is "
+                "ST_Buffer(ST_Force2D(...), m). Then save again.")
+    return f"class {requested} does not fit a {gtype} geometry"
+
+
 def classify(gtype: str, ndims: int, member_types=(), all_closed=False, clamp=False,
              requested: str | None = None) -> str:
     """The class of a geometry item: the requested one if it fits the geometry,
@@ -72,8 +90,13 @@ def classify(gtype: str, ndims: int, member_types=(), all_closed=False, clamp=Fa
     if requested:
         if requested not in GEOMETRY_CLASSES:
             raise ValueError(f"unknown class {requested!r} (allowed: {', '.join(GEOMETRY_CLASSES)})")
+        # Polygon2D asked, MULTIPOLYGON returned (e.g. by an alpha shape): same
+        # dimension, so take the multi class instead of failing.
+        multi = _MULTI_OF.get(requested[:-2])
+        if multi and gtype == multi.upper():
+            requested = multi + requested[-2:]
         if gtype not in _CLASS_TYPES[requested]:
-            raise ValueError(f"class {requested} does not fit a {gtype} geometry")
+            raise ValueError(_class_mismatch(requested, gtype))
         if (ndims or 2) < 3 and requested not in FLAT_CLASSES:
             raise ValueError(f"class {requested} needs a geometry with heights (give height_m)")
         return requested
@@ -98,6 +121,24 @@ def classify(gtype: str, ndims: int, member_types=(), all_closed=False, clamp=Fa
     raise ValueError(f"cannot store a {gtype} with mixed parts ({', '.join(sorted(members))}); "
                      "save the parts as separate items")
 DEFAULT_COLOR = "#ff5a00"
+DEFAULT_ALPHA = 0.8  # opacity; transparency = 1 - alpha
+
+
+def _check_alpha(value) -> float:
+    """Opacity 0-1. Models also send "50%" or 50 (percent); those are scaled."""
+    if isinstance(value, bool):
+        raise ValueError("alpha must be a number between 0 and 1 (opacity)")
+    text = str(value).strip()
+    percent = text.endswith("%")
+    try:
+        alpha = float(text.rstrip("%").strip().replace(",", "."))
+    except ValueError:
+        raise ValueError(f"alpha must be a number between 0 and 1 (opacity), not {value!r}") from None
+    if percent or 1 < alpha <= 100:
+        alpha /= 100
+    if not 0 <= alpha <= 1:
+        raise ValueError("alpha must be between 0 and 1 (opacity; transparency = 1 - alpha)")
+    return alpha
 
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -142,6 +183,21 @@ def _audit(op: str, user_id: str, **details) -> None:
 
 def enabled() -> bool:
     return os.getenv("CITYDB_SCRATCHPAD", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+_TRANSLIT = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"})
+
+
+def safe_name(name) -> str:
+    """A valid item name made from what a model sent: umlauts transliterated
+    ("Röblingweg_hull" -> "Roeblingweg_hull"), other characters -> "_"."""
+    import unicodedata
+
+    text = unicodedata.normalize("NFKD", str(name or "").translate(_TRANSLIT))
+    text = re.sub(r"[^A-Za-z0-9_]+", "_", text.encode("ascii", "ignore").decode()).strip("_")
+    if text[:1].isdigit():
+        text = "_" + text
+    return text[:64]
 
 
 def valid_name(name) -> bool:
@@ -356,7 +412,7 @@ t AS (SELECT n, CASE WHEN ST_SRID(g) = 0 THEN ST_SetSRID(g, s.srid)
                      WHEN ST_SRID(g) <> s.srid THEN ST_Transform(g, s.srid)
                      ELSE g END AS g
       FROM c, (SELECT srid FROM database_srs LIMIT 1) s)
-SELECT n, ST_NPoints(g) AS vertices,
+SELECT n, ST_NPoints(g) AS vertices, ST_NDims(g) AS ndims,
        encode(ST_AsEWKB(CASE WHEN ST_HasArc(g) THEN ST_CurveToLine(g) ELSE g END), 'hex') AS ewkb
 FROM t"""
 
@@ -469,13 +525,13 @@ FROM q WHERE q.objectid IS NOT NULL"""
 
 _UPSERT_SQL = """
 INSERT INTO {schema}.scratchpad
-    (user_id, name, label, kind, class, color, clamp, geom, objectids, is_visible, data)
+    (user_id, name, label, kind, class, color, clamp, geom, objectids, is_visible, data, alpha)
 VALUES (%s, %s, %s, %s, %s, %s, %s,
         CASE WHEN %s::text IS NULL THEN NULL ELSE ST_GeomFromEWKB(decode(%s, 'hex')) END,
-        %s, true, %s::jsonb)
+        %s, true, %s::jsonb, %s)
 ON CONFLICT (user_id, name) DO UPDATE SET
     label = EXCLUDED.label, kind = EXCLUDED.kind, class = EXCLUDED.class, color = EXCLUDED.color,
-    clamp = EXCLUDED.clamp, geom = EXCLUDED.geom, objectids = EXCLUDED.objectids,
+    alpha = EXCLUDED.alpha, clamp = EXCLUDED.clamp, geom = EXCLUDED.geom, objectids = EXCLUDED.objectids,
     is_visible = true, data = EXCLUDED.data, updated_at = now()"""
 
 
@@ -492,7 +548,7 @@ def _check_vertices(row: dict) -> None:
 
 def save_item(user_id: str, name: str, sql: str, *, label: str | None = None,
               color: str | None = None, clamp: bool = False, item_class: str | None = None,
-              size_m: float | None = None, height_m: float | None = None,
+              alpha: float | None = None, size_m: float | None = None, height_m: float | None = None,
               extrude_m: float | None = None, base_z: float | None = None,
               qdb: DatabaseConnection | None = None,
               wdb: DatabaseConnection | None = None) -> dict:
@@ -500,12 +556,17 @@ def save_item(user_id: str, name: str, sql: str, *, label: str | None = None,
 
     A ``geom`` column makes a geometry item (rows are collected into one), an
     ``objectid`` column a featureset. Saving an existing name replaces it.
-    ``height_m`` / ``extrude_m`` / ``base_z`` make the geometry 3D (``_shape``)."""
+    ``height_m`` / ``extrude_m`` / ``base_z`` make the geometry 3D (``_shape``).
+    ``alpha`` is the opacity (0-1, default DEFAULT_ALPHA; transparency = 1 - alpha)."""
     try:
         _check_user(user_id)
+        renamed_from = None
+        if not valid_name(name) and valid_name(safe_name(name)):
+            renamed_from, name = name, safe_name(name)  # e.g. an umlaut: save instead of failing
         if not valid_name(name):
             raise ValueError(f"invalid name {name!r}: letters, digits, _ (no spaces), max 64")
         color = color if isinstance(color, str) and _COLOR_RE.match(color) else DEFAULT_COLOR
+        alpha = DEFAULT_ALPHA if alpha is None else _check_alpha(alpha)
         inner = _inner_sql(sql)
         blocked = guard_sql(inner)
         if blocked:
@@ -518,6 +579,17 @@ def save_item(user_id: str, name: str, sql: str, *, label: str | None = None,
         if not probe:
             raise ValueError("the query returned no rows, nothing to save")
         columns = set(probe[0])
+        notes = []
+        if "label" in columns:
+            # A computed label (height, distance) wins: it matches the saved geometry.
+            rows = qdb.execute(f"SELECT string_agg(DISTINCT q.label::text, ', ') AS label, "
+                               f"count(DISTINCT q.label) AS labels FROM ({inner}) q", settings=settings)
+            computed = rows[0].get("label") if rows else None
+            if computed:
+                label = computed[:200]
+            if rows and int(rows[0].get("labels") or 0) > 1:
+                notes.append(f"{rows[0]['labels']} different labels were joined into one item label; "
+                             "for one label each, save one item per row (one call each)")
         if "geom" in columns:
             row = qdb.execute(_GEOM_SQL.format(inner=inner), settings=settings)[0]
             if not row.get("ewkb"):
@@ -527,6 +599,9 @@ def save_item(user_id: str, name: str, sql: str, *, label: str | None = None,
                                          height_m=height_m, extrude_m=extrude_m, base_z=base_z,
                                          sphere_r=size_m)
             _check_vertices(meta)
+            if cls in FLAT_CLASSES and (row.get("ndims") or 2) > 2 and not clamp:
+                notes.append(f"class {cls} is 2D: the heights of the SELECT were dropped"
+                             + (" (use 3Dmarker to keep them)" if cls == "2Dmarker" else ""))
             kind, ewkb, ids, count = "geometry", meta["shape_ewkb"], None, int(row.get("n") or 1)
             detail = type_label(meta)
         elif "objectid" in columns:
@@ -552,9 +627,19 @@ def save_item(user_id: str, name: str, sql: str, *, label: str | None = None,
         if isinstance(size_m, (int, float)) and size_m > 0:
             data["size_m"] = float(size_m)  # sphere radius / pipe radius in the viewer
         wdb.execute(_pg_sql.SQL(_UPSERT_SQL).format(schema=schema),
-                    (user_id, name, label, kind, cls, color, bool(clamp), ewkb, ewkb, ids, json.dumps(data)))
+                    (user_id, name, label, kind, cls, color, bool(clamp), ewkb, ewkb, ids, json.dumps(data),
+                     alpha))
         _audit("save", user_id, name=name, kind=kind, **{"class": cls}, count=count, geometry_type=detail)
-        return {"ok": True, "name": name, "kind": kind, "class": cls, "count": count, "type": detail}
+        out = {"ok": True, "name": name, "kind": kind, "class": cls, "count": count, "type": detail}
+        if alpha != DEFAULT_ALPHA:
+            out["alpha"] = alpha
+        if label:
+            out["label"] = label
+        if renamed_from:
+            notes.insert(0, f"name {renamed_from!r} is not allowed (letters, digits, _); saved as {name!r}")
+        if notes:
+            out["note"] = "; ".join(notes)
+        return out
     except Exception as exc:
         return {"ok": False, "name": name, "error": str(exc)}
 
@@ -624,9 +709,7 @@ def update_item(user_id: str, name: str, *, label=None, color=None, alpha=None, 
                 raise ValueError("color must be #rrggbb")
             sets.append("color = %s"); params.append(color); changed["color"] = color
         if alpha is not None:
-            alpha = float(alpha)
-            if not 0 <= alpha <= 1:
-                raise ValueError("alpha must be between 0 and 1")
+            alpha = _check_alpha(alpha)
             sets.append("alpha = %s"); params.append(alpha); changed["alpha"] = alpha
         if size_m is not None:
             size_m = float(size_m)
@@ -769,12 +852,16 @@ def _parse_file(payload) -> dict:
             raise ValueError(f"file too large (max {MAX_IMPORT_BYTES // (1024 * 1024)} MB)")
         try:
             payload = json.loads(payload)
-        except (json.JSONDecodeError, RecursionError) as exc:
-            raise ValueError(f"not a JSON file: {exc}") from exc
+        except (json.JSONDecodeError, RecursionError):
+            raise ValueError("this is not a JSON file; only files exported from this list "
+                             "can be imported") from None
     if not isinstance(payload, dict):
-        raise ValueError("not a scratchpad file (expected a JSON object)")
+        raise ValueError("not a scratchpad export file (expected a JSON object)")
     if payload.get("format") != FILE_FORMAT:
-        raise ValueError(f"not a scratchpad file (format must be {FILE_FORMAT!r})")
+        if payload.get("type") in ("FeatureCollection", "Feature", "GeometryCollection"):
+            raise ValueError("this is a GeoJSON file; only scratchpad export files can be imported "
+                             "(to add GeoJSON, paste it into the chat)")
+        raise ValueError("not a scratchpad export file (it was not exported from this list)")
     if payload.get("version") != FILE_VERSION:
         raise ValueError(f"unsupported file version {payload.get('version')!r} (supported: {FILE_VERSION})")
     srid = payload.get("srid")
@@ -1062,33 +1149,37 @@ _HEIGHT_PROPS = {
 TOOL_SCHEMAS = {
     "save_to_scratchpad": {
         "description": (
-            "Save a result under a name in the user's personal scratchpad (shown in the 3D viewer "
-            "when there is one, and reusable in later SQL through the view my_scratchpad). Give "
-            "EITHER `sql`: a read-only SELECT returning an `objectid` column (saved as a set of "
-            "features, e.g. buildings) or a `geom` column (saved as one geometry: point, line, "
-            "polygon, solid; several rows are combined), OR `geojson`: a GeoJSON geometry, Feature "
-            "or FeatureCollection in WGS84 lon/lat (e.g. points the user pasted). Saving an "
-            "existing name replaces it. Returns whether it was saved, how many objects and the "
-            "stored geometry type (\"Z\" = with heights). A 3D bounding box is "
-            "`ST_3DExtent(...) AS geom` (stored as a closed box, Solid3D), a 2D one "
-            "`ST_Extent(...) AS geom` (ST_MakeEnvelope is 2D only). height_m / extrude_m make "
-            "a 2D geometry 3D."
+            "Create an item in the user's scratchpad: it is stored and drawn in the 3D viewer, and "
+            "reusable in later SQL through the view my_scratchpad. This is the tool that DRAWS: "
+            "PostGIS computes the geometry inside `sql` (a SELECT the tool runs itself), so put the "
+            "whole computation (hull, buffer, line, points, marker position, ...) in that SELECT; "
+            "run_query only looks things up. `sql` returns EITHER an `objectid` column (a group of "
+            "city objects, e.g. buildings, coloured in the viewer) OR a `geom` column (one geometry "
+            "item: point, line, polygon, solid; several rows are collected into one item); an optional "
+            "`label` column sets the label from a computed value (height, distance). One "
+            "item has one name, colour, alpha and label, so N groups or N labels need N calls. "
+            "Instead of sql, `geojson` takes a GeoJSON geometry/Feature/FeatureCollection in WGS84 "
+            "lon/lat. Saving an existing name replaces it. Returns ok, count and the stored type "
+            "(\"Z\" = with heights)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description":
-                         "Identifier: letters, digits, underscore, no spaces, e.g. affected_2013."},
+                         "Identifier: letters, digits, underscore, no spaces, e.g. energy_class_A."},
                 "sql": {"type": "string", "description":
-                        "SELECT returning objectid rows or a geom column (not both needed)."},
+                        "SELECT returning objectid rows (a group) or a geom column (a geometry)."},
                 "geojson": {"description": "GeoJSON (object or string) instead of sql."},
-                "label": {"type": "string", "description": "Text shown on the map (optional)."},
+                "label": {"type": "string", "description": "Text shown on the map, e.g. '32.2 m' (optional)."},
                 "color": {"type": "string", "description": "Colour as #rrggbb (optional)."},
+                "alpha": {"type": "number", "description":
+                          "Opacity 0-1 (optional, default 0.8). Transparency = 1 - alpha: "
+                          "50 % transparent -> 0.5, 30 % transparent -> 0.7."},
                 "clamp": {"type": "boolean", "description":
                           "true = drape a 2D shape on the terrain (optional)."},
                 "class": {"type": "string", "enum": list(GEOMETRY_CLASSES), "description":
                           "How to draw a geometry (optional, derived from the geometry "
-                          "otherwise): 2Dmarker/3Dmarker = pin with label, Point3D = sphere, "
+                          "otherwise): 2Dmarker/3Dmarker = pin with label, Point3D = sphere(s), "
                           "LineString3D = pipe, Solid3D = closed solid, ..."},
                 "size_m": {"type": "number", "description":
                            "Radius in metres for Point3D spheres and LineString3D pipes (optional)."},
@@ -1116,7 +1207,8 @@ TOOL_SCHEMAS = {
     },
     "update_scratchpad_item": {
         "description": (
-            "Change a saved item in place: label, color, alpha (opacity 0-1), class, size_m "
+            "Change a saved item in place: label, color, alpha (opacity 0-1; transparency = "
+            "1 - alpha), class, size_m "
             "(sphere/pipe radius), clamp, and its height. Only the given fields change. To give "
             "an item a height or make an area a solid use height_m / extrude_m: the stored "
             "geometry is converted and the class follows (2Dmarker -> 3Dmarker, Polygon2D -> "
@@ -1129,7 +1221,8 @@ TOOL_SCHEMAS = {
                 "name": {"type": "string"},
                 "label": {"type": "string", "description": "New map text; empty removes it."},
                 "color": {"type": "string", "description": "#rrggbb"},
-                "alpha": {"type": "number", "description": "Opacity of areas and solids, 0-1."},
+                "alpha": {"type": "number", "description":
+                          "Opacity 0-1; transparency = 1 - alpha (30 % transparent -> 0.7)."},
                 "class": {"type": "string", "enum": list(GEOMETRY_CLASSES)},
                 "size_m": {"type": "number"},
                 "clamp": {"type": "boolean"},
@@ -1239,6 +1332,7 @@ def run_tool(name: str, arguments: dict, ctx_user_id=None) -> dict:
             return {"scratchpad": {"ok": False, "name": args.get("name"), "error": str(exc)}}
         return {"scratchpad": save_item(user_id, str(args.get("name") or ""), query,
                                         label=args.get("label"), color=args.get("color"),
+                                        alpha=None if args.get("alpha") in (None, "") else args.get("alpha"),
                                         clamp=clamp, item_class=args.get("class"), **numbers)}
     if name == "scratchpad_action":
         names = args.get("names")

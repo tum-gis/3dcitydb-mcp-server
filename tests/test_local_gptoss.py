@@ -107,6 +107,61 @@ def test_recover_case_insensitive_tool_name() -> None:
     assert result.tool == "run_query"
 
 
+def test_namespaced_extra_tool_name_is_recovered() -> None:
+    """gpt-oss sometimes calls "functions.save_to_scratchpad"; the extra tool still runs."""
+    cb = _StubCallback()
+    p = _RobustReActParser(cb, tool_names={"run_query", "save_to_scratchpad", "list_scratchpad"})
+    args = {"name": "hull", "sql": "SELECT 1 AS geom", "alpha": 0.5}
+    result = p.parse_result(
+        [_gen("", [{"name": "functions.save_to_scratchpad", "args": args, "id": "call_ns"}])]
+    )
+    assert isinstance(result, AgentAction)
+    assert result.tool == "save_to_scratchpad"
+    assert json.loads(result.tool_input) == args
+    # run_query keeps its SQL path even with the prefix
+    result = p.parse_result(
+        [_gen("", [{"name": "functions.run_query", "args": {"sql": SQL}, "id": "call_ns2"}])]
+    )
+    assert isinstance(result, AgentAction) and result.tool == "run_query"
+    assert result.tool_input.startswith("SELECT")
+
+
+def test_native_tool_call_after_a_tool_ran_is_recovered() -> None:
+    """gpt-oss: run_query, then planning prose + a native save_to_scratchpad call.
+    The call runs (it was dropped before, and the plan became the answer); SQL
+    quoted in prose after a tool ran is still not recovered."""
+    cb = _StubCallback()
+    cb._tools_called = 1
+    p = _RobustReActParser(cb, tool_names={"run_query", "save_to_scratchpad"})
+    args = {"name": "energy_class_A", "sql": "SELECT b.objectid FROM feature b", "color": "#16a34a"}
+    result = p.parse_result([_gen("8 distinct classes, need 8 save_to_scratchpad calls.",
+                                  [{"name": "save_to_scratchpad", "args": args, "id": "c1"}])])
+    assert isinstance(result, AgentAction) and result.tool == "save_to_scratchpad"
+    assert json.loads(result.tool_input) == args
+    result = p.parse_result([_gen("", [{"name": "run_query", "args": {"sql": SQL}, "id": "c2"}])])
+    assert isinstance(result, AgentAction) and result.tool == "run_query"
+    try:
+        result = p.parse_result([_gen("Now I would run SELECT 1 AS x FROM feature to check.")])
+    except OutputParserException:
+        result = None
+    assert not isinstance(result, AgentAction)
+
+
+def test_echoed_actions_keep_the_extra_tool_name() -> None:
+    """gpt-oss plans in text ("Action: save_to_scratchpad / Action Input: {...} for each
+    class") before the real block; trimming to the last block must keep its Action line,
+    otherwise the save JSON (it has a "sql" key) was routed to run_query."""
+    cb = _StubCallback()
+    cb._tools_called = 1
+    p = _RobustReActParser(cb, tool_names={"run_query", "save_to_scratchpad"})
+    text = ("We'll output: Action: save_to_scratchpad / Action Input: { ... } for each class.\n"
+            "Action: save_to_scratchpad\n"
+            'Action Input: {"name": "energy_H", "sql": "SELECT b.objectid FROM feature b", "color": "#e11d48"}\n')
+    result = p.parse(text)
+    assert isinstance(result, AgentAction) and result.tool == "save_to_scratchpad"
+    assert json.loads(result.tool_input)["name"] == "energy_H"
+
+
 def test_non_sql_tool_call_falls_through() -> None:
     """Empty content + non-SQL tool_call → stock empty-output strike 1."""
     p, cb = _parser()
@@ -276,6 +331,9 @@ def main() -> None:
         test_recover_json_string_args,
         test_recover_query_key,
         test_recover_case_insensitive_tool_name,
+        test_namespaced_extra_tool_name_is_recovered,
+        test_native_tool_call_after_a_tool_ran_is_recovered,
+        test_echoed_actions_keep_the_extra_tool_name,
         test_non_sql_tool_call_falls_through,
         test_wrong_tool_name_ignored,
         test_no_tool_calls_unchanged,
