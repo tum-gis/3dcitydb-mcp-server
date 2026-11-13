@@ -24,7 +24,18 @@
               exportTip: "Download all your items as a JSON file",
               importTip: "Add items from a JSON file exported here (same names are replaced)",
               tooLarge: "File too large (max 5 MB)", readError: "Could not read the file",
+              notJson: "Only .json files exported from this list can be imported",
               importing: "Importing ..." };
+    // Small line icons (Lucide-style) for the header buttons: arrow out of a
+    // tray = export (download), arrow into a tray = import (upload).
+    var ICON_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+        'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">';
+    var ICONS = {
+        importBtn: ICON_SVG + '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>' +
+                   '<polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>',
+        exportBtn: ICON_SVG + '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>' +
+                   '<polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+    };
     var MAX_IMPORT_BYTES = 5 * 1024 * 1024;
     var NOTICE_MS = 10000;
     var HIGHLIGHT = Cesium.Color.fromCssColorString("#ff5a00");
@@ -420,6 +431,8 @@
             var file = input.files && input.files[0];
             input.remove();
             if (!file) return;
+            // The file dialog's filter is only a suggestion ("All files" bypasses it).
+            if (!/\.json$/i.test(file.name || "")) { showNotice({ text: T.notJson, error: true }); return; }
             if (file.size > MAX_IMPORT_BYTES) { showNotice({ text: T.tooLarge, error: true }); return; }
             var reader = new FileReader();
             reader.onload = function () {
@@ -477,15 +490,19 @@
             try { localStorage.setItem(COLLAPSED_KEY, collapsed ? "1" : "0"); } catch (e) { /* no storage */ }
             updateCollapsed();
         };
-        [["[data-import]", T.importBtn, T.importTip, pickImportFile],
-         ["[data-export]", T.exportBtn, T.exportTip, function () { post("export"); }]].forEach(function (b) {
+        [["[data-import]", ICONS.importBtn, T.importBtn, T.importTip, pickImportFile],
+         ["[data-export]", ICONS.exportBtn, T.exportBtn, T.exportTip, function () { post("export"); }]
+        ].forEach(function (b) {
             var el = panel.querySelector(b[0]);
-            el.textContent = b[1];
-            el.title = b[2];
-            el.style.cssText = "background:rgba(148,163,184,.18);border:1px solid #475569;color:#e2e8f0;" +
-                "cursor:pointer;border-radius:4px;padding:0 5px;font:11px/1.5 sans-serif";
+            el.innerHTML = b[1];  // fixed markup from ICONS above, never data
+            el.title = b[2] + ": " + b[3];
+            el.setAttribute("aria-label", b[2]);
+            el.style.cssText = "background:none;border:0;color:#cbd5e1;cursor:pointer;padding:0 3px;" +
+                "display:inline-flex;align-items:center;line-height:0";
+            el.onmouseenter = function () { el.style.color = "#f8fafc"; };
+            el.onmouseleave = function () { el.style.color = "#cbd5e1"; };
             // a click on a button must not collapse/expand the list
-            el.onclick = function (ev) { ev.stopPropagation(); b[3](); };
+            el.onclick = function (ev) { ev.stopPropagation(); b[4](); };
         });
         updateCollapsed();
         (document.getElementById("cesiumContainer") || document.body).appendChild(panel);

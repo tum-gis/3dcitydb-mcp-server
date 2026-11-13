@@ -149,8 +149,8 @@ def test_export_needs_a_valid_user():
 @pytest.mark.parametrize("payload,error", [
     ("not json", "not a JSON file"),
     ("[]", "expected a JSON object"),
-    (json.dumps({"format": "geojson", "version": 1, "items": []}), "format"),
-    (json.dumps({"type": "FeatureCollection", "features": []}), "format"),
+    (json.dumps({"format": "geojson", "version": 1, "items": []}), "not a scratchpad export file"),
+    (json.dumps({"type": "FeatureCollection", "features": []}), "this is a GeoJSON file"),
     (json.dumps({"format": "3dcitydb-scratchpad", "version": 2, "items": []}), "version"),
     (json.dumps({"format": "3dcitydb-scratchpad", "version": 1}), "item list"),
     (json.dumps({"format": "3dcitydb-scratchpad", "version": 1, "srid": "x", "items": []}), "srid"),
