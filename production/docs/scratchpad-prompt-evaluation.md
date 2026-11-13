@@ -1,6 +1,6 @@
 # Scratchpad prompt evaluation
 
-This evaluation measures how local models handle requests to create, draw, group or colour items in the scratchpad: the old prompt (baseline), two fix rounds, and a final round in English and German. It ran on 2026-11-13 against the Harthof data. Each cell is a single run, so read the results as indications, not statistics. The first attempt was set up for the wrong database (`citydb`, LDBV data), but nothing ran there; every run below used `harthof`.
+This evaluation measures how local models handle requests to create, draw, group or colour items in the scratchpad: the old prompt (baseline), two fix rounds, and a final round in English and German, then evening rounds over the native tool-call API with more changes (see "Evening rounds"). It ran on 2026-11-13 against the Harthof data. Each cell is a single run, so read the results as indications, not statistics. The first attempt was set up for the wrong database (`citydb`, LDBV data), but nothing ran there; every run below used `harthof`.
 
 ## Setup
 
@@ -139,8 +139,9 @@ No run triggered the `_class_mismatch` hint.
 
 ### Control questions
 
-None of the 11 sessions created an item for C1 or C2. Both questions match the broad intent pattern,
-so both got the save reminder after their run_query.
+None of the 11 sessions created an item for C1 or C2. Both questions matched the broad intent pattern
+then, so both got the save reminder after their run_query; since the evening rounds they no longer do
+(change 11).
 
 ### Failure types
 
@@ -154,6 +155,50 @@ so both got the save reminder after their run_query.
 | wrong dimension 2D/3D, CG_3DAlphaWrapping for 2D | none |
 | ignored colour/transparency | none with the new prompt (baseline qwen Q6/Q7) |
 | false save on a control question | none |
+
+## Evening rounds: native tool calls, one call for many items, guards
+
+Same questions, same database, same grading. Native = `--provider openai --base-url
+<OLLAMA_BASE_URL>/v1` with `OPENAI_API_KEY=ollama` (Ollama's OpenAI-compatible endpoint, cloud
+backend with LiteLLM tool calls, see `.env.example`); ReAct = `--provider ollama` as above.
+
+| Model, language, backend | Final (afternoon) | Native, before the fixes | Round 2 | Round 3 | Round 4 |
+|---|---|---|---|---|---|
+| gpt-oss:20b EN, native | – | 3 + 2◐ | 5 + 2◐ | 8 / 8 ¹ | **7 / 8** (5 min) |
+| gpt-oss:20b DE, native | – | 3 + 3◐ | 7 / 8 | 6 + 1◐ | **7 / 8** (5 min) |
+| gpt-oss:20b EN, ReAct | 2 + 3◐ | – | 5 + 1◐ | 4 / 8 | – |
+| gpt-oss:120b EN, native | 3 + 2◐ (ReAct) | 5 + 2◐ (10 min) | **8 / 8** (47 min ²) | – | – |
+| qwen3.6:27b EN, ReAct | 7 / 8 | – | 7 + 1◐ | – | – |
+| granite4.2:30b EN, native | – | – | 3 / 3, then timeout ³ | 6 + 2◐ (48 min) | – |
+
+¹ All answers but the control questions in German; Q5 saved correctly but answered "could not be
+created". ² Ran in parallel with qwen on the same GPU. ³ `LITELLM_TIMEOUT` default 120 s; round 3
+used 600 s as in `.env.example`.
+
+Round 2 = the changes 6 to 10 below; round 3 = plus the fixes from round 2; round 4 = plus the
+fixes from round 3. A last check of Q4+Q5 only (gpt-oss:20b native, after the recipe 6 change): EN 5
+correct lines (37.0/45.3/38.1/42.2/39.6 m) after a first wrong set of 4; DE markers at z = height
+(28 m instead of 528 m), which is now refused (change 13).
+
+Per question in round 4 (gpt-oss:20b native): Q1 8 groups in one call (EN: E–H the same red), Q2
+convex hull, red, 0.5, Q3 Point3D 14 / 51 points, Q4 5 × 3Dmarker with the reference labels, Q6
+444,957 m² **2D**, Q7 451,749 m² **2D**, Q8 9 rings z 499.2–522.3, orange. Q5 failed in both: EN 4
+lines to the marker's own building (0.1–2.9 m); DE claimed 5 lines, none saved (the turn had re-saved
+the markers, so the claim guard saw a save). C1/C2 created no item in any evening run.
+
+Failures seen in the evening rounds and what was done about them:
+
+| Failure | Where | Change |
+|---|---|---|
+| ReAct crash "unsupported early_stopping_method `generate`" at the iteration limit | gpt-oss:20b ReAct round 2, C2 | 11 |
+| Save reminder on C1/C2 ("points", "colours" matched the intent pattern), the model looped | gpt-oss:20b ReAct round 2 | 11 |
+| Line of length 0 with the right distance label | qwen round 2, Q5 | 12 |
+| English questions answered in German | gpt-oss:20b native rounds 2 and 3 | 11, 12 |
+| "Could not be created" after all items were saved (iteration limit) | gpt-oss:20b native round 3, Q5 | 12 |
+| Own building taken as the nearest one | gpt-oss:20b native round 4, Q5 | 13 |
+| Markers at z = relative height | gpt-oss:20b DE, Q4 check | 13 |
+| Ollama "error parsing tool call" (invalid JSON from the model) | gpt-oss:20b ReAct round 3, Q4 | none; native API recommended |
+| Floor rings shifted one storey up (z 502–525) | gpt-oss:20b DE round 3, granite round 3 | none |
 
 ## What changed and why
 
@@ -192,28 +237,47 @@ into the answer instead of calling the tool. The following changes came out of t
    flat class on a SELECT with heights says that the heights were dropped ("use 3Dmarker to keep
    them"). gpt-oss:120b reacted to the first note in Q4 with a per-row save.
 
-Tests: 455 passed, 1 failed (the known
+Evening (rounds 2 to 4):
+
+6. **One call for many items** (`item_name` column, `_save_groups`). Q1, Q4 and Q5 needed five to
+   eight saves; the models stopped after the first or hit the iteration limit. Now every distinct
+   `item_name` becomes its own item with its own label and colour, in one call.
+7. **Helper views** `building_solid` and `building_footprint` created by `provision()`. The recipes
+   use them instead of the four-table joins that the weaker models got wrong.
+8. **Shorter prompt with routed recipes.** The save reminder repeats the one or two recipes whose
+   trigger matches the question, right where the model writes the save call.
+9. **Claim and empty-reply guards** in both backends, once per turn each.
+10. **Bugs**: log lines on stdout corrupted the stdio MCP stream (now stderr); the query role's
+    password depended on the database name although the role is per server, so a second database
+    could not log in (now derived from user and password only, re-provisioned once on failure); an
+    empty gpt-oss reply over the native API ended the turn with an error (now retried once).
+11. After round 2: `early_stopping_method="force"` (LangChain no longer supports "generate");
+    "colour/Farbe/points/Punkte" removed from the intent pattern; the language rule is also sent
+    after scratchpad results in the cloud backend, and the German example verbs left the prompt.
+12. After round 3: a zero-length line is refused; a once-per-turn **language guard**
+    (`wrong_language_nudge`, both backends); at the iteration limit the cloud backend names the items
+    saved in the turn; "shown/angezeigt/dargestellt" count as claims; the local guards send their
+    message to the model as the Observation (`send_to_llm`), not only to the log.
+13. After round 4: recipe 6 excludes the marker's own building by its 2D envelope (the name-based
+    exclusion was rewritten wrongly); a 3D item more than 100 m below the city objects around it is
+    refused with a hint to take Z from the geometry.
+
+Tests: 488 passed, 1 deselected (the known
 `test_codelists.py::TestCodelistStructure::test_de_function_and_usage_identical`).
 
 ## Remaining failures and proposed changes
 
-- **Claimed saves (all three models).** The answer says an item was created when no
-  `save_to_scratchpad` call succeeded in that turn (qwen EN Q4 once in four sessions; several times
-  for gpt-oss).
-
-  Proposed guard in the local backend: for a question with scratchpad intent, refuse one Final
-  Answer that claims "created/saved/erstellt" while no scratchpad tool call returned `ok` in the
-  turn. Reply once: "no item was saved yet: call save_to_scratchpad, or say that it failed". It
-  should fire only once, like the existing tool-call guard, so that it cannot loop. The control
-  questions would not be affected, since their answers do not claim a save.
-- **gpt-oss (20b and 120b) fails the multi-step questions:** wrong or placeholder SQL, giving up after
-  one tool error, output loops, and code or invalid JSON as tool input. These are model-quality
-  limits; the prompt does not fix them. qwen3.6:27b is the model to recommend for scratchpad work.
-- **Many saves in one turn hit the iteration limit** (Q1 with 8 classes plus lookups, on gpt-oss).
-  Option: count successful scratchpad saves at half weight toward `AGENT_MAX_ITERATIONS`, or raise
-  the limit for questions with scratchpad intent.
-- **gpt-oss answers English questions in German.** This is in the existing language-reminder path,
-  and it is independent of the scratchpad.
+- **Claimed saves.** Guarded since the evening rounds (change 9), once per turn. The guard only
+  sees whether *any* save succeeded in the turn, so a turn that re-saves something else and then
+  claims the requested item passes (gpt-oss:20b DE round 4, Q5).
+- **gpt-oss:20b over ReAct** still fails multi-step questions (invalid tool-call JSON from Ollama,
+  claimed saves). Over the native API it reaches 7/8 in both languages in about 5 minutes per
+  session; use the native API for gpt-oss (`.env.example`). qwen3.6:27b works with both.
+- **Many saves in one turn hit the iteration limit:** solved by `item_name` (one call).
+- **gpt-oss answers English questions in German:** guarded since round 4 (change 12); all English
+  answers of round 4 were English.
+- **Floor rings one storey too high** (generate_series(1, n) instead of (0, n - 1)) in two runs; the
+  recipe has the right range. Not guarded.
 - **Q3 class:** a point set is drawn as Point3D spheres (recipe 4) or as 3Dmarker pins. Both are
   acceptable; no change.
 - **Q2:** no real 3D alpha wrapping is possible on this server (PostGIS was built against SFCGAL 2.0).

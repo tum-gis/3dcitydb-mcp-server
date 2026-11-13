@@ -219,6 +219,26 @@ def _format_activity(events: list[tuple[str, object]]) -> str:
     return "\n\n".join(lines)
 
 
+_scratchpad_provisioned = False
+
+
+def _provision_scratchpad_once(stderr) -> None:
+    """Table, view, helper views and query role, as the web UI does at start
+    (idempotent; the console may run against a database the UI never set up)."""
+    global _scratchpad_provisioned
+    if _scratchpad_provisioned:
+        return
+    _scratchpad_provisioned = True
+    try:
+        from citydb_mcp.tools import scratchpad
+
+        result = scratchpad.provision()
+        if result.get("error"):
+            print(f"Scratchpad setup: {result['error']}", file=stderr)
+    except Exception as exc:
+        print(f"Scratchpad setup failed: {exc}", file=stderr)
+
+
 @dataclass
 class ChatConsole:
     """Maintain one CLI conversation while sharing the production chat runtime."""
@@ -272,8 +292,11 @@ class ChatConsole:
                 return run_tool_sync(name, args, stderr=self.stderr, ctx=self.tool_ctx())
             return run
 
+        specs = scratchpad_tool_specs()
+        if specs:
+            _provision_scratchpad_once(self.stderr)
         return {spec["function"]["name"]: {"spec": spec, "run": tool(spec["function"]["name"])}
-                for spec in scratchpad_tool_specs()}
+                for spec in specs}
 
     def close(self) -> None:
         """Remove the items of a generated scratchpad user (not of a given one)."""

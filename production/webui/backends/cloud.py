@@ -5,6 +5,8 @@ import time as _time
 from typing import Callable, Generator
 
 from webui.session import TurnControl
+from webui.llm_utils import (EMPTY_REPLY_NUDGE, SAVE_CLAIM_NUDGE, claims_unsaved_item,
+                              no_answer_text, scratch_saved_names, wrong_language_nudge)
 from webui.llm_utils import (long_result_note, scratch_save_reminder, scratch_tool_hint,
                               scratch_tool_result, wants_scratchpad)
 from webui.llm_utils import (
@@ -103,6 +105,13 @@ def native_tool_stream(
     # Track content from a previous iteration to detect redundant tool calls.
     _cached_content: str = ""
     _last_tool_sql: str = ""
+    # Scratchpad items saved in this turn, and the one-shot guards (each may
+    # fire once, so they cannot loop): an empty reply, and an answer that
+    # claims an item although no save succeeded.
+    _saved: list[str] = []
+    _empty_retry_used = False
+    _claim_guard_used = False
+    _language_guard_used = False  # wrong_language_nudge sent (once per turn)
 
     for iteration in range(MAX_ITERATIONS):
         if turn.stopped():
@@ -233,8 +242,24 @@ def native_tool_stream(
 
             # Pure text — final answer
             if content:
-                print("[cloud] final text response", flush=True)
                 visible, tagged_reasoning = _strip_reasoning_tags(content)
+                if (extra_tools and not _claim_guard_used
+                        and claims_unsaved_item(_last_user_q, visible, _saved)):
+                    _claim_guard_used = True
+                    force_text_response = False
+                    print("[cloud] answer claims an unsaved item — asking once more", flush=True)
+                    working_messages.append({"role": "assistant", "content": content})
+                    working_messages.append({"role": "user", "content": SAVE_CLAIM_NUDGE})
+                    continue
+                lang_nudge = "" if _language_guard_used else wrong_language_nudge(_last_user_q, visible)
+                if lang_nudge:
+                    _language_guard_used = True
+                    force_text_response = True
+                    print("[cloud] answer is in another language — asking for a rewrite", flush=True)
+                    working_messages.append({"role": "assistant", "content": content})
+                    working_messages.append({"role": "user", "content": lang_nudge})
+                    continue
+                print("[cloud] final text response", flush=True)
                 if tagged_reasoning:
                     reasoning = _merge_reasoning(reasoning, tagged_reasoning)
                 if reasoning:
@@ -242,8 +267,13 @@ def native_tool_stream(
                 final_text = _post_process_markdown(visible)
                 if final_text:
                     yield ("final", final_text)
-            else:
-                print("[cloud] WARNING: empty response (no text, no tool calls)", flush=True)
+                    return
+            print("[cloud] WARNING: empty response (no text, no tool calls)", flush=True)
+            if not _empty_retry_used:
+                _empty_retry_used = True
+                working_messages.append({"role": "user", "content": EMPTY_REPLY_NUDGE})
+                continue
+            yield ("final", no_answer_text(_saved))
             return
 
         # Append assistant message (with tool_calls) to history
@@ -287,11 +317,16 @@ def native_tool_stream(
                 except Exception as exc:
                     raw_result = json.dumps({"error": str(exc)})
                 result_data = scratch_tool_result(raw_result)
+                _saved.extend(scratch_saved_names(raw_result))
                 last_error = result_data.get("error") or ""
                 last_had_error = bool(last_error)
                 print(f"[cloud] {tool_name} result → {raw_result[:300]}", flush=True)
                 yield ("tool_result", {**result_data, "tool": tool_name, "iteration": iteration})
                 hint = scratch_tool_hint(result_data)
+                # The answer usually follows this result, not a run_query result, so it
+                # needs the language rule too (gpt-oss answered English questions in German).
+                hint += (f"\nThe user's question was:\n\"\"\"\n{_last_user_q}\n\"\"\"\n"
+                         "Reply in EXACTLY the same language as that question.")
                 working_messages.append({"role": "tool", "tool_call_id": tc.id,
                                          "content": _truncate_result(raw_result) + "\n" + hint})
                 continue
@@ -413,15 +448,20 @@ def native_tool_stream(
 
     # All iterations exhausted — compose a graceful failure message.
     error_hint = f" Last error: {last_error}." if last_error else ""
+    if _saved:
+        # gpt-oss saved all five Q5 lines, kept calling tools and then apologised
+        # that nothing could be retrieved (evaluation round 3).
+        give_up = (f"The step limit is reached. These scratchpad items WERE saved in this turn: "
+                   f"{', '.join(_saved)}. Tell the user briefly what was saved and, if something "
+                   f"is missing, what. Do NOT include any SQL.")
+    else:
+        give_up = (f"You have tried {MAX_ITERATIONS} SQL queries but none returned usable results."
+                   f"{error_hint} Briefly apologise, explain that the data could not be retrieved, "
+                   f"and suggest they try rephrasing or verify the data exists. Do NOT include any SQL.")
     working_messages.append({
         "role": "user",
-        "content": (
-            f"You have tried {MAX_ITERATIONS} SQL queries but none returned usable results."
-            f"{error_hint} "
-            f"Respond in the SAME LANGUAGE the user used in their original question. "
-            f"Briefly apologise, explain that the data could not be retrieved, and suggest "
-            f"they try rephrasing or verify the data exists. Do NOT include any SQL."
-        ),
+        "content": (f"{give_up}\nThe user's question was:\n\"\"\"\n{_last_user_q}\n\"\"\"\n"
+                    f"Respond in the SAME LANGUAGE as that question."),
     })
     _fut_fail = _executor.submit(
         safe_completion,

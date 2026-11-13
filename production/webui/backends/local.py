@@ -24,6 +24,8 @@ from langchain.agents.output_parsers import ReActSingleInputOutputParser
 
 from webui.session import TurnControl
 from webui.llm_utils import long_result_note, scratch_save_reminder, scratch_tool_hint, scratch_tool_result
+from webui.llm_utils import (SAVE_CLAIM_NUDGE, claims_unsaved_item, scratch_saved_names,
+                              wrong_language_nudge)
 from webui.llm_utils import (
     MAX_ITERATIONS,
     _log_context_usage,
@@ -239,6 +241,9 @@ class _EventCallback(BaseCallbackHandler):
         self._iteration = 0
         self._tools_called = 0
         self._parse_errors = 0  # counts _require_tool_call failures to break the retry loop
+        self.saved_names: list[str] = []  # scratchpad items saved in this turn
+        self._claim_guard_used = False  # _check_save_claim fired (once per turn)
+        self._language_guard_used = False  # _check_language fired (once per turn)
         # Consecutive unparseable LLM responses WITHOUT a successful tool
         # execution in between (see _RobustReActParser._record_parse_failure).
         # A model that keeps emitting an unparseable action (e.g. granite4.2's
@@ -902,7 +907,43 @@ class _RobustReActParser(ReActSingleInputOutputParser):
         # out of AgentExecutor (same path as the parse-loop breaker).
         if isinstance(result, AgentAction):
             self._check_repetition(result)
+        elif isinstance(result, AgentFinish):
+            self._check_save_claim(result)
+            self._check_language(result)
         return result
+
+    @staticmethod
+    def _correction(message: str, finish: AgentFinish) -> OutputParserException:
+        """A parser error whose message reaches the model as the Observation
+        (without send_to_llm, AgentExecutor sends "Invalid or incomplete response")."""
+        return OutputParserException(message, observation=message, llm_output=finish.log or "",
+                                     send_to_llm=True)
+
+    def _check_save_claim(self, finish: AgentFinish) -> None:
+        """Send one correction if the answer reports a scratchpad item although
+        no save succeeded in this turn (once per turn, so it cannot loop)."""
+        if (len(self._tool_names) < 2 or getattr(self._cb, "_claim_guard_used", False)
+                or not claims_unsaved_item(self._user_question,
+                                           str(finish.return_values.get("output", "")),
+                                           getattr(self._cb, "saved_names", []))):
+            return
+        self._cb._claim_guard_used = True
+        print("[local] answer claims an unsaved item — asking once more", flush=True)
+        raise self._correction(
+            SAVE_CLAIM_NUDGE + "\nUse this format:\nAction: save_to_scratchpad\n"
+            'Action Input: {"name": "...", "sql": "SELECT ..."}', finish)
+
+    def _check_language(self, finish: AgentFinish) -> None:
+        """Ask once for a rewrite when the Final Answer is clearly in another
+        language (English/German) than the user's question."""
+        if getattr(self._cb, "_language_guard_used", False):
+            return
+        nudge = wrong_language_nudge(self._user_question, str(finish.return_values.get("output", "")))
+        if not nudge:
+            return
+        self._cb._language_guard_used = True
+        print("[local] answer is in another language — asking for a rewrite", flush=True)
+        raise self._correction(nudge + "\nUse this format:\nFinal Answer: ...", finish)
 
     def _parse_impl(self, text: str) -> AgentAction | AgentFinish:
         # Strip <think>/<thought>/... blocks before any parsing so the standard
@@ -1310,6 +1351,7 @@ def react_stream(
             except Exception as exc:
                 raw = json.dumps({"error": str(exc)})
             callback.last_extra_raw = raw
+            callback.saved_names.extend(scratch_saved_names(raw))
             data = scratch_tool_result(raw)
             if data.get("error"):
                 return f"Error: {data['error']}. " + scratch_tool_hint(data) + "\n\n" + _answer_lang_reminder
@@ -1398,7 +1440,9 @@ def react_stream(
         tools=tools,
         verbose=True,
         max_iterations=MAX_ITERATIONS,
-        early_stopping_method="generate",
+        # "generate" is no longer supported by LangChain's AgentExecutor and
+        # raised at the iteration limit; "force" returns the stop text instead.
+        early_stopping_method="force",
         handle_parsing_errors=True,
         return_intermediate_steps=False,
     )

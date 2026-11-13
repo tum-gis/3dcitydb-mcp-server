@@ -135,6 +135,27 @@ def test_save_enforces_limits():
     assert "full" in sp.save_item(UID, "x", "SELECT 'a' AS objectid", qdb=qdb, wdb=wdb)["error"]
 
 
+def test_save_refuses_a_line_of_length_zero():
+    qdb = FakeDb({"ST_HasArc": [{"n": 1, "vertices": 2, "zero_line": True, "ewkb": "01"}],
+                  "LIMIT 1": [{"geom": "g"}]})
+    out = sp.save_item(UID, "line", "SELECT g AS geom", qdb=qdb, wdb=FakeDb())
+    assert not out["ok"] and "ST_3DShortestLine(a, b) itself" in out["error"]
+    assert "ST_3DLength(g) = 0" in sp._GEOM_SQL
+
+
+def test_save_refuses_a_3d_item_far_below_the_ground():
+    """Markers at z = height_m (28 m) in a city whose ground is at 499 m."""
+    def qdb(zmax):
+        return FakeDb({"ST_HasArc": [{"n": 1, "vertices": 1, "ndims": 3, "zmax": zmax, "ewkb": "01"}],
+                       "AS ground": [{"ground": 499.0}], "shape_ewkb": _shape_reply("POINT", 3),
+                       "LIMIT 1": [{"geom": "g"}]})
+    out = sp.save_item(UID, "m", "SELECT g AS geom", item_class="3Dmarker", qdb=qdb(28.6), wdb=FakeDb())
+    assert not out["ok"] and "ST_ZMax(s.envelope)" in out["error"] and "470 m below" in out["error"]
+    out = sp.save_item(UID, "m", "SELECT g AS geom", item_class="3Dmarker", qdb=qdb(527.9),
+                       wdb=FakeDb({"count(*) AS n": [{"n": 0}]}))
+    assert out["ok"], out
+
+
 # ── actions, purge ────────────────────────────────────────────────────────────
 
 def test_actions_report_found_and_missing():
@@ -379,6 +400,8 @@ def test_create_and_draw_requests_count_as_scratchpad_intent(question):
     "How many buildings are there?", "Show me all residential buildings in Röblingweg",
     "List the 5 tallest buildings", "Welche Gebäude haben ein Flachdach?", "Wie hoch ist das Gebäude?",
     "What is the total roof area per street?",
+    "How many points does the lod2Solid of building B1 have?", "What colours do the roofs in the dataset have?",
+    "Wie viele Punkte hat das lod2Solid des Gebäudes B1?", "Welche Farben haben die Dächer im Datensatz?",
 ])
 def test_plain_questions_are_no_scratchpad_intent(question):
     from webui import llm_utils
@@ -392,9 +415,10 @@ def test_prompt_block_teaches_compute_in_sql_and_the_recipes():
     block = llm_utils.SCRATCHPAD_TOOLS_INSTRUCTIONS
     assert "PostGIS computes, the scratchpad draws" in block
     assert "alpha = 1 - X/100" in block and "30 % -> 0.7" in block
-    assert "N save_to_scratchpad calls" in block
+    assert "SEVERAL ITEMS = ONE CALL" in block and "item_name" in block
+    assert "building_solid(objectid" in block and "building_footprint(objectid" in block
     assert "A `label` column sets the" in block and block.count("' m' AS label") == 2
-    for recipe in ("CG_3DConvexHull", "CG_OptimalAlphaShape", "ST_DumpPoints", "ST_ZMax(b.envelope)",
+    for recipe in ("CG_3DConvexHull", "CG_OptimalAlphaShape", "ST_DumpPoints", "ST_ZMax(s.envelope)",
                    "ST_3DShortestLine", "ST_Buffer(ST_Force2D(p.geom)", "generate_series", "ST_3DExtent"):
         assert recipe in block, recipe
     assert len(block) < 6000  # weak models do worse with long prompts
@@ -423,7 +447,7 @@ def test_save_schema_has_alpha_and_says_it_draws():
     save = sp.TOOL_SCHEMAS["save_to_scratchpad"]
     assert "alpha" in save["inputSchema"]["properties"]
     assert "1 - alpha" in save["inputSchema"]["properties"]["alpha"]["description"]
-    assert "DRAWS" in save["description"] and "N calls" in save["description"]
+    assert "DRAWS" in save["description"] and "item_name" in save["description"]
     assert "1 - alpha" in sp.TOOL_SCHEMAS["update_scratchpad_item"]["inputSchema"]["properties"]["alpha"][
         "description"]
 
@@ -778,3 +802,271 @@ def test_list_mode_reaches_the_prompt_and_the_backend(monkeypatch):
     list(chat_runtime.stream_chat_turn(settings, [], lambda sql: ""))
     assert seen["full_lists"] is False
     assert chat_runtime.ChatTurnSettings(provider="openai", model="m").full_lists is True
+
+
+# ── Several items in one call (item_name), helper views, guards ───────────────
+
+def _split_qdb(groups):
+    """Fake read connection for a SELECT with an item_name column: ``groups``
+    is [(value, color)]; every group query returns two objectids."""
+    return FakeDb({"LIMIT 1": [{"objectid": "B1", "item_name": "A", "color": "#16a34a"}],
+                   "GROUP BY 1 ORDER BY 1": [{"v": v, "c": c} for v, c in groups],
+                   "array_agg(DISTINCT": [{"n": 2, "ids": ["B1", "B2"]}]})
+
+
+def test_item_name_column_creates_one_item_per_value():
+    qdb = _split_qdb([("A", "#16a34a"), ("B", "not a colour"), ("Röbling", None)])
+    wdb = FakeDb({"count(*) AS n": [{"n": 0}]})
+    out = sp.save_item(UID, "energy", "SELECT b.objectid, p.val_string AS item_name, '#16a34a' AS color "
+                       "FROM feature b", color="#dc2626", qdb=qdb, wdb=wdb)
+    assert [r["name"] for r in out] == ["energy_A", "energy_B", "energy_Roebling"]
+    assert all(r["ok"] and r["count"] == 2 for r in out)
+    upserts = [c[1] for c in wdb.calls if "ON CONFLICT" in c[0]]
+    assert [u[5] for u in upserts] == ["#16a34a", "#dc2626", "#dc2626"]  # own colour, else the call's
+    # Each item re-runs the SELECT restricted to its group, by rank, not by a quoted value.
+    group_sql = [c[0] for c in qdb.calls if "item_group = " in c[0]]
+    assert group_sql and all("Röbling" not in s for s in group_sql)
+
+
+def test_item_name_keeps_values_that_already_carry_the_prefix():
+    assert sp._group_item_name("marker", "DEBY_LOD2_1") == "marker_DEBY_LOD2_1"
+    assert sp._group_item_name("line", "line_marker_X") == "line_marker_X"
+    assert sp._group_item_name("energy", "32.2 m") == "energy_32_2_m"
+    with pytest.raises(ValueError):
+        sp._group_item_name("energy", "%%%")
+
+
+def test_item_name_rejects_too_many_or_clashing_groups():
+    many = _split_qdb([(str(i), None) for i in range(sp.MAX_GROUPS + 1)])
+    out = sp.save_item(UID, "g", "SELECT 1 AS objectid, 1 AS item_name", qdb=many, wdb=FakeDb())
+    assert not out["ok"] and "more than" in out["error"]
+    clash = _split_qdb([("a b", None), ("a_b", None)])
+    out = sp.save_item(UID, "g", "SELECT 1 AS objectid, 1 AS item_name", qdb=clash, wdb=FakeDb())
+    assert not out["ok"] and "same item name" in out["error"]
+
+
+def test_split_results_reach_the_viewer_and_the_model():
+    from webui import llm_utils
+
+    raw = json.dumps({"scratchpad": [{"ok": True, "name": "energy_A", "kind": "featureset", "count": 1},
+                                     {"ok": False, "name": "energy_B", "error": "boom"}]})
+    focus = []
+    assert llm_utils.note_scratch_result(raw, focus) and focus == ["energy_A"]
+    assert llm_utils.scratch_saved_names(raw) == ["energy_A"]
+    assert llm_utils.scratch_tool_result(raw)["error"] == "boom"
+
+
+def test_query_password_does_not_depend_on_the_database(monkeypatch):
+    monkeypatch.delenv("CITYDB_QUERY_PASSWORD", raising=False)
+    monkeypatch.setenv("CITYDB_PASSWORD", "pw")
+    monkeypatch.setenv("CITYDB_NAME", "citydb")
+    first = sp.query_password()
+    monkeypatch.setenv("CITYDB_NAME", "harthof")
+    assert sp.query_password() == first  # one role per server, shared by its databases
+    monkeypatch.setenv("CITYDB_QUERY_PASSWORD", "explicit")
+    assert sp.query_password() == "explicit"
+
+
+def test_query_role_is_provisioned_once_when_its_login_fails(monkeypatch, capsys):
+    monkeypatch.setenv("CITYDB_SCRATCHPAD", "true")
+    monkeypatch.setattr(sp, "_query_role_ok", None)
+    logins = iter([RuntimeError("password authentication failed"), [{"?column?": 1}]])
+
+    class _Q:
+        def execute(self, *a, **k):
+            r = next(logins)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+    q = _Q()
+    monkeypatch.setattr(sp, "query_db", lambda: q)
+    provisioned = []
+    monkeypatch.setattr(sp, "provision", lambda: provisioned.append(1) or {"error": ""})
+    assert sp.run_query_target("owner") == (q, True) and provisioned == [1]
+    assert capsys.readouterr().out == ""  # nothing on stdout: that is the stdio MCP channel
+
+
+def test_query_role_fallback_logs_to_stderr_not_stdout(monkeypatch, capsys):
+    monkeypatch.setenv("CITYDB_SCRATCHPAD", "true")
+    monkeypatch.setattr(sp, "_query_role_ok", None)
+
+    class _Broken:
+        def execute(self, *a, **k):
+            raise RuntimeError("password authentication failed")
+
+    monkeypatch.setattr(sp, "query_db", lambda: _Broken())
+    monkeypatch.setattr(sp, "provision", lambda: {"error": "role: permission denied"})
+    assert sp.run_query_target("owner") == ("owner", True)
+    captured = capsys.readouterr()
+    assert captured.out == "" and "query role unavailable" in captured.err
+
+
+def test_provision_creates_the_helper_views():
+    db = FakeDb({"pg_roles": [{"x": 1}]})
+    db.conn_params = {"dbname": "citydb"}
+    out = sp.provision(db)
+    assert out["table"] and out["views"] and out["role"]
+    created = " ".join(c[0] for c in db.calls)
+    assert "building_solid" in created and "building_footprint" in created
+
+
+@pytest.mark.parametrize("question,first", [
+    ("Create one group per energy class", "1"),
+    ("Create a single 3D alpha-wrapping around the buildings", "2"),
+    ("Create a 2D alpha-wrapping around all footprints", "3"),
+    ("Add a 2m buffer (in 2D) around that alpha-wrapping.", "7"),
+    ("Put a marker on top of the 5 tallest buildings", "5"),
+    ("Create 3D lines from the markers to the closest buildings", "6"),
+    ("Wie viele Stockwerke hat das Gebäude? Erstelle Ringe", "8"),
+])
+def test_the_save_reminder_repeats_the_matching_recipe(question, first):
+    from webui import llm_utils
+
+    recipes = llm_utils.scratch_recipes_for(question)
+    assert recipes and recipes[0].startswith(first + " ")
+    assert recipes[0] in llm_utils.scratch_save_reminder(question)
+    if "2D" in question:
+        assert not any(r.startswith("2 ") for r in recipes)
+    if "3D alpha" in question:
+        assert not any(r.startswith("3 ") for r in recipes)
+
+
+def test_claims_unsaved_item_only_without_a_save():
+    from webui import llm_utils
+
+    q = "Create a marker on the tallest building"
+    assert llm_utils.claims_unsaved_item(q, "The marker was created.", [])
+    assert not llm_utils.claims_unsaved_item(q, "The marker was created.", ["marker_X"])
+    assert not llm_utils.claims_unsaved_item("How tall is it?", "It was created in 1990.", [])
+    assert not llm_utils.claims_unsaved_item(q, "Could not find the building.", [])
+    assert llm_utils.claims_unsaved_item(q, "Die Eckpunkte wurden im Viewer als Punkt-Set angezeigt.", [])
+
+
+def _cloud_run(monkeypatch, replies, question, run=None):
+    from webui.backends import cloud
+
+    sent = []
+    monkeypatch.setattr(cloud, "_litellm_kwargs", lambda *a, **k: {"model": "m"})
+    monkeypatch.setattr(cloud, "_log_context_usage", lambda *a, **k: (0, 1000, None))
+    monkeypatch.setattr(cloud, "safe_completion", lambda kw, **k: sent.append(k) or replies.pop(0))
+    extra = {"save_to_scratchpad": {"spec": {"type": "function", "function": {"name": "save_to_scratchpad"}},
+                                    "run": run or (lambda a: json.dumps(
+                                        {"scratchpad": {"ok": True, "name": "s", "kind": "featureset",
+                                                        "count": 1}}))}}
+    events = list(cloud.native_tool_stream("openai", "m", None, [{"role": "user", "content": question}],
+                                           lambda sql: "{}", extra_tools=extra))
+    return events, sent
+
+
+def test_cloud_asks_once_when_the_answer_claims_an_unsaved_item(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    call = NS(id="c1", function=NS(name="save_to_scratchpad",
+                                   arguments=json.dumps({"name": "s", "sql": "SELECT 1 AS objectid"})))
+    replies = [NS(choices=[NS(message=NS(content="The group s was created.", tool_calls=None))]),
+               NS(choices=[NS(message=NS(content="", tool_calls=[call]))]),
+               NS(choices=[NS(message=NS(content="Saved s (1 object).", tool_calls=None))])]
+    events, sent = _cloud_run(monkeypatch, replies, "Create a group s of all buildings")
+    assert ("final", "Saved s (1 object).") in events
+    assert any("no save_to_scratchpad call succeeded" in str(m.get("content", ""))
+               for m in sent[1]["messages"] if isinstance(m, dict))
+    # The answer after a scratchpad result is anchored to the question's language.
+    tool_msgs = [m for m in sent[2]["messages"] if isinstance(m, dict) and m.get("role") == "tool"]
+    assert tool_msgs and "same language" in tool_msgs[-1]["content"]
+    assert "Create a group s of all buildings" in tool_msgs[-1]["content"]
+
+
+def test_cloud_claim_guard_fires_only_once(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    replies = [NS(choices=[NS(message=NS(content="The group s was created.", tool_calls=None))]),
+               NS(choices=[NS(message=NS(content="The group s was created.", tool_calls=None))])]
+    events, sent = _cloud_run(monkeypatch, replies, "Create a group s of all buildings")
+    assert len(sent) == 2 and ("final", "The group s was created.") in events
+
+
+def test_cloud_retries_an_empty_reply_once_then_answers(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    empty = NS(choices=[NS(message=NS(content="", tool_calls=None))])
+    events, sent = _cloud_run(monkeypatch, [empty, NS(choices=[NS(message=NS(content="42", tool_calls=None))])],
+                              "How many buildings?")
+    assert ("final", "42") in events and len(sent) == 2
+    events, sent = _cloud_run(monkeypatch, [empty, empty], "How many buildings?")
+    finals = [d for e, d in events if e == "final"]
+    assert len(sent) == 2 and finals and "without an answer" in finals[0]
+
+
+def test_local_parser_asks_once_when_the_answer_claims_an_unsaved_item():
+    import queue
+
+    from langchain_core.agents import AgentFinish
+    from langchain_core.exceptions import OutputParserException
+    from webui.backends import local
+
+    cb = local._EventCallback(queue.Queue())
+    cb._tools_called = 1
+    parser = local._RobustReActParser(cb, user_question="Put a marker on the tallest building",
+                                      tool_names={"run_query", "save_to_scratchpad"})
+    claim = "Thought: done\nFinal Answer: The marker was created."
+    with pytest.raises(OutputParserException, match="no save_to_scratchpad call succeeded"):
+        parser.parse(claim)
+    assert isinstance(parser.parse(claim), AgentFinish)  # only once per turn
+    cb2 = local._EventCallback(queue.Queue())
+    cb2._tools_called = 1
+    cb2.saved_names.append("marker_X")
+    parser2 = local._RobustReActParser(cb2, user_question="Put a marker on the tallest building",
+                                       tool_names={"run_query", "save_to_scratchpad"})
+    assert isinstance(parser2.parse(claim), AgentFinish)
+
+
+@pytest.mark.parametrize("question,answer,expected", [
+    ("Create a 2D alpha-wrapping around the union of all buildings footprints.",
+     "Ein 2D-Alpha-Wrapping um die Gebäudefußabdrücke wurde erstellt und ist im Viewer als gelb dargestellt.",
+     "English"),
+    ("Erstelle eine 2D-Alpha-Umhüllung um die Vereinigung aller Grundrisse der Gebäude.",
+     "The 2D alpha wrapping was created and is shown in yellow with 30 % transparency.", "German"),
+    ("Create one group per class.", "The groups energy_A to energy_H were created.", None),
+    ("Put a marker on the buildings in Röblingweg.",
+     "The markers on Röblingweg were created for the buildings of the street.", None),
+    ("How many?", "42", None),
+])
+def test_wrong_language_nudge(question, answer, expected):
+    from webui import llm_utils
+
+    nudge = llm_utils.wrong_language_nudge(question, answer)
+    assert (expected in nudge) if expected else nudge == ""
+
+
+def test_cloud_asks_once_for_the_language_of_the_question(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    german = "Die Anzahl der Gebäude ist 331 und das ist die Antwort."
+    replies = [NS(choices=[NS(message=NS(content=german, tool_calls=None))]),
+               NS(choices=[NS(message=NS(content="There are 331 buildings.", tool_calls=None))])]
+    events, sent = _cloud_run(monkeypatch, replies, "How many buildings are there in the dataset?")
+    assert ("final", "There are 331 buildings.") in events and len(sent) == 2
+    assert "Rewrite the same answer in English" in sent[1]["messages"][-1]["content"]
+    replies = [NS(choices=[NS(message=NS(content=german, tool_calls=None))]),
+               NS(choices=[NS(message=NS(content=german, tool_calls=None))])]
+    events, sent = _cloud_run(monkeypatch, replies, "How many buildings are there in the dataset?")
+    assert len(sent) == 2 and ("final", german) in events  # only once per turn
+
+
+def test_local_parser_asks_once_for_the_language_of_the_question():
+    import queue
+
+    from langchain_core.agents import AgentFinish
+    from langchain_core.exceptions import OutputParserException
+    from webui.backends import local
+
+    cb = local._EventCallback(queue.Queue())
+    cb._tools_called = 1
+    parser = local._RobustReActParser(cb, user_question="How many buildings are there in the dataset?",
+                                      tool_names={"run_query"})
+    german = "Thought: fertig\nFinal Answer: Die Anzahl der Gebäude ist 331 und das ist die Antwort."
+    with pytest.raises(OutputParserException) as exc:
+        parser.parse(german)
+    assert exc.value.send_to_llm and "in English" in exc.value.observation
+    assert isinstance(parser.parse(german), AgentFinish)

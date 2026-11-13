@@ -19,7 +19,7 @@ In `production/.env`:
 CITYDB_SCRATCHPAD=true
 # Optional: name and password of the read-only query role (defaults below)
 # CITYDB_QUERY_USER=citydb_query
-# CITYDB_QUERY_PASSWORD=<derived from CITYDB_PASSWORD and CITYDB_NAME if unset>
+# CITYDB_QUERY_PASSWORD=<derived from CITYDB_USER and CITYDB_PASSWORD if unset>
 # Optional: shared scratchpad user id for MCP clients without a web UI session
 # CITYDB_SCRATCHPAD_MCP_USER=<default: a fixed uuid>
 # Optional: audit log, one JSON line per change; empty switches it off
@@ -36,9 +36,11 @@ CITYDB_SCRATCHPAD=true
   `CITYDB_SCRATCHPAD=true`; `_execute_tool` dispatches them to `scratchpad.run_tool`.
 - The 3D viewer (`ENABLE_VIZ=true`) is needed to **display** items. Without it, saving and querying
   still work; only the viewer payload is skipped.
-- The derived query password is `sha256("citydb_query:<CITYDB_PASSWORD>:<CITYDB_NAME>")[:32]`, so the
+- The derived query password is `sha256("citydb_query:<CITYDB_USER>:<CITYDB_PASSWORD>")[:32]`, so the
   web UI and every MCP subprocess agree without storing another secret. Set `CITYDB_QUERY_PASSWORD`
-  to use your own.
+  to use your own. It does not depend on the database name, because the role exists once per
+  PostgreSQL server: several databases on one server (e.g. `citydb` and `harthof`) share it. If the
+  role cannot log in, `run_query` provisions it once and tries again before falling back to the guard.
 - `provision()` needs `CREATEROLE`. The fullstack setup has it (bootstrap superuser). With BYOD and
   fewer rights, the table and view are still created, the role is not, and a fallback guard is used
   (see "Isolation between users").
@@ -56,7 +58,7 @@ and the local ReAct backend.
 
 | Tool | Arguments | Does |
 |------|-----------|------|
-| `save_to_scratchpad` | `name`, and `sql` **or** `geojson`; optional `label`, `color`, `alpha`, `clamp`, `class`, `size_m`, `height_m`, `extrude_m`, `base_z` | Saves an item (replaces an existing name). `sql` is a SELECT with an `objectid` column (featureset) or a `geom` column (geometry); if both are present, `geom` wins. An optional `label` column sets the label. `geojson` is a Geometry, Feature or FeatureCollection in WGS84 lon/lat; it is converted to the database CRS (`_geojson_sql` passes the geometries as quoted literals, never as free SQL). |
+| `save_to_scratchpad` | `name`, and `sql` **or** `geojson`; optional `label`, `color`, `alpha`, `clamp`, `class`, `size_m`, `height_m`, `extrude_m`, `base_z` | Saves an item (replaces an existing name). `sql` is a SELECT with an `objectid` column (featureset) or a `geom` column (geometry); if both are present, `geom` wins. An optional `label` column sets the label; an `item_name` column makes one item per value (`<name>_<value>`, optional `color` column). `geojson` is a Geometry, Feature or FeatureCollection in WGS84 lon/lat; it is converted to the database CRS (`_geojson_sql` passes the geometries as quoted literals, never as free SQL). |
 | `update_scratchpad_item` | `name`; optional `label`, `color`, `alpha`, `class`, `size_m`, `clamp`, `height_m`, `extrude_m`, `base_z` | Changes a saved item in place: style, class and height (see below). |
 | `scratchpad_action` | `action` (`show`, `hide`, `delete`, `goto`), `names`; optional `confirm` | Acts on the named items. Deleting more than one needs `confirm: true` (see below). |
 | `list_scratchpad` | none | Name, label, kind, class, colour, visibility, count or geometry type. |
@@ -129,16 +131,49 @@ Models mixed up "compute a geometry with PostGIS (run_query)" and "store/draw it
 tool)": they computed a hull or a line with `run_query` and then answered in text, or wrote the SQL
 and the tool arguments into the answer. `SCRATCHPAD_TOOLS_INSTRUCTIONS` is therefore built around one
 rule: the whole computation goes into the SELECT of `save_to_scratchpad`'s `sql`, the tool runs it and
-draws the result, `run_query` only looks up values. Then a few short rules (one item = one name,
-colour, alpha and label, so N groups or N labels are N calls; "as one object" is one call whose
-SELECT returns all parts; alpha = 1 - transparency) and nine verified SQL recipes: one group per
-attribute value, 3D hull/wrapping, 2D alpha shape around footprints, the vertices of a solid as a
-point set, a marker on top of a building, a 3D shortest line to the nearest building with the
-distance as label, a buffer around a saved item, footprint rings per storey in one item, and bounding
-boxes. The recipes use placeholders and the standard 3DCityDB v5 ids (901 Building, 710
-GroundSurface), no dataset values. The block is about 5,200 characters; the measurements with
-gpt-oss:20b and qwen3.6:27b, and the SQL behind each recipe, are in
+draws the result, `run_query` only looks up values. Then a few short rules (several items =
+ONE call with an `item_name` column; "as one object" is one call without it; never claim an item the
+tool did not return as ok; alpha = 1 - transparency), the helper views, and nine verified SQL recipes:
+one group per attribute value (with a colour column), 3D hull/wrapping, 2D alpha shape around
+footprints, the vertices of a solid as a point set, markers on top of the N tallest buildings, 3D
+shortest lines from saved markers to the nearest building with the distance as label, a buffer around
+a saved item, footprint rings per storey in one item, and bounding boxes. The recipes use the helper
+views and placeholders, no dataset values. The block is about 5,300 characters.
+
+The recipes are a list of (trigger, recipe) in `SCRATCHPAD_RECIPES`. All of them are in the system
+prompt; the save reminder that follows a `run_query` result (`scratch_save_reminder`) repeats the one
+or two whose trigger matches the question, the one mentioned first in the question first, right
+where the model writes the save call (`scratch_recipes_for`; a question that says 2D never gets the
+3D hull recipe, one that says 3D never the 2D alpha shape). The measurements with gpt-oss and qwen,
+and the SQL behind each recipe, are in
 [scratchpad-prompt-evaluation.md](scratchpad-prompt-evaluation.md).
+
+Both backends guard against two failures seen in every evaluation round, each at most once per turn
+so they cannot loop: an answer that reports an item as created although no save succeeded in the
+turn is sent back once with `SAVE_CLAIM_NUDGE` (`claims_unsaved_item`), and an empty reply (gpt-oss
+over the OpenAI-compatible API) is answered once with `EMPTY_REPLY_NUDGE`; a second empty reply ends
+the turn with a short text naming the items saved so far instead of an error. A third guard, also
+once per turn, asks for a rewrite when the answer is clearly German and the question English, or the
+other way round (`wrong_language_nudge`, counted on function words, so German street names in an
+English answer do not trigger it): gpt-oss:20b answered most English questions in German although
+the question was quoted next to the language rule. When the cloud backend reaches the step limit after
+successful saves, its closing request names those items instead of "no data could be retrieved".
+
+Words such as "colour", "Farbe", "points" or "Punkte" alone do not count as a request to draw: "What
+colours do the roofs have?" and "How many points does the solid have?" only ask for values.
+
+### Helper views
+
+`provision()` also creates two plain views in the 3DCityDB schema, so the save SQL does not have to
+repeat the long joins from a building to its geometry (weak models got them wrong):
+
+| View | Columns | Content |
+|---|---|---|
+| `building_solid` | `objectid, lod, geom, height_m, envelope` | The `lod1Solid`..`lod4Solid` geometry of each `Building` / `BuildingPart`; `height_m` is the Z range of its envelope. |
+| `building_footprint` | `objectid, geom` | The geometry of the building's `GroundSurface` boundaries (3D polygons at ground height). |
+
+The query role reads them like any other table of the schema. If they cannot be created (a schema
+without these classes), `provision()` reports it under `error` and the rest still works.
 
 `CG_3DAlphaWrapping` and `CG_Extrude` on areas are in the PostGIS catalogue of the
 `3dcitydb-v5-docker-sfcgal-patched` image but fail at run time ("compiled against SFCGAL 2.0,
@@ -345,7 +380,22 @@ Rules (constants in `scratchpad.py`):
   max 200 characters) and wins over the `label` argument: a height or distance computed next to the
   geometry always matches it, while a value looked up in a separate query did not (qwen labelled
   lines with distances of a different metric). When the rows carry several different labels they are joined into the
-  one item label and the result's `note` says to save one item per row instead.
+  one item label and the result's `note` says to save again with an `item_name` column.
+- An `item_name` column makes **one item per distinct value** in a single call (`_save_groups`):
+  the item is named `<name>_<value>` (the value alone if it already starts with the prefix, made
+  valid with `safe_name`), gets its own `label` column value and, with a `color` column (#rrggbb), its
+  own colour. Each item re-runs the SELECT restricted to its group by rank (`dense_rank()` over the
+  `item_name` text), so no value from the data is put into SQL text. At most `MAX_GROUPS = 50`
+  values; values that would give the same name are refused. The result is a list with one report per
+  item. Before, one group per class, five markers or five lines needed five to eight calls, and
+  weaker models stopped after the first.
+- A line geometry of length 0 is refused with a hint to use `ST_3DShortestLine(a, b)` itself (a
+  model drew `ST_MakeLine(marker, ST_StartPoint(ST_3DShortestLine(marker, b)))`: correct distance
+  label, invisible line).
+- A 3D item whose highest point is more than `BELOW_GROUND_M = 100` m below the city objects around it
+  is refused: it was built from a relative height (a model used `height_m`, 28 m, as the Z of roof
+  markers where the ground is at 499 m). The error says to take Z from the geometry, e.g.
+  `ST_ZMax(s.envelope)`. Items saved with `clamp` are not checked.
 - A flat class (`2Dmarker`, `Polygon2D`, ...) on a SELECT with heights drops them; the result's
   `note` says so (for `2Dmarker`: "use 3Dmarker to keep them").
 - `MAX_ITEMS = 100` per user (replacing an existing name is still allowed when full).
@@ -632,8 +682,12 @@ kept copy `window.__citydbScratchpad` also has no notice). Import reads the file
 - Web UI side: `scratch_tool_result` / `scratch_tool_hint`, `note_scratch_result` (focus names from the
   tool result), the prompt block (`SCRATCHPAD_TOOLS_INSTRUCTIONS`) only when enabled and no
   `scratch_save` convention in it, and the shape of `list_items`.
-- Prompt and intent: the block keeps the "PostGIS computes" rule, the alpha mapping and all recipes
-  and stays under 6,000 characters; create/draw questions in English and German count as scratchpad
+- Prompt and intent: the block keeps the "PostGIS computes" rule, the alpha mapping, the
+  `item_name` rule, the helper views and all recipes and stays under 6,000 characters; the save
+  reminder repeats the matching recipe; `item_name` splits (names, own colours, by rank, limits,
+  clashes); the claim and empty-reply guards fire once (cloud and local backends); the query
+  password does not depend on the database; a failing query-role login is provisioned once and
+  otherwise logged to stderr, never stdout; `provision()` creates the helper views; create/draw questions in English and German count as scratchpad
   intent and get the save reminder, plain questions do not; `alpha` on save (stored, default 0.8,
   `"50%"` scaled, out of range refused) and in the tool schema; the SFCGAL probe advertises only
   working functions; the CLI activity names scratchpad tools with their arguments.

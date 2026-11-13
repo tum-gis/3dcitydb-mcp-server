@@ -725,7 +725,7 @@ Per-user state (user identity, per-tab Stop, parallel chats) — see
 |----------|---------|-------------|
 | `CITYDB_SCRATCHPAD` | `false` | Master switch for the per-user spatial scratchpad (table + four MCP tools + `my_scratchpad` view + `[SCRATCHPAD]` prompt block) |
 | `CITYDB_QUERY_USER` | `citydb_query` | Name of the dedicated read-only role used for `run_query` and the scratchpad |
-| `CITYDB_QUERY_PASSWORD` | *derived* | Password for that role; if unset it is derived deterministically from `CITYDB_PASSWORD` and `CITYDB_NAME` so the web UI and every MCP subprocess agree |
+| `CITYDB_QUERY_PASSWORD` | *derived* | Password for that role; if unset it is derived deterministically from `CITYDB_USER` and `CITYDB_PASSWORD` (not the database name: the role is shared by all databases on the server) so the web UI and every MCP subprocess agree |
 | `CITYDB_SCRATCHPAD_MCP_USER` | *fixed uuid* | Shared scratchpad user id for external MCP clients that have no web UI session |
 | `CITYDB_MCP_AUDIT_LOG` | *(empty)* | Path to a JSONL audit log, one line per scratchpad change; empty switches it off |
 

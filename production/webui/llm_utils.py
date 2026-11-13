@@ -1124,24 +1124,26 @@ def scratchpad_tool_specs() -> list[dict]:
             for n, spec in scratchpad.TOOL_SCHEMAS.items()]
 
 
-SCRATCHPAD_TOOLS_INSTRUCTIONS = """[SCRATCHPAD] Drawing results in the user's 3D viewer
-One rule: PostGIS computes, the scratchpad draws. Put the whole computation (hull, buffer, line,
-points, marker position, rings, ...) in the SELECT of the `sql` argument of save_to_scratchpad;
-the tool runs it, stores the result as an item and draws it. run_query only looks things up
+_SCRATCHPAD_RULES = """[SCRATCHPAD] Drawing results in the user's 3D viewer
+One rule: PostGIS computes, the scratchpad draws. save_to_scratchpad runs the SELECT in its `sql`
+argument, stores the result as an item and draws it, so put the whole computation (hull, buffer,
+line, points, marker position, rings, ...) in that SELECT. run_query only looks things up
 (values, ids, numbers) and draws nothing.
 - When the user asks to create, draw, show, mark, put, add, group or colour something (groups of
-  buildings, marker, line, ring, point set, hull, wrapping, buffer; "erstelle", "zeige", "setze",
-  "füge hinzu", "ordne zu", "stelle dar"), the turn MUST contain save_to_scratchpad call(s).
-  A text answer or run_query alone does not draw anything.
-- Use run_query first only to learn values you need (the distinct classes, the ids of the 5
-  tallest, storeys and height, the nearest building), then save. Compute positions in the SELECT
-  (from the tables or my_scratchpad); do not paste coordinates.
-- One item = one name, colour, alpha and label. N groups, N labels or "one item per line" =
-  N save_to_scratchpad calls, one after the other. "As one object" = ONE call whose SELECT returns
-  all parts (its rows are collected into one item).
+  buildings, marker, line, ring, point set, hull, wrapping, buffer; in any language), the turn
+  MUST contain save_to_scratchpad. Never say an item was created unless the tool returned ok
+  for it.
+- SEVERAL ITEMS = ONE CALL: one group per class, one marker per building, one line per marker:
+  add an `item_name` column; every distinct value becomes its own item <name>_<value>, with its
+  own `label` column and optional `color` column. "As one object" = one call WITHOUT item_name
+  (all rows are collected into one item).
 - `sql` returns `objectid` rows (a group of city objects, coloured in the viewer) or a `geom`
   column (a geometry; heights kept = 3D, ST_Force2D(...) = flat 2D). A `label` column sets the
-  label from a computed value (height, distance), so it always matches the geometry.
+  label from a computed value (height, distance).
+- Shortcut views (use them instead of joining feature/property/geometry_data):
+  building_solid(objectid, lod, geom, height_m, envelope) = the 3D solid of each building,
+  building_footprint(objectid, geom) = its ground surface (3D polygons at ground height),
+  my_scratchpad(name, label, class, color, geom, objectids text[]) = the user's saved items.
 - 2D or 3D: when the user says "2D" or "3D", pass class (2D: Polygon2D, MultiPolygon2D,
   LineString2D; 3D: Polygon3D, Solid3D, Surface3D, LineString3D) and compute in that dimension.
   2D = ST_Force2D input and 2D functions (CG_OptimalAlphaShape, ST_ConcaveHull, ST_Buffer,
@@ -1151,54 +1153,84 @@ the tool runs it, stores the result as an item and draws it. run_query only look
 - color '#rrggbb' (red #dc2626, green #16a34a, yellow #facc15, orange #f97316, blue #2563eb).
   alpha = opacity 0-1: "X % transparency" means alpha = 1 - X/100 (50 % -> 0.5, 30 % -> 0.7).
 - name: letters, digits, _ (no spaces); a name the user gives ("as cornerpoints") is the name.
-  After saving, tell the user names and counts in one or two sentences.
+  After saving, tell the user the names and counts the tool returned, in one or two sentences.
 - Also: update_scratchpad_item (label, color, alpha, class, size_m, height_m of a saved item),
   scratchpad_action (show/hide/delete/goto; deleting several: ask first, then confirm=true),
-  list_scratchpad. Saved items in SQL: view my_scratchpad(name, label, class, color, geom,
-  objectids text[]).
+  list_scratchpad."""
 
-Recipes for `sql` (b = building, objectclass_id 901; replace <...>):
-1 One group per value (one call per value, own colour, label = the value):
-  SELECT b.objectid FROM feature b JOIN property p ON p.feature_id = b.id AND p.name = '<attr>'
-  WHERE b.objectclass_id = 901 AND p.val_string = '<value>'
-2 3D hull / wrapping around buildings (one closed solid):
-  SELECT CG_3DConvexHull(ST_Collect(g.geometry)) AS geom FROM feature b
-  JOIN property gp ON gp.feature_id = b.id AND gp.name = 'lod2Solid'
-  JOIN geometry_data g ON g.id = gp.val_geometry_id WHERE b.objectid IN (<ids or subquery>)
-  (CG_3DAlphaWrapping(ST_Collect(g.geometry), 10) only if the SFCGAL list above offers it;
-  otherwise tell the user it is a convex hull.)
-3 2D alpha shape / alpha wrapping / concave outline around building footprints (class MultiPolygon2D):
-  SELECT CG_OptimalAlphaShape(ST_Union(ST_Force2D(g.geometry)), false, 1) AS geom FROM feature b
-  JOIN property r ON r.feature_id = b.id AND r.name = 'boundary'
-  JOIN feature s ON s.id = r.val_feature_id AND s.objectclass_id = 710
-  JOIN property sp ON sp.feature_id = s.id AND sp.val_geometry_id IS NOT NULL
-  JOIN geometry_data g ON g.id = sp.val_geometry_id WHERE b.objectclass_id = 901
-4 All points (vertices) of a building's solid as one point set (class "Point3D", size_m 0.3):
-  SELECT ST_Collect(DISTINCT d.geom) AS geom FROM feature b
-  JOIN property gp ON gp.feature_id = b.id AND gp.name = 'lod2Solid'
-  JOIN geometry_data g ON g.id = gp.val_geometry_id, ST_DumpPoints(g.geometry) d
-  WHERE b.objectid = '<id>'
-5 Marker on top of a building with its height (one call per building, name marker_<objectid>):
-  SELECT ST_MakePoint(ST_X(ST_Centroid(b.envelope)), ST_Y(ST_Centroid(b.envelope)), ST_ZMax(b.envelope))
-  AS geom, round((ST_ZMax(b.envelope) - ST_ZMin(b.envelope))::numeric, 1) || ' m' AS label
-  FROM feature b WHERE b.objectid = '<id>'
-6 3D line from a saved item to the nearest other building, distance as label (one call per line):
-  SELECT ST_3DShortestLine(p.geom, g.geometry) AS geom,
-  round(ST_3DDistance(p.geom, g.geometry)::numeric, 1) || ' m' AS label
-  FROM my_scratchpad p, feature o JOIN property gp ON gp.feature_id = o.id AND gp.name = 'lod2Solid'
-  JOIN geometry_data g ON g.id = gp.val_geometry_id WHERE p.name = '<item>'
-  AND o.objectid <> '<its own building>' ORDER BY ST_3DDistance(p.geom, g.geometry) LIMIT 1
-7 Buffer around a saved item (2D, class Polygon2D): SELECT ST_Buffer(ST_Force2D(p.geom), <m>) AS geom
-  FROM my_scratchpad p WHERE p.name = '<item>'
-8 Rings of the footprint at several heights in ONE item (e.g. per storey: h = height / storeys,
-  both from run_query; storeysAboveGround and the nested height value):
-  SELECT ST_Collect(ST_Translate(ST_ExteriorRing(d.geom), 0, 0, i * <h>)) AS geom FROM feature b
-  JOIN property r ON r.feature_id = b.id AND r.name = 'boundary'
-  JOIN feature s ON s.id = r.val_feature_id AND s.objectclass_id = 710
-  JOIN property sp ON sp.feature_id = s.id AND sp.val_geometry_id IS NOT NULL
-  JOIN geometry_data g ON g.id = sp.val_geometry_id, ST_Dump(g.geometry) d,
-  generate_series(0, <storeys> - 1) i WHERE b.objectid = '<id>'
-9 Bounding box: 3D SELECT ST_3DExtent(b.envelope) AS geom (a closed box); 2D ST_Extent(...)."""
+# (trigger, recipe): all recipes go into the system prompt; the save reminder
+# after a run_query repeats the ones whose trigger matches the question, next
+# to where the model writes the save call.
+SCRATCHPAD_RECIPES = [
+    (r"group|class|klasse|gruppe|categor|kategor",
+     """1 One group per value, ONE call (name e.g. energy -> energy_A, energy_B, ...):
+  SELECT b.objectid, p.val_string AS item_name,
+  CASE p.val_string WHEN '<v1>' THEN '#16a34a' WHEN '<v2>' THEN '#facc15' ... ELSE '#dc2626' END AS color
+  FROM feature b JOIN property p ON p.feature_id = b.id AND p.name = '<attr>'
+  WHERE b.objectclass_id = 901"""),
+    (r"\b3d\b.*(hull|wrap|hülle|huelle|umhüll|umhuell)|convex|konvex",
+     """2 3D hull / wrapping around buildings (one closed solid, class Solid3D):
+  SELECT CG_3DConvexHull(ST_Collect(s.geom)) AS geom FROM building_solid s
+  WHERE s.objectid IN (<ids or subquery>)
+  (CG_3DAlphaWrapping(ST_Collect(s.geom), 10) only if the SFCGAL list above offers it;
+  otherwise tell the user it is a convex hull.)"""),
+    (r"\b2d\b|alpha|concave|konkav|outline|umriss|footprint|grundriss",
+     """3 2D alpha shape / alpha wrapping / concave outline around footprints (class MultiPolygon2D):
+  SELECT CG_OptimalAlphaShape(ST_Union(ST_Force2D(f.geom)), false, 1) AS geom
+  FROM building_footprint f"""),
+    (r"point|punkt|vertex|vertices",
+     """4 All points (vertices) of a building's solid as one point set (class Point3D, size_m 0.3):
+  SELECT ST_Collect(DISTINCT d.geom) AS geom FROM building_solid s, ST_DumpPoints(s.geom) d
+  WHERE s.objectid = '<id>'"""),
+    (r"marker|markier|\bpin\b|tallest|highest|höchst|hoechst|on top",
+     """5 Markers on top of the N tallest buildings with their height, ONE call
+  (name marker, class 3Dmarker):
+  SELECT s.objectid AS item_name, ST_MakePoint(ST_X(ST_Centroid(s.envelope)),
+  ST_Y(ST_Centroid(s.envelope)), ST_ZMax(s.envelope)) AS geom,
+  round(s.height_m::numeric, 1) || ' m' AS label
+  FROM building_solid s ORDER BY s.height_m DESC LIMIT <N>"""),
+    (r"line|linie|distance|abstand|entfernung|nearest|closest|nächst|naechst",
+     """6 3D line from each saved marker to the nearest other building, distance as label, ONE call
+  (name line, class LineString3D):
+  SELECT m.name AS item_name, ST_3DShortestLine(m.geom, n.geom) AS geom,
+  round(n.d::numeric, 1) || ' m' AS label
+  FROM my_scratchpad m CROSS JOIN LATERAL (SELECT s.geom, ST_3DDistance(m.geom, s.geom) AS d
+    FROM building_solid s
+    WHERE NOT ST_Intersects(ST_Force2D(s.envelope), ST_Force2D(m.geom))  -- not its own building
+    ORDER BY 2 LIMIT 1) n
+  WHERE m.name LIKE '<marker item name>_%'"""),
+    (r"buffer|puffer",
+     """7 Buffer around a saved item (2D, class Polygon2D):
+  SELECT ST_Buffer(ST_Force2D(p.geom), <m>) AS geom FROM my_scratchpad p WHERE p.name = '<item>'"""),
+    (r"floor|storey|stories|stockwerk|geschoss|etage|\bring",
+     """8 Rings of the footprint at several heights in ONE item (e.g. per storey: h = height / storeys,
+  both from run_query: storeysAboveGround and the nested height value). The footprint is already
+  at ground height, so only add i * h:
+  SELECT ST_Collect(ST_Translate(ST_ExteriorRing(d.geom), 0, 0, i * <h>)) AS geom
+  FROM building_footprint f, ST_Dump(f.geom) d, generate_series(0, <storeys> - 1) i
+  WHERE f.objectid = '<id>'"""),
+    (r"bounding|\bbox\b|extent|quader",
+     """9 Bounding box: 3D SELECT ST_3DExtent(b.envelope) AS geom (a closed box); 2D ST_Extent(...)."""),
+]
+_SCRATCH_RECIPE_RES = [(re.compile(t, re.IGNORECASE), r) for t, r in SCRATCHPAD_RECIPES]
+
+SCRATCHPAD_TOOLS_INSTRUCTIONS = (
+    _SCRATCHPAD_RULES + "\n\nRecipes for `sql` (b = building, objectclass_id 901; replace <...>):\n"
+    + "\n".join(r for _, r in SCRATCHPAD_RECIPES))
+
+
+def scratch_recipes_for(question: str, limit: int = 2) -> list[str]:
+    """The recipes whose trigger matches the question (at most ``limit``), the
+    one mentioned first in the question first. A question that says 2D never
+    gets the 3D hull recipe, one that says 3D never the 2D alpha shape."""
+    text = question or ""
+    hits = sorted((m.start(), r) for rx, r in _SCRATCH_RECIPE_RES if (m := rx.search(text)))
+    found = [r for _, r in hits]
+    if re.search(r"\b2d\b", text, re.IGNORECASE):
+        found = [r for r in found if not r.startswith("2 ")]
+    elif re.search(r"\b3d\b", text, re.IGNORECASE):
+        found = [r for r in found if not r.startswith("3 ")]
+    return found[:limit]
 
 
 def note_scratch_result(raw_result: str, focus: list) -> bool:
@@ -1240,15 +1272,17 @@ def build_scratchpad_payload(user_id: str, focus=()) -> dict | None:
 # result the cloud backend lets the model call a tool again for them (instead
 # of forcing a text answer), and both backends remind the model to save.
 # Broad on purpose: a missed request costs the whole answer, a false match
-# only one reminder line.
+# only one reminder line. No "colour"/"Farbe"/"points"/"Punkte": "What colours do
+# the roofs have?" or "How many points does the solid have?" only ask for values
+# (the reminder sent gpt-oss into a loop there, evaluation round 2).
 _SCRATCH_INTENT_RE = re.compile(
     r"speicher|merk|markier|notier|lösch|losch|ausblend|einblend|blende|gespeichert|"
     r"erstell|zeichne|setze|füge|fuege|hinzu|ordne|gruppe|darstell|\bstelle\b.*\bdar\b|"
     r"\bzeige\b.*\b(als|in)\b|beschrift|umhüll|umhuell|hülle|huelle|puffer|linie|\bring|"
-    r"punkte|punktmenge|farbe|transparen|\b(rot|grün|gruen|gelb|blau|orange)\w*\b|"
+    r"punktmenge|transparen|\b(rot|grün|gruen|gelb|blau|orange)\w*\b|"
     r"\bsave|\bstore|remember|\bmark|\bpin\b|delete|\bhide|\bshow\b.*\b(saved|my|as)\b|scratchpad|"
-    r"\bcreate|\bdraw|\bput\b|\badd\b|\bgroups?\b|\blabel|\bcolou?r|\bbuffer|\bhull|wrapping|"
-    r"\blines?\b|\brings?\b|\bpoints\b|pointset|\bhighlight|\bvisuali[sz]|"
+    r"\bcreate|\bdraw|\bput\b|\badd\b|\bgroups?\b|\blabel|\bbuffer|\bhull|wrapping|"
+    r"\blines?\b|\brings?\b|pointset|\bhighlight|\bvisuali[sz]|"
     r"\b(red|green|yellow|blue|orange)\b",
     re.IGNORECASE)
 
@@ -1258,14 +1292,94 @@ def scratch_save_reminder(question: str) -> str:
     weak models otherwise answer in text and never call save_to_scratchpad."""
     if not wants_scratchpad(question):
         return ""
+    recipes = scratch_recipes_for(question)
     return ("\nSCRATCHPAD: the user asked to create/draw/mark something. run_query draws nothing: "
-            "now call save_to_scratchpad with a SELECT that computes the geometry (or objectids), "
-            "one call per item (own name, colour, alpha = 1 - transparency, label), and only "
-            "then give the final answer.")
+            "now call save_to_scratchpad with a SELECT that computes the geometry (or objectids); "
+            "several items = ONE call with an item_name column (own label/color columns); "
+            "alpha = 1 - transparency. Only then give the final answer."
+            + ("\nMatching recipe(s):\n" + "\n".join(recipes) if recipes else ""))
 
 
 def wants_scratchpad(question: str) -> bool:
     return bool(_SCRATCH_INTENT_RE.search(question or ""))
+
+
+# An answer that reports a new item. Seen in every evaluation round: the model
+# says "created" although no save succeeded (production/docs/scratchpad-prompt-evaluation.md).
+_SAVE_CLAIM_RE = re.compile(
+    r"\b(created|saved|added|drawn|placed|stored|shown|displayed|erstellt|gespeichert|hinzugefügt|"
+    r"hinzugefuegt|angelegt|gezeichnet|gesetzt|platziert|eingefügt|eingefuegt|angezeigt|"
+    r"dargestellt)\b",
+    re.IGNORECASE)
+
+SAVE_CLAIM_NUDGE = (
+    "Your answer says an item was created, but no save_to_scratchpad call succeeded in this "
+    "turn, so nothing is drawn. Call save_to_scratchpad now (several items: ONE call with an "
+    "item_name column), or tell the user plainly that the item could not be saved.")
+
+EMPTY_REPLY_NUDGE = ("Your last reply was empty. Continue: call the next tool, or give the "
+                     "final answer to the user's question.")
+
+
+def scratch_saved_names(raw_result: str) -> list[str]:
+    """Names of the items a scratchpad tool result reports as saved (ok)."""
+    try:
+        report = json.loads(raw_result).get("scratchpad")
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return []
+    rows = report if isinstance(report, list) else [report]
+    return [str(r.get("name")) for r in rows
+            if isinstance(r, dict) and r.get("ok") and r.get("name") and "action" not in r]
+
+
+def claims_unsaved_item(question: str, answer: str, saved: list) -> bool:
+    """True if the question asks for an item, nothing was saved this turn and
+    the answer still reports one as created (the backend then asks once more)."""
+    return (not saved and wants_scratchpad(question)
+            and bool(_SAVE_CLAIM_RE.search(answer or "")))
+
+
+# Answer language check. gpt-oss:20b answered most English questions in German
+# although the question was quoted next to "reply in the same language" (evaluation
+# round 3). Function words only, so German street names or attribute values in an
+# English answer do not count.
+_DE_WORDS = re.compile(r"\b(der|die|das|und|ist|sind|wurde|wurden|mit|nicht|für|auf|ein|eine|"
+                       r"einen|im|dem|den|des|zu|als|hat|haben|es|sie|wir|bitte|wie|viele|welche|"
+                       r"welcher|was|gibt|alle|erstelle|zeige|diese|dieses|um|füge)\b", re.IGNORECASE)
+_EN_WORDS = re.compile(r"\b(the|and|is|are|was|were|with|not|for|on|a|an|of|to|as|has|have|it|"
+                       r"they|we|please|this|that|which|how|many|what|there|all|create|show)\b",
+                       re.IGNORECASE)
+
+
+def _language_of(text: str) -> str | None:
+    """'en', 'de' or None (too short or unclear), from function words."""
+    de, en = len(_DE_WORDS.findall(text or "")), len(_EN_WORDS.findall(text or ""))
+    if de + en < 2:
+        return None
+    if de >= 2 * en + 1:
+        return "de"
+    if en >= 2 * de + 1:
+        return "en"
+    return None
+
+
+def wrong_language_nudge(question: str, answer: str) -> str:
+    """A request to rewrite ``answer`` when it is clearly in another language
+    (English/German) than ``question``; "" otherwise. Used once per turn."""
+    q, a = _language_of(question), _language_of(answer)
+    if not q or not a or q == a:
+        return ""
+    name = {"en": "English", "de": "German"}[q]
+    return (f"Your answer is not in the language of the user's question. Rewrite the same "
+            f"answer in {name}; do not call any tool.")
+
+
+def no_answer_text(saved: list) -> str:
+    """Final text when the model returns nothing even after one retry."""
+    if saved:
+        return ("The model stopped without an answer. Saved in this turn: "
+                + ", ".join(saved) + ".")
+    return "The model stopped without an answer. Please try again or rephrase the question."
 
 
 def scratch_tool_result(raw: str) -> dict:

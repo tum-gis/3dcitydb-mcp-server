@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import threading
 
 from psycopg2 import sql as _pg_sql
@@ -178,7 +179,7 @@ def _audit(op: str, user_id: str, **details) -> None:
         with _audit_lock, open(path, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except OSError as exc:
-        print(f"[scratchpad] audit log not written ({path}): {exc}", flush=True)
+        print(f"[scratchpad] audit log not written ({path}): {exc}", file=sys.stderr, flush=True)
 
 
 def enabled() -> bool:
@@ -223,11 +224,16 @@ def guard_sql(sql: str) -> str | None:
 
 def query_password() -> str:
     """CITYDB_QUERY_PASSWORD, or one derived from the owner login, so the web UI
-    and every MCP subprocess agree without storing a secret."""
+    and every MCP subprocess agree without storing a secret.
+
+    The role exists once per PostgreSQL server, not per database, so the
+    derived password must not depend on CITYDB_NAME: otherwise provisioning a
+    second database on the same server (e.g. harthof next to citydb) changes
+    the password and the first one falls back to the SQL guard."""
     explicit = os.getenv("CITYDB_QUERY_PASSWORD")
     if explicit:
         return explicit
-    seed = f"citydb_query:{os.getenv('CITYDB_PASSWORD', '')}:{os.getenv('CITYDB_NAME', '')}"
+    seed = f"citydb_query:{os.getenv('CITYDB_USER', '')}:{os.getenv('CITYDB_PASSWORD', '')}"
     return hashlib.sha256(seed.encode()).hexdigest()[:32]
 
 
@@ -266,7 +272,9 @@ def run_query_target(owner_db: DatabaseConnection) -> tuple[DatabaseConnection, 
     """Connection for run_query and whether the SQL guard is needed.
 
     With the scratchpad on, run_query uses the query role; if that role cannot
-    log in (not provisioned, BYOD), it falls back to the owner + the guard."""
+    log in, it is provisioned once (this database's grants, current password)
+    and tried again; if that fails too (no CREATEROLE, BYOD), run_query falls
+    back to the owner + the guard."""
     global _query_role_ok
     if not enabled():
         return owner_db, False
@@ -274,9 +282,15 @@ def run_query_target(owner_db: DatabaseConnection) -> tuple[DatabaseConnection, 
         try:
             query_db().execute("SELECT 1")
             _query_role_ok = True
-        except Exception as exc:
-            print(f"[scratchpad] query role unavailable, using guard: {exc}", flush=True)
-            _query_role_ok = False
+        except Exception:
+            result = provision()
+            try:
+                query_db().execute("SELECT 1")
+                _query_role_ok = True
+            except Exception as exc:
+                print(f"[scratchpad] query role unavailable, using guard: {exc} "
+                      f"(provision: {result.get('error') or 'ok'})", file=sys.stderr, flush=True)
+                _query_role_ok = False
     return (query_db(), True) if _query_role_ok else (owner_db, True)
 
 
@@ -332,6 +346,28 @@ SELECT name, label, kind, color, alpha, clamp, geom, objectids, is_visible, data
 FROM {schema}.scratchpad
 WHERE user_id = current_setting('citydb.user_id', true)"""
 
+# Shortcuts for the save SQL: the 3DCityDB joins from a building to its solid
+# or its ground surfaces are long, and weak models get them wrong. Plain views
+# (read-only, filters on objectid are pushed down to the indexes).
+_HELPER_VIEWS_DDL = [
+    """CREATE OR REPLACE VIEW {schema}.building_solid AS
+SELECT b.objectid, substring(gp.name from 4 for 1)::int AS lod,
+       g.geometry AS geom, ST_ZMax(b.envelope) - ST_ZMin(b.envelope) AS height_m, b.envelope
+FROM {schema}.feature b
+JOIN {schema}.objectclass oc ON oc.id = b.objectclass_id AND oc.classname IN ('Building', 'BuildingPart')
+JOIN {schema}.property gp ON gp.feature_id = b.id AND gp.name ~ '^lod[1-4]Solid$'
+JOIN {schema}.geometry_data g ON g.id = gp.val_geometry_id""",
+    """CREATE OR REPLACE VIEW {schema}.building_footprint AS
+SELECT b.objectid, g.geometry AS geom
+FROM {schema}.feature b
+JOIN {schema}.objectclass oc ON oc.id = b.objectclass_id AND oc.classname IN ('Building', 'BuildingPart')
+JOIN {schema}.property r ON r.feature_id = b.id AND r.name = 'boundary'
+JOIN {schema}.feature s ON s.id = r.val_feature_id
+JOIN {schema}.objectclass sc ON sc.id = s.objectclass_id AND sc.classname = 'GroundSurface'
+JOIN {schema}.property sp ON sp.feature_id = s.id AND sp.val_geometry_id IS NOT NULL
+JOIN {schema}.geometry_data g ON g.id = sp.val_geometry_id""",
+]
+
 
 def _class_check_ddl() -> str:
     allowed = ", ".join("'" + c + "'" for c in CLASSES)  # inside $$ ... $$: no doubling
@@ -355,6 +391,13 @@ def provision(owner_db: DatabaseConnection | None = None) -> dict:
     except Exception as exc:
         out["error"] = f"table: {exc}"
         return out
+    try:
+        for ddl in _HELPER_VIEWS_DDL:
+            db.execute(_pg_sql.SQL(ddl).format(schema=schema))
+        out["views"] = True
+    except Exception as exc:  # e.g. a schema without these classes: the recipes then use the joins
+        out["views"] = False
+        out["error"] = f"helper views: {exc}"
     role = _pg_sql.Identifier(QUERY_ROLE)
     try:
         exists = db.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (QUERY_ROLE,))
@@ -413,8 +456,26 @@ t AS (SELECT n, CASE WHEN ST_SRID(g) = 0 THEN ST_SetSRID(g, s.srid)
                      ELSE g END AS g
       FROM c, (SELECT srid FROM database_srs LIMIT 1) s)
 SELECT n, ST_NPoints(g) AS vertices, ST_NDims(g) AS ndims,
+       ST_Dimension(g) = 1 AND ST_3DLength(g) = 0 AS zero_line, ST_ZMax(g) AS zmax,
        encode(ST_AsEWKB(CASE WHEN ST_HasArc(g) THEN ST_CurveToLine(g) ELSE g END), 'hex') AS ewkb
 FROM t"""
+
+# A model in evaluation round 2 drew ST_MakeLine(marker, ST_StartPoint(ST_3DShortestLine(marker, b)))
+# (the start point is the marker itself): right distance label, invisible line.
+_ZERO_LINE = ("the line has length 0 (both ends are the same point); use ST_3DShortestLine(a, b) "
+              "itself as geom, its start point is on a and its end point on b")
+
+# A 3D item whose highest point is this far below the city objects around it was
+# built from a relative height: a model used height_m (28 m) as the Z of roof
+# markers in a dataset whose ground is at 499 m (evaluation round 5).
+BELOW_GROUND_M = 100
+
+
+def _below_ground(zmax: float, ground: float) -> str:
+    return (f"the item lies {ground - zmax:.0f} m below the ground around it (its highest point is "
+            f"z {zmax:.1f}, the city objects nearby start at z {ground:.1f}): heights are absolute, "
+            f"take Z from the geometry (e.g. ST_ZMax(s.envelope) for a roof), not a relative height "
+            f"such as height_m")
 
 # Describes a geometry (EWKB hex), optionally after the expression {expr} of g.
 _SHAPE_SQL = """
@@ -546,18 +607,69 @@ def _check_vertices(row: dict) -> None:
                          "simplify it (e.g. ST_Simplify, CG_3DConvexHull) first")
 
 
+MAX_GROUPS = 50  # items one save call may create through an item_name column
+SPLIT_COLUMN = "item_name"
+
+
+def _group_item_name(prefix: str, value) -> str:
+    """Item name for one item_name value: the value itself when it already
+    starts with the prefix, else prefix_value ("energy" + "A" -> "energy_A")."""
+    text = safe_name(value).lstrip("_")
+    if not text:
+        raise ValueError(f"item_name {value!r} has no letters or digits")
+    if text.lower().startswith(prefix.lower()):
+        return text[:64]
+    return f"{prefix}_{text}"[:64]
+
+
+def _save_groups(user_id: str, prefix: str, inner: str, columns: set, settings: dict,
+                 qdb: DatabaseConnection, wdb: DatabaseConnection, color, **kwargs) -> list[dict]:
+    """One item per distinct item_name of the SELECT (saved by save_item each).
+    A color column gives each item its own colour; label/geom/objectid work
+    per item as in a single save."""
+    color_expr = "min(q.color::text)" if "color" in columns else "NULL"
+    groups = qdb.execute(
+        f"SELECT q.{SPLIT_COLUMN}::text AS v, {color_expr} AS c FROM ({inner}) q "
+        f"WHERE q.{SPLIT_COLUMN} IS NOT NULL GROUP BY 1 ORDER BY 1 LIMIT {MAX_GROUPS + 1}",
+        settings=settings)
+    if not groups:
+        raise ValueError(f"the {SPLIT_COLUMN} column is empty")
+    if len(groups) > MAX_GROUPS:
+        raise ValueError(f"more than {MAX_GROUPS} different {SPLIT_COLUMN} values; "
+                         "group the rows further or save in several calls")
+    names = [_group_item_name(prefix, g["v"]) for g in groups]
+    if len(set(names)) < len(names):
+        raise ValueError(f"different {SPLIT_COLUMN} values give the same item name; "
+                         "use values that differ in letters or digits")
+    results = []
+    for i, (group, item) in enumerate(zip(groups, names), 1):
+        # The i-th group by the same ordering as above; no value goes into the SQL text.
+        sub = (f"SELECT * FROM (SELECT q.*, dense_rank() OVER (ORDER BY q.{SPLIT_COLUMN}::text) "
+               f"AS item_group FROM ({inner}) q WHERE q.{SPLIT_COLUMN} IS NOT NULL) z "
+               f"WHERE z.item_group = {i}")
+        own = group.get("c")
+        results.append(save_item(user_id, item, sub, split=False, qdb=qdb, wdb=wdb,
+                                 color=own if isinstance(own, str) and _COLOR_RE.match(own) else color,
+                                 **kwargs))
+    return results
+
+
 def save_item(user_id: str, name: str, sql: str, *, label: str | None = None,
               color: str | None = None, clamp: bool = False, item_class: str | None = None,
               alpha: float | None = None, size_m: float | None = None, height_m: float | None = None,
               extrude_m: float | None = None, base_z: float | None = None,
+              split: bool = True,
               qdb: DatabaseConnection | None = None,
-              wdb: DatabaseConnection | None = None) -> dict:
+              wdb: DatabaseConnection | None = None) -> dict | list[dict]:
     """Re-run ``sql`` read-only as the user and store its result under ``name``.
 
     A ``geom`` column makes a geometry item (rows are collected into one), an
     ``objectid`` column a featureset. Saving an existing name replaces it.
     ``height_m`` / ``extrude_m`` / ``base_z`` make the geometry 3D (``_shape``).
-    ``alpha`` is the opacity (0-1, default DEFAULT_ALPHA; transparency = 1 - alpha)."""
+    ``alpha`` is the opacity (0-1, default DEFAULT_ALPHA; transparency = 1 - alpha).
+
+    An ``item_name`` column (with ``split``) creates one item per distinct
+    value, named ``<name>_<value>``, and returns a list of results."""
     try:
         _check_user(user_id)
         renamed_from = None
@@ -579,6 +691,10 @@ def save_item(user_id: str, name: str, sql: str, *, label: str | None = None,
         if not probe:
             raise ValueError("the query returned no rows, nothing to save")
         columns = set(probe[0])
+        if split and SPLIT_COLUMN in columns:
+            return _save_groups(user_id, name, inner, columns, settings, qdb, wdb, color,
+                                label=label, clamp=clamp, item_class=item_class, alpha=alpha,
+                                size_m=size_m, height_m=height_m, extrude_m=extrude_m, base_z=base_z)
         notes = []
         if "label" in columns:
             # A computed label (height, distance) wins: it matches the saved geometry.
@@ -589,11 +705,17 @@ def save_item(user_id: str, name: str, sql: str, *, label: str | None = None,
                 label = computed[:200]
             if rows and int(rows[0].get("labels") or 0) > 1:
                 notes.append(f"{rows[0]['labels']} different labels were joined into one item label; "
-                             "for one label each, save one item per row (one call each)")
+                             "for one item per row, save again with an item_name column (one item per value)")
         if "geom" in columns:
             row = qdb.execute(_GEOM_SQL.format(inner=inner), settings=settings)[0]
             if not row.get("ewkb"):
                 raise ValueError("the geom column is empty")
+            if row.get("zero_line"):
+                raise ValueError(_ZERO_LINE)
+            if (row.get("ndims") or 2) > 2 and not clamp and row.get("zmax") is not None:
+                ground = _ground_z(qdb, row["ewkb"])
+                if ground is not None and float(row["zmax"]) < ground - BELOW_GROUND_M:
+                    raise ValueError(_below_ground(float(row["zmax"]), ground))
             _check_vertices(row)
             meta, cls, clamp, _ = _shape(qdb, row["ewkb"], clamp=bool(clamp), item_class=item_class or None,
                                          height_m=height_m, extrude_m=extrude_m, base_z=base_z,
@@ -1019,7 +1141,7 @@ def import_items(user_id: str, payload, wdb: DatabaseConnection | None = None) -
                             if n > 0:
                                 missing_objects[item["name"]] = n
                         except Exception as exc:  # only information, never fatal
-                            print(f"[scratchpad] import: objectid check failed: {exc}", flush=True)
+                            print(f"[scratchpad] import: objectid check failed: {exc}", file=sys.stderr, flush=True)
             except ValueError as exc:
                 skipped.append({"name": item["name"], "reason": str(exc)})
                 continue
@@ -1156,8 +1278,11 @@ TOOL_SCHEMAS = {
             "run_query only looks things up. `sql` returns EITHER an `objectid` column (a group of "
             "city objects, e.g. buildings, coloured in the viewer) OR a `geom` column (one geometry "
             "item: point, line, polygon, solid; several rows are collected into one item); an optional "
-            "`label` column sets the label from a computed value (height, distance). One "
-            "item has one name, colour, alpha and label, so N groups or N labels need N calls. "
+            "`label` column sets the label from a computed value (height, distance). "
+            "SEVERAL ITEMS IN ONE CALL: add an `item_name` column; every distinct value becomes "
+            "its own item named <name>_<value>, with its own `label` and (optional `color` "
+            "column, #rrggbb) its own colour. Use it for one group per class, one marker per "
+            "building, one line per pair. "
             "Instead of sql, `geojson` takes a GeoJSON geometry/Feature/FeatureCollection in WGS84 "
             "lon/lat. Saving an existing name replaces it. Returns ok, count and the stored type "
             "(\"Z\" = with heights)."
@@ -1166,9 +1291,11 @@ TOOL_SCHEMAS = {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description":
-                         "Identifier: letters, digits, underscore, no spaces, e.g. energy_class_A."},
+                         "Identifier: letters, digits, underscore, no spaces, e.g. energy_class_A. "
+                         "With an item_name column it is the prefix (energy -> energy_A, energy_B)."},
                 "sql": {"type": "string", "description":
-                        "SELECT returning objectid rows (a group) or a geom column (a geometry)."},
+                        "SELECT returning objectid rows (a group) or a geom column (a geometry); "
+                        "optional columns: label, item_name (one item per value), color."},
                 "geojson": {"description": "GeoJSON (object or string) instead of sql."},
                 "label": {"type": "string", "description": "Text shown on the map, e.g. '32.2 m' (optional)."},
                 "color": {"type": "string", "description": "Colour as #rrggbb (optional)."},
