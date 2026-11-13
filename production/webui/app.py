@@ -4283,13 +4283,13 @@ if __name__ == "__main__":
         uvicorn.run(
             fastapi_app,
             host="0.0.0.0",
-            port=int(os.environ.get("GRADIO_PORT", "7860")),
+            port=int(os.environ.get("GRADIO_PORT", "7811")),
         )
     else:
         demo.queue(default_concurrency_limit=_WEBUI_CONCURRENCY)
         demo.launch(
             server_name="0.0.0.0",
-            server_port=int(os.environ.get("GRADIO_PORT", "7860")),
+            server_port=int(os.environ.get("GRADIO_PORT", "7811")),
             show_api=False,
             share=False,
         )

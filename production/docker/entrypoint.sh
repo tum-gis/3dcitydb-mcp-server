@@ -21,13 +21,16 @@ if [ -z "$DATABASE_URL" ]; then
   fi
 fi
 
-# Optionally also expose the MCP server over SSE/HTTP (port 8080). The
+# Optionally also expose the MCP server over SSE/HTTP (port 8811). The
 # container normally runs a single foreground process (the Gradio UI), so the
 # SSE server is launched in the background before `exec` hands the foreground
 # to webui.app. Enable with CITYDB_MCP_SSE=1 (host/port configurable).
+# It binds to 0.0.0.0 inside the container (needed for port publishing), so it
+# always requires a bearer token: CITYDB_MCP_AUTH_TOKEN, or one generated on
+# first start and stored in /app/data/mcp_auth_token (production/data on the host).
 if [ "${CITYDB_MCP_SSE:-0}" = "1" ]; then
   export MCP_SSE_HOST="${MCP_SSE_HOST:-0.0.0.0}"
-  export MCP_SSE_PORT="${MCP_SSE_PORT:-8080}"
+  export MCP_SSE_PORT="${MCP_SSE_PORT:-8811}"
   echo "Starting citydb-mcp SSE server on ${MCP_SSE_HOST}:${MCP_SSE_PORT} (endpoint: http://${MCP_SSE_HOST}:${MCP_SSE_PORT}/sse)..."
   python -m citydb_mcp.server_sse --host "${MCP_SSE_HOST}" --port "${MCP_SSE_PORT}" &
 fi

@@ -58,15 +58,24 @@ services:
       - CITYDB_SCHEMA=${CITYDB_SCHEMA:-citydb}
       # CITYDB_DOCKER_NETWORK / CITYDB_HOST_DATA_DIR are auto-detected from the
       # running container; set them only if you need to override the defaults.
-      # Expose the MCP server over SSE/HTTP on port 8080 (endpoint: /sse) so
-      # external MCP clients (e.g. VS Code) can connect without a local process.
+      # Expose the MCP server over HTTP on port 8811 (endpoints: /mcp, /sse) so
+      # external MCP clients (e.g. VS Code, Claude Code) can connect without a
+      # local process. Clients must send "Authorization: Bearer <token>": set
+      # CITYDB_MCP_AUTH_TOKEN in .env, or use the token generated on first
+      # start in ./data/mcp_auth_token.
       - CITYDB_MCP_SSE=1
       - MCP_SSE_HOST=0.0.0.0
-      - MCP_SSE_PORT=8080
+      - MCP_SSE_PORT=${MCP_SSE_PORT:-8811}
+      - GRADIO_PORT=${GRADIO_PORT:-7811}
     ports:
-      - "7860:7860"
+      # Gradio UI; change the port with GRADIO_PORT in .env.
+      - "${GRADIO_PORT:-7811}:${GRADIO_PORT:-7811}"
       - "127.0.0.1:7861:7861"
-      - "8080:8080"
+      # MCP server, published on this machine only. To reach it from other
+      # machines on purpose, drop the "127.0.0.1:" prefix, keep the token set,
+      # put a TLS reverse proxy in front, and add the public name to
+      # CITYDB_MCP_ALLOWED_HOSTS.
+      - "127.0.0.1:${MCP_SSE_PORT:-8811}:${MCP_SSE_PORT:-8811}"
     volumes:
       - ./data:/app/data
       # Docker socket — needed so Gradio can launch the citydb-tool container

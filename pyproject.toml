@@ -37,7 +37,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=1.10.0",
     "psycopg2-binary>=2.9.0",
     "python-dotenv>=1.0.0",
     "starlette>=0.36.0",

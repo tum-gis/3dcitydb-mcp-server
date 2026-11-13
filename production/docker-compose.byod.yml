@@ -16,8 +16,10 @@ services:
       - .env
     environment:
       - CITYDB_MCP_VARIANT=byod
+      - GRADIO_PORT=${GRADIO_PORT:-7811}
     ports:
-      - "7860:7860"
+      # Gradio UI; change the port with GRADIO_PORT in .env.
+      - "${GRADIO_PORT:-7811}:${GRADIO_PORT:-7811}"
     volumes:
       - ./data:/app/data
     restart: unless-stopped

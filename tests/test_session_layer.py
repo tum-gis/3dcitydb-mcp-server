@@ -151,6 +151,20 @@ def test_split_tool_ctx_strips_and_sanitizes():
     assert tool_context.split_tool_ctx({"sql": "x", "_ctx": "nope"}) == ({"sql": "x"}, {})
 
 
+def test_split_tool_ctx_ignores_ctx_when_untrusted(monkeypatch):
+    # The HTTP/SSE transport turns trust off: _ctx is stripped but ignored, so
+    # a remote client cannot pose as another user.
+    monkeypatch.setattr(tool_context, "trust_client_ctx", False)
+    args, ctx = tool_context.split_tool_ctx(
+        {"sql": "SELECT 1", "_ctx": {"user_id": UID_A, "session_id": "s"}})
+    assert args == {"sql": "SELECT 1"}
+    assert ctx == {}
+
+
+def test_stdio_trusts_ctx_by_default():
+    assert tool_context.trust_client_ctx is True
+
+
 def test_current_tool_ctx_is_scoped_to_the_call():
     token = tool_context.set_tool_ctx({"user_id": UID_A})
     assert tool_context.current_tool_ctx() == {"user_id": UID_A}

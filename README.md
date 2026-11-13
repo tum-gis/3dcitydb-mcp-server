@@ -65,7 +65,7 @@ There are four ways to run the 3DCityDB MCP Server (Option 3b is a 3D-viewer var
 |---|---|---|---|---|
 | **Best for** | Claude Code / Claude Desktop power users | Existing 3DCityDB instances | Starting from a `.gml`/`.json`/`.ifc` file | 3D exploration & highlighting of query results |
 | **Requires** | Python 3.10+, running 3DCityDB | Docker, running 3DCityDB | Docker only | Docker only (same as Option 3) |
-| **Gradio UI** | No (uses your AI client directly) | Yes (`localhost:7860`) | Yes (`localhost:7860`) | Yes (`localhost:7860`) with embedded 3D viewer |
+| **Gradio UI** | No (uses your AI client directly) | Yes (`localhost:7811`) | Yes (`localhost:7811`) | Yes (`localhost:7811`) with embedded 3D viewer |
 | **CityGML/CityJSON/IFC import** | Manual | Manual | Via Gradio UI | Via Gradio UI |
 | **Database** | Your own | Your own | Bundled (PostgreSQL + PostGIS + SFCGAL) | Bundled (same as Option 3) |
 
@@ -218,23 +218,107 @@ Add to your `claude_desktop_config.json`:
 
 Restart Claude Desktop. The MCP server will be listed in Settings → Developer → MCP Servers.
 
-### SSE transport (remote / production)
+### HTTP / SSE transport (remote / production)
 
-Run the server over HTTP for remote clients:
+`3dcitydb-mcp-sse` serves the MCP server over HTTP. Every endpoint except
+`/health` requires a bearer token, because anyone who can reach the server can
+otherwise run SQL queries against your database.
 
 ```bash
-3dcitydb-mcp-sse --host 0.0.0.0 --port 8080
+# Generate a token once and keep it in your .env (never commit it)
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+export CITYDB_MCP_AUTH_TOKEN=<the token>
+
+3dcitydb-mcp-sse                                  # binds 127.0.0.1:8811 (default)
+3dcitydb-mcp-sse --host 0.0.0.0 --port 8811       # all interfaces; token required
 ```
 
-- Clients connect via: `http://your-server:8080/sse`
-- Modern clients (e.g. VS Code) prefer the Streamable HTTP transport: `http://your-server:8080/mcp`
-- Health check: `http://your-server:8080/health`
+- Streamable HTTP (preferred by modern clients, e.g. VS Code, Claude Code): `http://localhost:8811/mcp/`
+- SSE (older clients): `http://localhost:8811/sse`
+- Health check (no token): `http://localhost:8811/health`
 
-The repository ships a ready-made [`.mcp.json`](.mcp.json) that points an
-MCP client (e.g. VS Code) at `http://localhost:8080/mcp/`. With the
-fullstack stack running locally, it enables the `3dcitydb-*` tools in your
-editor without any manual configuration. Adjust the URL if you run the
-SSE server on a different host or port.
+Clients send the token as `Authorization: Bearer <token>`. Token rules:
+
+| `CITYDB_MCP_AUTH_TOKEN` | Bind address | Behaviour |
+|---|---|---|
+| set | any | token required |
+| unset | loopback (`127.0.0.1`, `::1`, `localhost`) | no authentication, warning in the log |
+| unset | anything else (e.g. `0.0.0.0`) | a token is generated on first start, saved to `mcp_auth_token` (mode 0600) and required; the log names the file |
+
+The generated token file lives in `/app/data` in Docker (`production/data/` on
+the host), otherwise in your user config directory (`%APPDATA%\3dcitydb-mcp\`
+or `~/.config/3dcitydb-mcp/`); `CITYDB_MCP_AUTH_TOKEN_FILE` overrides the path.
+
+The server also checks the `Host` and `Origin` headers against DNS-rebinding
+attacks. `localhost`, `127.0.0.1` and `[::1]` are accepted on any port; add
+other names (e.g. the public name of a reverse proxy) to
+`CITYDB_MCP_ALLOWED_HOSTS` (comma-separated). Further settings:
+`CITYDB_MCP_MAX_CONNECTIONS` (default 32) and `CITYDB_STATEMENT_TIMEOUT_MS`
+(default 60000).
+
+> **Remote use:** a bearer token sent over plain HTTP can be read by anyone
+> on the network path. For access from other machines, put a reverse proxy
+> with TLS (e.g. Caddy, nginx, Traefik) in front of the server and keep the
+> server itself bound to `127.0.0.1`.
+
+**Claude Code** — the repository ships a ready-made [`.mcp.json`](.mcp.json)
+that points at `http://localhost:8811/mcp/` and reads the token from the
+`CITYDB_MCP_AUTH_TOKEN` environment variable:
+
+```json
+{
+  "mcpServers": {
+    "3dcitydb": {
+      "type": "http",
+      "url": "http://localhost:8811/mcp/",
+      "headers": { "Authorization": "Bearer ${CITYDB_MCP_AUTH_TOKEN}" }
+    }
+  }
+}
+```
+
+Or add it from the command line:
+`claude mcp add --transport http 3dcitydb http://localhost:8811/mcp/ --header "Authorization: Bearer <token>"`.
+
+**VS Code** (`.vscode/mcp.json`) — prompts for the token once and stores it securely:
+
+```json
+{
+  "inputs": [
+    { "type": "promptString", "id": "citydb-token", "description": "3DCityDB MCP token", "password": true }
+  ],
+  "servers": {
+    "3dcitydb": {
+      "type": "http",
+      "url": "http://localhost:8811/mcp/",
+      "headers": { "Authorization": "Bearer ${input:citydb-token}" }
+    }
+  }
+}
+```
+
+**Claude Desktop** (`claude_desktop_config.json`) — Claude Desktop starts
+local servers as processes, so bridge to the HTTP endpoint with
+[`mcp-remote`](https://www.npmjs.com/package/mcp-remote) (requires Node.js),
+or use the stdio setup above when the server runs on the same machine:
+
+```json
+{
+  "mcpServers": {
+    "3dcitydb": {
+      "command": "npx",
+      "args": ["mcp-remote", "http://localhost:8811/mcp/",
+               "--header", "Authorization: Bearer ${CITYDB_MCP_AUTH_TOKEN}"],
+      "env": { "CITYDB_MCP_AUTH_TOKEN": "<the token>" }
+    }
+  }
+}
+```
+
+With the fullstack stack (Option 3) the HTTP server runs inside the container
+and is published on `127.0.0.1:8811` only. Set `CITYDB_MCP_AUTH_TOKEN` in
+`production/.env`, or read the generated token from
+`production/data/mcp_auth_token`.
 
 ### LangChain agent CLI (optional)
 
@@ -301,7 +385,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 docker compose -f docker-compose.byod.yml up -d
 
 # 4. Open the UI
-# http://localhost:7860
+# http://localhost:7811
 ```
 
 The pre-built image (`ghcr.io/tum-gis/3dcitydb-mcp-agent:latest`) is pulled automatically from the GitHub Container Registry on first run.
@@ -428,7 +512,7 @@ cp /path/to/your/city.gml data/
 docker compose -f docker-compose.fullstack.yml up -d
 
 # 5. Open the UI
-# http://localhost:7860
+# http://localhost:7811
 ```
 
 Both images are pulled automatically from the GitHub Container Registry on first run. The first start takes ~60 seconds while PostgreSQL initialises.
@@ -622,6 +706,19 @@ All options are set via environment variables (`.env` file or Docker Compose `en
 | `CITYDB_PASSWORD` | *(required)* | Database password |
 | `CITYDB_SCHEMA` | `citydb` | 3DCityDB schema name |
 | `DATABASE_URL` | *(auto-built)* | Full PostgreSQL URL (overrides individual vars) |
+
+### Ports and MCP server over HTTP
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GRADIO_PORT` | `7811` | Web UI port (Docker variants; host and container side) |
+| `MCP_SSE_PORT` | `8811` | Port of `3dcitydb-mcp-sse` (also `--port`) |
+| `CITYDB_MCP_SSE` | `0` | Docker: `1` also starts the MCP server over HTTP (on by default in the fullstack compose file) |
+| `CITYDB_MCP_AUTH_TOKEN` | *(unset)* | Bearer token required on `/mcp`, `/sse` and `/messages/`; generated and stored in `mcp_auth_token` when unset and not bound to loopback |
+| `CITYDB_MCP_AUTH_TOKEN_FILE` | `/app/data/mcp_auth_token` (Docker) or user config dir | Where a generated token is stored |
+| `CITYDB_MCP_ALLOWED_HOSTS` | *(empty)* | Extra `Host` names accepted by the DNS-rebinding check (comma-separated; `host:*` for any port, `*` disables the check) |
+| `CITYDB_MCP_MAX_CONNECTIONS` | `32` | Maximum concurrent HTTP connections |
+| `CITYDB_STATEMENT_TIMEOUT_MS` | `60000` | Maximum run time of one SQL statement (`0` = none) |
 
 ### Fullstack only
 
@@ -818,7 +915,7 @@ Per-user state (user identity, per-tab Stop, parallel chats) — see
                (PostgreSQL + PostGIS)
 
 
-      Browser ──► Gradio UI (port 7860)       [Docker variants only]
+      Browser ──► Gradio UI (port 7811)       [Docker variants only]
                                 │
           ┌─────────────────────┴────────────────────┐
           │                                          │
@@ -883,6 +980,12 @@ These new features are already implemented (to full extent or partially):
 - [`idea-for-future-spatial-scratchpad.md`](production/docs/idea-for-future-spatial-scratchpad.md) — a per-user "spatial scratchpad" table + MCP tools to create, store, style, navigate to, visualize (in the 3D viewer) and delete temporary/derived spatial objects (markers, 2D overlays, 3D solids/pipes), isolated via row-level security, off by default. *Implemented in a slightly modified form, see [`scratchpad.md`](production/docs/scratchpad.md).*
 - [`idea-for-future-session-scoped-chat-cancellation.md`](production/docs/idea-for-future-session-scoped-chat-cancellation.md) — isolate Stop-button cancellation per chat session so concurrent users do not interrupt each other's work. *Implemented, see [`session-layer.md`](production/docs/session-layer.md).*
 - [`idea-for-future-llm-benchmarking.md`](production/docs/idea-for-future-llm-benchmarking.md) — a reusable CLI for interactive ChatBot conversations and repeatable multi-LLM benchmarks, including CSV question sets and optional independent answer grading. *Partially implemented and documented in [`benchmarking.md`](production/docs/benchmarking.md)*
+
+---
+
+## Security
+
+Please report vulnerabilities privately, not in public issues. See [SECURITY.md](SECURITY.md).
 
 ---
 

@@ -29,3 +29,6 @@ production/data/*.zip
 production/data/*.json
 production/data/*.citygml
 production/data/*.csv
+# Auto-generated bearer token of the HTTP/SSE MCP server; never commit it.
+mcp_auth_token
+production/data/mcp_auth_token

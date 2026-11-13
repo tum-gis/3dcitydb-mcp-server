@@ -49,7 +49,7 @@ docker compose -f production/docker-compose.byod.yml up -d
 
 ### 4. Open the UI
 
-Navigate to **http://localhost:7860**
+Navigate to **http://localhost:7811**
 
 ---
 
@@ -102,4 +102,6 @@ Data in your external database is unaffected.
 | `ANTHROPIC_API_KEY` | One of these | Anthropic API key |
 | `OPENAI_API_KEY` | One of these | OpenAI API key |
 | `OLLAMA_HOST` | One of these | Ollama base URL |
-| `CITYDB_MCP_AUTH_TOKEN` | ❌ | Bearer token for MCP SSE clients |
+| `GRADIO_PORT` | ❌ | Web UI port on host and container (default `7811`) |
+| `CITYDB_MCP_SSE` | ❌ | `1` also starts the MCP server over HTTP (port `MCP_SSE_PORT`, default `8811`; not published by the BYOD compose file) |
+| `CITYDB_MCP_AUTH_TOKEN` | ❌ | Bearer token that MCP HTTP/SSE clients must send (`Authorization: Bearer …`); generated into `/app/data/mcp_auth_token` if unset |

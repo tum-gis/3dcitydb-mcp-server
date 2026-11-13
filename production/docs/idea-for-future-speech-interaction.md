@@ -276,7 +276,7 @@ usable manual-voice version after ~1 week.
 
 1. **Secure context for the microphone.** `getUserMedia` only works on
    `https://` or `localhost`. The fullstack stack is served on
-   `http://<host>:7860`, so **LAN users need a reverse proxy with a
+   `http://<host>:7811`, so **LAN users need a reverse proxy with a
    certificate** (or an SSH port-forward to `localhost`). Same-machine
    use works as-is. This is the most likely "it doesn't work over the
    network" issue and needs a short runbook.

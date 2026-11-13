@@ -7,7 +7,7 @@ code, and how each is (or will be) addressed.
 ## Scope and method
 
 - **Environment:** Fullstack Docker deployment (`docker-compose.fullstack.yml`,
-  image `citydb-mcp-agent:local`), Web UI at `http://localhost:7860`, Ollama
+  image `citydb-mcp-agent:local`), Web UI at `http://localhost:7811`, Ollama
   server 0.33.2 on the LAN.
 - **Code path under test:** the Web UI local backend
   (`production/webui/backends/local.py`) — a **text-format ReAct agent**

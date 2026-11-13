@@ -6,6 +6,40 @@ Both components are versioned together. The format is loosely based on
 with 1.2.0; the 1.0.x and 1.1.0 entries below were reconstructed from the
 published GitHub release notes and the commit history.
 
+## [Unreleased]
+
+### Security
+- **HTTP/SSE transport requires authentication.** `3dcitydb-mcp-sse` now
+  requires `Authorization: Bearer <token>` on `/mcp`, `/sse` and `/messages/`
+  (`/health` stays open). The token is read from `CITYDB_MCP_AUTH_TOKEN`.
+  Without it, the server only runs unauthenticated on a loopback address; on
+  any other bind address it generates a token on first start, stores it in
+  `mcp_auth_token` (mode 0600; `/app/data` in Docker, otherwise the user's
+  config directory, or `CITYDB_MCP_AUTH_TOKEN_FILE`) and enforces it.
+- **Safe defaults.** `--host` defaults to `127.0.0.1` (was `0.0.0.0`). The
+  fullstack compose file publishes the MCP port on `127.0.0.1` only.
+- **DNS-rebinding protection** for both HTTP transports: `Host` and `Origin`
+  are checked; `localhost`, `127.0.0.1` and `[::1]` are accepted on any port,
+  `CITYDB_MCP_ALLOWED_HOSTS` adds names.
+- **No user impersonation over HTTP.** The HTTP server ignores the
+  client-supplied `_ctx` session context, so HTTP clients use the shared
+  `CITYDB_SCRATCHPAD_MCP_USER` scratchpad identity. The web UI (stdio) is
+  unchanged.
+- `/health` no longer returns database error details.
+- Limits: `CITYDB_MCP_MAX_CONNECTIONS` (default 32) for the HTTP server and a
+  per-statement `statement_timeout` (`CITYDB_STATEMENT_TIMEOUT_MS`, default
+  60000 ms, `0` disables) on every database connection.
+- New `SECURITY.md` on reporting vulnerabilities privately.
+
+### Changed
+- **Default ports moved off commonly used ones:** MCP HTTP/SSE server
+  `8080` → `8811` (`--port`, `MCP_SSE_PORT`), Gradio web UI `7860` → `7811`
+  (`GRADIO_PORT`). The compose files take both ports from these variables.
+  Update your `.mcp.json` / client configuration and bookmarks.
+- `.mcp.json` points at `http://localhost:8811/mcp/` and sends
+  `Authorization: Bearer ${CITYDB_MCP_AUTH_TOKEN}`.
+- Minimum `mcp` version raised to 1.10 (`mcp.server.transport_security`).
+
 ## [1.2.0]
 
 ### Added
