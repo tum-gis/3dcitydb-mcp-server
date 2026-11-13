@@ -1,5 +1,8 @@
 """Spatial scratchpad: per-user saved results that the 3D viewer can show.
 
+The viewer's item list can export all items of a user as a JSON file and
+import such a file (``export_items`` / ``import_items``).
+
 An item is either a *featureset* (a list of objectids, coloured in the tiles)
 or a *geometry* (pin, line, area, solid). Clients create and manage items with
 the MCP tools in ``TOOL_SCHEMAS`` (see production/docs/scratchpad.md);
@@ -660,6 +663,313 @@ def update_item(user_id: str, name: str, *, label=None, color=None, alpha=None, 
         return {"ok": True, "name": name, "updated": changed}
     except Exception as exc:
         return {"ok": False, "name": name, "error": str(exc)}
+
+
+# ── Export / import (the viewer's item list: a JSON file per user) ────────────
+# Plain JSON, not GeoJSON: geometries stay in the database's CRS with their
+# heights (EWKT), so another person with the same dataset gets exactly the
+# same items. The file is untrusted on import: every field is checked, the
+# geometry only ever reaches PostGIS as a bound parameter, and all rows are
+# written in one statement (one transaction).
+
+FILE_FORMAT = "3dcitydb-scratchpad"
+FILE_VERSION = 1
+MAX_IMPORT_BYTES = 5 * 1024 * 1024
+MAX_LABEL_CHARS = 500
+MAX_OBJECTID_CHARS = 256
+
+_EXPORT_SQL = """
+SELECT name, label, kind, class, color, alpha, clamp, is_visible, data, created_at, updated_at,
+       ST_AsEWKT(geom) AS geom, objectids
+FROM {schema}.scratchpad WHERE user_id = %s ORDER BY created_at, name"""
+
+_DB_SRID_SQL = "SELECT srid FROM {schema}.database_srs LIMIT 1"
+
+# Reads a geometry from the file (EWKT, bound parameter), gives it the file's
+# SRID if it has none and transforms it to the database's; describes the result.
+_IMPORT_SHAPE_SQL = """
+WITH i AS (SELECT ST_GeomFromEWKT(%(ewkt)s) AS g),
+s AS (SELECT CASE WHEN ST_SRID(i.g) = 0 THEN ST_SetSRID(i.g, %(file_srid)s) ELSE i.g END AS g FROM i),
+t AS (SELECT CASE WHEN ST_SRID(s.g) <> %(db_srid)s THEN ST_Transform(s.g, %(db_srid)s) ELSE s.g END AS g
+      FROM s)
+SELECT ST_NPoints(g) AS vertices, GeometryType(g) AS gtype, ST_NDims(g) AS ndims,
+       (SELECT array_agg(DISTINCT GeometryType(ST_GeometryN(g, k)))
+        FROM generate_series(1, ST_NumGeometries(g)) k) AS members,
+       (SELECT bool_and(GeometryType(ST_GeometryN(g, k)) IN ('POLYHEDRALSURFACE', 'TIN')
+                        AND ST_IsClosed(ST_GeometryN(g, k)))
+        FROM generate_series(1, ST_NumGeometries(g)) k) AS closed,
+       encode(ST_AsEWKB(g), 'hex') AS shape_ewkb
+FROM t"""
+
+_FOUND_SQL = "SELECT count(DISTINCT objectid) AS n FROM {schema}.feature WHERE objectid = ANY(%s::text[])"
+
+_IMPORT_ROW = ("(%s, %s, %s, %s, %s, %s, %s, %s, "
+               "CASE WHEN %s::text IS NULL THEN NULL ELSE ST_GeomFromEWKB(decode(%s, 'hex')) END, "
+               "%s::text[], %s, %s::jsonb, COALESCE(%s::timestamptz, now()))")
+
+_IMPORT_SQL = """
+INSERT INTO {{schema}}.scratchpad
+    (user_id, name, label, kind, class, color, alpha, clamp, geom, objectids, is_visible, data, created_at)
+VALUES {rows}
+ON CONFLICT (user_id, name) DO UPDATE SET
+    label = EXCLUDED.label, kind = EXCLUDED.kind, class = EXCLUDED.class, color = EXCLUDED.color,
+    alpha = EXCLUDED.alpha, clamp = EXCLUDED.clamp, geom = EXCLUDED.geom,
+    objectids = EXCLUDED.objectids, is_visible = EXCLUDED.is_visible, data = EXCLUDED.data,
+    updated_at = now()
+RETURNING name"""
+
+
+def _db_srid(db: DatabaseConnection) -> int:
+    rows = db.execute(_pg_sql.SQL(_DB_SRID_SQL).format(schema=_pg_sql.Identifier(db.schema)))
+    if not rows or rows[0].get("srid") is None:
+        raise ValueError("the database has no SRID (database_srs is empty)")
+    return int(rows[0]["srid"])
+
+
+def _iso(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+def export_items(user_id: str, db: DatabaseConnection | None = None) -> dict:
+    """All items of the user as the import/export file (a dict, see
+    production/docs/scratchpad.md). Raises ValueError without a valid user."""
+    import datetime
+
+    _check_user(user_id)
+    db = db or _owner_reader()
+    rows = db.execute(_pg_sql.SQL(_EXPORT_SQL).format(schema=_pg_sql.Identifier(db.schema)), (user_id,))
+    items = []
+    for r in rows:
+        item = {"name": r["name"], "label": r.get("label"), "kind": r["kind"], "class": r.get("class"),
+                "color": r.get("color") or DEFAULT_COLOR,
+                "alpha": float(r["alpha"]) if r.get("alpha") is not None else 0.8,
+                "clamp": bool(r.get("clamp")), "is_visible": bool(r.get("is_visible")),
+                "data": r.get("data") if isinstance(r.get("data"), dict) else {},
+                "created_at": _iso(r.get("created_at")), "updated_at": _iso(r.get("updated_at"))}
+        if r["kind"] == "geometry":
+            item["geom"] = r.get("geom")
+        else:
+            item["objectids"] = list(r.get("objectids") or [])
+        items.append(item)
+    out = {"format": FILE_FORMAT, "version": FILE_VERSION, "srid": _db_srid(db),
+           "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+           "items": items}
+    _audit("export", user_id, count=len(items))
+    return out
+
+
+def _parse_file(payload) -> dict:
+    """The file as a dict with format/version/items checked (ValueError otherwise)."""
+    if isinstance(payload, (bytes, bytearray)):
+        if len(payload) > MAX_IMPORT_BYTES:
+            raise ValueError(f"file too large (max {MAX_IMPORT_BYTES // (1024 * 1024)} MB)")
+        payload = payload.decode("utf-8", errors="strict")
+    if isinstance(payload, str):
+        if len(payload.encode("utf-8")) > MAX_IMPORT_BYTES:
+            raise ValueError(f"file too large (max {MAX_IMPORT_BYTES // (1024 * 1024)} MB)")
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            raise ValueError(f"not a JSON file: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("not a scratchpad file (expected a JSON object)")
+    if payload.get("format") != FILE_FORMAT:
+        raise ValueError(f"not a scratchpad file (format must be {FILE_FORMAT!r})")
+    if payload.get("version") != FILE_VERSION:
+        raise ValueError(f"unsupported file version {payload.get('version')!r} (supported: {FILE_VERSION})")
+    srid = payload.get("srid")
+    if srid is not None and (isinstance(srid, bool) or not isinstance(srid, int) or not 0 < srid < 1_000_000):
+        raise ValueError("srid must be a positive integer")
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise ValueError("the file has no item list")
+    if len(items) > MAX_ITEMS:
+        raise ValueError(f"too many items in the file ({len(items)}, max {MAX_ITEMS})")
+    return payload
+
+
+def _has_nul(value) -> bool:
+    return "\x00" in value if isinstance(value, str) else False
+
+
+def _check_item(it) -> dict:
+    """One item of the file, checked and normalised (ValueError with the reason).
+    The geometry is checked later in the database."""
+    if not isinstance(it, dict):
+        raise ValueError("not an object")
+    name = it.get("name")
+    if not valid_name(name):
+        raise ValueError("invalid name (letters, digits, _; max 64)")
+    kind = it.get("kind")
+    if kind not in ("geometry", "featureset"):
+        raise ValueError("kind must be geometry or featureset")
+    label = it.get("label")
+    if label is not None and (not isinstance(label, str) or len(label) > MAX_LABEL_CHARS or _has_nul(label)):
+        raise ValueError(f"label must be text (max {MAX_LABEL_CHARS} characters)")
+    color = it.get("color")
+    color = color if isinstance(color, str) and _COLOR_RE.match(color) else DEFAULT_COLOR
+    alpha = it.get("alpha", 0.8)
+    if alpha is None:
+        alpha = 0.8
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not 0 <= alpha <= 1:
+        raise ValueError("alpha must be a number between 0 and 1")
+    clamp, visible = it.get("clamp", False), it.get("is_visible", True)
+    if not isinstance(clamp, bool) or not isinstance(visible, bool):
+        raise ValueError("clamp and is_visible must be true or false")
+    data = it.get("data")
+    data = {} if data is None else data
+    if not isinstance(data, dict):
+        raise ValueError("data must be an object")
+    data = dict(data)
+    size_m = data.get("size_m")
+    if size_m is not None and (isinstance(size_m, bool) or not isinstance(size_m, (int, float))
+                               or not 0 < size_m < 1e6):
+        data.pop("size_m")  # list_items casts it to a number
+    data_json = json.dumps(data, ensure_ascii=False)
+    if "\\u0000" in data_json:
+        raise ValueError("data contains a NUL character")
+    created = it.get("created_at")
+    if created is not None:
+        import datetime
+        try:
+            created = datetime.datetime.fromisoformat(str(created)).isoformat()
+        except ValueError:
+            created = None
+    cls = it.get("class")
+    if cls is not None and cls not in CLASSES:
+        raise ValueError(f"unknown class {cls!r}")
+    out = {"name": name, "label": label or None, "kind": kind, "class": cls, "color": color,
+           "alpha": float(alpha), "clamp": clamp, "is_visible": visible, "data": data_json,
+           "created_at": created, "geom": None, "objectids": None}
+    if kind == "featureset":
+        if cls not in (None, "FeatureSet"):
+            raise ValueError(f"class {cls} does not fit a featureset (FeatureSet)")
+        out["class"] = "FeatureSet"
+        ids = it.get("objectids")
+        if not isinstance(ids, list):
+            raise ValueError("a featureset needs an objectids list")
+        if len(ids) > MAX_FEATURESET:
+            raise ValueError(f"too many objects ({len(ids)}, max {MAX_FEATURESET})")
+        if not all(isinstance(i, str) and 0 < len(i) <= MAX_OBJECTID_CHARS and not _has_nul(i) for i in ids):
+            raise ValueError("objectids must be non-empty strings")
+        out["objectids"] = list(dict.fromkeys(ids))
+    else:
+        if cls == "FeatureSet":
+            raise ValueError("class FeatureSet needs kind featureset")
+        geom = it.get("geom")
+        if not isinstance(geom, str) or not geom.strip() or _has_nul(geom):
+            raise ValueError("a geometry item needs geom as EWKT text")
+        out["geom"] = geom.strip()
+    return out
+
+
+def import_items(user_id: str, payload, wdb: DatabaseConnection | None = None) -> dict:
+    """Add the items of an export file (str, bytes or dict) to the user's
+    scratchpad; an existing name is replaced. Items that fail a check are
+    skipped with the reason; a file that is not a scratchpad file writes nothing.
+    All rows go in with one statement, so either all valid items are stored or none."""
+    result = {"ok": False, "imported": 0, "replaced": [], "skipped": []}
+    try:
+        _check_user(user_id)
+        data = _parse_file(payload)
+    except (ValueError, UnicodeDecodeError) as exc:
+        result["error"] = str(exc)
+        return result
+    try:
+        wdb = wdb or writer_db()
+        schema = _pg_sql.Identifier(wdb.schema)
+        skipped = result["skipped"]
+        checked, seen = [], set()
+        for idx, raw in enumerate(data["items"]):
+            label = raw.get("name") if isinstance(raw, dict) and isinstance(raw.get("name"), str) else f"#{idx + 1}"
+            try:
+                item = _check_item(raw)
+            except ValueError as exc:
+                skipped.append({"name": label[:64], "reason": str(exc)})
+                continue
+            if item["name"] in seen:
+                skipped.append({"name": item["name"], "reason": "duplicate name in the file"})
+                continue
+            seen.add(item["name"])
+            checked.append(item)
+
+        db_srid = _db_srid(wdb) if any(i["kind"] == "geometry" for i in checked) else None
+        file_srid = data.get("srid") or db_srid
+        missing_objects = {}
+        ready = []
+        for item in checked:
+            try:
+                if item["kind"] == "geometry":
+                    try:
+                        rows = wdb.execute(_IMPORT_SHAPE_SQL, {"ewkt": item["geom"], "file_srid": file_srid,
+                                                               "db_srid": db_srid})
+                    except Exception as exc:
+                        raise ValueError("the geometry could not be read: "
+                                         + str(exc).strip().splitlines()[0][:200]) from exc
+                    meta = rows[0] if rows else {}
+                    if not meta.get("shape_ewkb"):
+                        raise ValueError("the geometry could not be read")
+                    if not meta.get("vertices"):
+                        raise ValueError("the geometry is empty")
+                    _check_vertices(meta)
+                    gtype = (meta.get("gtype") or "").upper()
+                    if item["class"]:
+                        # The class must fit the geometry type; heights are not
+                        # checked (the viewer draws either way, as it was saved).
+                        if gtype not in _CLASS_TYPES[item["class"]]:
+                            raise ValueError(f"class {item['class']} does not fit a {gtype} geometry")
+                    else:
+                        item["class"] = classify(gtype, meta["ndims"], meta.get("members") or (),
+                                                 bool(meta.get("closed")), item["clamp"])
+                    item["ewkb"] = meta["shape_ewkb"]
+                else:
+                    item["ewkb"] = None
+                    if item["objectids"]:
+                        try:
+                            found = wdb.execute(_pg_sql.SQL(_FOUND_SQL).format(schema=schema),
+                                                (item["objectids"],))
+                            n = len(item["objectids"]) - int(found[0]["n"] if found else 0)
+                            if n > 0:
+                                missing_objects[item["name"]] = n
+                        except Exception as exc:  # only information, never fatal
+                            print(f"[scratchpad] import: objectid check failed: {exc}", flush=True)
+            except ValueError as exc:
+                skipped.append({"name": item["name"], "reason": str(exc)})
+                continue
+            ready.append(item)
+
+        existing = {r["name"] for r in wdb.execute(
+            _pg_sql.SQL("SELECT name FROM {}.scratchpad WHERE user_id = %s").format(schema), (user_id,))}
+        free = MAX_ITEMS - len(existing)
+        to_write = []
+        for item in ready:
+            if item["name"] not in existing:
+                if free <= 0:
+                    skipped.append({"name": item["name"], "reason": f"scratchpad full ({MAX_ITEMS} items)"})
+                    continue
+                free -= 1
+            to_write.append(item)
+
+        written = []
+        if to_write:
+            params = []
+            for it in to_write:
+                params += [user_id, it["name"], it["label"], it["kind"], it["class"], it["color"], it["alpha"],
+                           it["clamp"], it["ewkb"], it["ewkb"], it["objectids"], it["is_visible"], it["data"],
+                           it["created_at"]]
+            query = _pg_sql.SQL(_IMPORT_SQL.format(rows=", ".join([_IMPORT_ROW] * len(to_write)))).format(
+                schema=schema)
+            written = [r["name"] for r in wdb.execute(query, tuple(params))]
+        result.update(ok=True, imported=len(written),
+                      replaced=[n for n in written if n in existing])
+        if missing_objects:
+            result["objects_not_found"] = missing_objects
+        _audit("import", user_id, names=written, replaced=result["replaced"],
+               skipped=[s["name"] for s in skipped])
+        return result
+    except Exception as exc:
+        result.update(ok=False, imported=0, replaced=[], error=str(exc))
+        return result
 
 
 def touch_user(user_id: str, wdb: DatabaseConnection | None = None) -> None:

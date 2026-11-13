@@ -404,12 +404,15 @@ viewer replaces its scratchpad layer with it.
   terrain. Other geometries get a label above their bounding box.
 - *camera*: items that are new in this turn, and `goto`, fly to the items' combined bounding box
   (1.5 s, pitch -35 degrees).
-- *item list* (bottom right, English or German by browser language): colour swatch, name (click flies
-  to it; the tooltip shows the class), eye (show/hide) and bin (delete). The header ("Meine Objekte
-  (50)") stays fixed and only the list scrolls, at most 220 px high (`LIST_MAX_PX`, less in a small
+- *item list* (bottom right, English only): colour swatch, name (click flies
+  to it; the tooltip shows the class), eye (show/hide) and bin (delete). The header ("My items
+  (50)", with the buttons **Import** and **Export**, see [Export and import](#export-and-import))
+  stays fixed and only the list scrolls, at most 220 px high (`LIST_MAX_PX`, less in a small
   viewer: `45vh - 40px`), so many items never cover the map. A refresh keeps the scroll position, a
   new or flown-to item is scrolled into view, and a click on the header collapses the list (remembered
-  per browser in `localStorage`, `citydb_scratchpad_collapsed`). Checked with 50 items in a 540 px high
+  per browser in `localStorage`, `citydb_scratchpad_collapsed`). The list is shown as soon as the
+  first scratchpad list arrived from the web UI, also when it is empty ("Nothing saved yet"), so Import
+  is always reachable. Checked with 50 items in a 540 px high
   viewer: the list is 203 px high and scrolls through 1,250 px of rows.
 
 **List round trip.** A click posts `scratchpad-action` to the parent page. The parent accepts it only
@@ -470,6 +473,67 @@ docker exec -it production-citydb-agent-1 3dcitydb-chat chat --scratchpad-user <
 
 There is no viewer in the terminal: `goto` and the colours have no effect there.
 
+## Export and import
+
+The item list's header has two buttons. **Export** downloads all of the user's items as a JSON file
+(`scratchpad-YYYY-MM-DD.json`); **Import** reads such a file, e.g. one a colleague exported, and adds
+its items to the user's scratchpad, so both see the same objects. An item with a name that already
+exists is **replaced** (as with `save_to_scratchpad`); other items stay.
+
+The file is plain JSON, not GeoJSON: geometries stay in the database's CRS with their heights, so a
+person with the same dataset gets exactly the same items.
+
+```json
+{"format": "3dcitydb-scratchpad", "version": 1, "srid": 25832,
+ "exported_at": "2026-11-13T10:00:00+00:00",
+ "items": [
+   {"name": "my_area", "label": "Planned park", "kind": "geometry", "class": "Polygon3D",
+    "color": "#16a34a", "alpha": 0.8, "clamp": false, "is_visible": true,
+    "data": {"sql": "SELECT ...", "count": 1},
+    "created_at": "2026-11-12T09:30:00+00:00", "updated_at": "2026-11-13T09:00:00+00:00",
+    "geom": "SRID=25832;POLYGON Z ((...))"},
+   {"name": "affected_2013", "kind": "featureset", "class": "FeatureSet", "color": "#dc2626",
+    "alpha": 0.8, "clamp": false, "is_visible": true, "data": {},
+    "objectids": ["DEBY_LOD2_4959457", "..."]}]}
+```
+
+- `srid`: the database SRID of the stored geometries (`database_srs`). `geom` is EWKT
+  (`ST_AsEWKT`) for geometry items, `objectids` the list of feature ids for featuresets; the other one
+  is left out. There is no user id in the file.
+- **Export** (`scratchpad.export_items(user_id)`) reads the user's rows with the owner connection.
+- **Import** (`scratchpad.import_items(user_id, payload)`) treats the file as untrusted:
+  - the file: at most 5 MB (checked in the viewer, in `_on_scratch_sink` and in `import_items`),
+    JSON object, `format` and `version` as above, at most `MAX_ITEMS` items. Otherwise nothing is
+    written and the list shows "Import failed: ...".
+  - every item: a valid name, `kind`, `class` in the vocabulary and fitting the kind (featureset ->
+    `FeatureSet`), `alpha` 0-1, `clamp` / `is_visible` booleans, `data` an object (a non-numeric
+    `size_m` is dropped), `label` text. A colour that is not `#rrggbb` becomes the default. Featureset:
+    `objectids` a list of strings, at most `MAX_FEATURESET`. Geometry: the EWKT goes to PostGIS only
+    as a **bound parameter** (`ST_GeomFromEWKT(%s)`), gets the file's `srid` if it has none, is
+    transformed (`ST_Transform`) when that differs from the database SRID, must not be empty, must
+    have at most `MAX_VERTICES` vertices, and its type must fit the class (`_CLASS_TYPES`; a missing
+    class is derived as on a save). The INSERT then stores the server's own EWKB of that checked
+    geometry.
+  - an item that fails a check is **skipped** with the reason; the others are imported. Names that
+    occur twice in the file are imported once. If the user would have more than `MAX_ITEMS` items,
+    the remaining new ones are skipped ("scratchpad full").
+  - all rows are written with **one INSERT ... ON CONFLICT statement** (one transaction): all valid
+    items or none. Rows are written only for the importing user (`user_for(session_hash)`).
+  - feature ids that do not exist in this database are kept (another person may have the same
+    dataset) and only reported ("N object id(s) not found in this database").
+  - the result `{"ok", "imported", "replaced", "skipped": [{"name", "reason"}], "objects_not_found"?,
+    "error"?}` is shown in the list's status line for a few seconds.
+- Both write an audit line (`export` with the count, `import` with the names, replaced and skipped).
+
+**Round trip in the web UI.** Export posts `{action: "export"}` through `#scratch-sink`;
+`_on_scratch_sink` returns the fresh list with an `export` key (`{filename, data}`) and a `notice`
+into `#scratch-state`. The page JS (`window._downloadScratchpad`) saves `export` as a Blob download and
+removes it before forwarding the list to the viewer, so later updates do not download again (the
+kept copy `window.__citydbScratchpad` also has no notice). Import reads the file in the viewer
+(`FileReader`), posts `{action: "import", content}`; the parent forwards `content` only for
+`import`, and `_on_scratch_sink` calls `import_items` and sends the new list with the result as
+`notice`.
+
 ## Limitations
 
 - The ground height for `height_m` / `extrude_m` is an estimate from nearby city objects, not a
@@ -512,6 +576,11 @@ There is no viewer in the terminal: `goto` and the colours have no effect there.
 - `tests/test_chat_cli.py`: the CLI passes the four tools and its own user in `_ctx`, two consoles
   get different users, scratchpad reports do not become the tool cache, `close()` removes a
   generated scratchpad but keeps a given one, `--scratchpad-user` is validated.
+- `tests/test_scratchpad_io.py`: export file shape; import rejecting bad files (not JSON, wrong
+  format/version, oversize, too many items) without touching the database; per-item checks (names,
+  kind, class vs kind and vs geometry type, alpha, data, objectids, vertices, empty or unreadable
+  geometry), default colour, replace semantics and duplicates, `MAX_ITEMS`, user isolation, the
+  geometry only as a bound parameter, unknown objectids kept, one INSERT; the notice texts.
 - Web UI side: `scratch_tool_result` / `scratch_tool_hint`, `note_scratch_result` (focus names from the
   tool result), the prompt block (`SCRATCHPAD_TOOLS_INSTRUCTIONS`) only when enabled and no
   `scratch_save` convention in it, and the shape of `list_items`.

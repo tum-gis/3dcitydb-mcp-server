@@ -854,18 +854,83 @@ def _scratch_state_value(payload):
     return json.dumps({**payload, "t": time.time()}, ensure_ascii=False, default=str)
 
 
-def _on_scratch_sink(raw: str, request: gr.Request):
-    """A click in the viewer's item list (show / hide / delete / goto).
-    `raw` is untrusted browser input; the action runs for this tab's user only."""
+def _import_notice(report: dict) -> dict:
+    """Short text for the viewer's item list after an import."""
+    if not report.get("ok"):
+        return {"text": "Import failed: " + str(report.get("error") or "unknown error"), "error": True}
+    lines = [f"Imported {report.get('imported', 0)} item(s)"
+             + (f", {len(report['replaced'])} replaced" if report.get("replaced") else "") + "."]
+    skipped = report.get("skipped") or []
+    if skipped:
+        shown = "; ".join(f"{s.get('name')}: {s.get('reason')}" for s in skipped[:3])
+        more = f" (+{len(skipped) - 3} more)" if len(skipped) > 3 else ""
+        lines.append(f"Skipped {len(skipped)}: {shown}{more}")
+    missing = report.get("objects_not_found") or {}
+    if missing:
+        lines.append(f"{sum(missing.values())} object id(s) not found in this database "
+                     f"({', '.join(missing)}); kept anyway.")
+    return {"text": "\n".join(lines), "error": bool(skipped) and not report.get("imported")}
+
+
+def _on_scratch_export(user_id: str):
     from citydb_mcp.tools import scratchpad
 
     try:
+        data = scratchpad.export_items(user_id)
+    except Exception as exc:
+        print(f"[scratchpad] viewer export failed: {exc}", flush=True)
+        payload = build_scratchpad_payload(user_id)
+        if payload is None:
+            return gr.update()
+        return _scratch_state_value({**payload, "notice": {"text": f"Export failed: {exc}", "error": True}})
+    print(f"[scratchpad] viewer export: {len(data['items'])} item(s)", flush=True)
+    payload = build_scratchpad_payload(user_id)
+    if payload is None:
+        return gr.update()
+    filename = time.strftime("scratchpad-%Y-%m-%d.json")
+    return _scratch_state_value({**payload, "export": {"filename": filename, "data": data},
+                                 "notice": {"text": f"Exported {len(data['items'])} item(s) to {filename}."}})
+
+
+def _on_scratch_import(user_id: str, content):
+    from citydb_mcp.tools import scratchpad
+
+    if not isinstance(content, str):
+        report = {"ok": False, "error": "no file content"}
+    elif len(content.encode("utf-8", errors="replace")) > scratchpad.MAX_IMPORT_BYTES:
+        report = {"ok": False, "error": "file too large (max 5 MB)"}
+    else:
+        report = scratchpad.import_items(user_id, content)
+    print(f"[scratchpad] viewer import: ok={report.get('ok')} imported={report.get('imported')} "
+          f"replaced={len(report.get('replaced') or [])} skipped={len(report.get('skipped') or [])} "
+          f"error={report.get('error')}", flush=True)
+    payload = build_scratchpad_payload(user_id)
+    if payload is None:
+        return gr.update()
+    return _scratch_state_value({**payload, "notice": _import_notice(report)})
+
+
+def _on_scratch_sink(raw: str, request: gr.Request):
+    """A click in the viewer's item list (show / hide / delete / goto, export,
+    import). `raw` is untrusted browser input; the action runs for this tab's
+    user only."""
+    from citydb_mcp.tools import scratchpad
+
+    # the import content (max 5 MB) plus a little JSON around it
+    if not isinstance(raw, str) or len(raw) > scratchpad.MAX_IMPORT_BYTES * 2 + 4096:
+        return gr.update()
+    try:
         data = json.loads(raw) if raw else {}
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         data = {}
     if not isinstance(data, dict):
         return gr.update()
     action, name = data.get("action"), data.get("name")
+    if action in ("export", "import"):
+        user_id = user_for(getattr(request, "session_hash", None) or "local")
+        if action == "export":
+            return _on_scratch_export(user_id)
+        return _on_scratch_import(user_id, data.get("content"))
     if action not in scratchpad.ACTIONS or not scratchpad.valid_name(name):
         return gr.update()
     user_id = user_for(getattr(request, "session_hash", None) or "local")
@@ -3147,10 +3212,24 @@ async (_win, _event_data) => {
   // Spatial scratchpad (scratchpad-bridge.js): the user's saved items. The
   // last list is kept, so a viewer that loads later can ask for it again.
   window._sendScratchpad = function (payload) {
-    window.__citydbScratchpad = payload;
+    // kept for a viewer that loads later, without the one-off notice
+    window.__citydbScratchpad = Object.assign({}, payload, { notice: null });
     var target = vizWindow();
     if (!target) return;
     target.postMessage(Object.assign({ type: "scratchpad" }, payload), window.location.origin);
+  };
+  // Export from the viewer's item list: the server puts the file into the
+  // scratch_state payload once; it is saved here and not passed on.
+  window._downloadScratchpad = function (exp) {
+    if (!exp || !exp.data) return;
+    var name = /^[A-Za-z0-9_.-]{1,80}$/.test(exp.filename || "") ? exp.filename : "scratchpad.json";
+    var blob = new Blob([JSON.stringify(exp.data, null, 2)], { type: "application/json" });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
   };
   window._reloadTiles = function () {
     var f = document.getElementById("cesium-iframe");
@@ -3184,7 +3263,9 @@ async (_win, _event_data) => {
     } else if (data.type === "scratchpad-action") {
       var sink = document.querySelector("#scratch-sink textarea");
       if (!sink) return;
-      sink.value = JSON.stringify({ action: data.action, name: data.name, t: data.t });
+      var msg = { action: data.action, name: data.name, t: data.t };
+      if (data.action === "import" && typeof data.content === "string") msg.content = data.content;
+      sink.value = JSON.stringify(msg);
       sink.dispatchEvent(new Event("input", { bubbles: true }));
     } else if (data.type === "selection_done") {
       // "Finish" in the viewer's selection panel: the selection itself was
@@ -3934,7 +4015,9 @@ def build_ui() -> gr.Blocks:
             scratch_state = gr.Textbox(visible=True, elem_id="scratch-state", label="", value="")
             scratch_state.change(
                 fn=None, inputs=[scratch_state], outputs=[],
-                js="(raw) => { if (raw) window._sendScratchpad(JSON.parse(raw)); }",
+                js=("(raw) => { if (!raw) return; var p = JSON.parse(raw);"
+                    " if (p.export) { window._downloadScratchpad(p.export); delete p.export; }"
+                    " window._sendScratchpad(p); }"),
             )
             scratch_sink = gr.Textbox(visible=True, elem_id="scratch-sink", label="")
             scratch_sink.change(fn=_on_scratch_sink, inputs=[scratch_sink],

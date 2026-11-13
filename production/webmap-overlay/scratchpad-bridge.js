@@ -18,13 +18,15 @@
 
     var ORIGIN = window.location.origin;
     var ID_PROPERTIES = ["objectid", "id", "GMLID", "gmlid"];
-    var DE = (navigator.language || "").toLowerCase().indexOf("de") === 0;
-    var T = DE ? { title: "Meine Objekte", empty: "Noch nichts gespeichert", hide: "Ausblenden",
-                   show: "Einblenden", del: "Löschen", go: "Hinfliegen", objects: "Objekte",
-                   collapse: "Liste einklappen", expand: "Liste ausklappen" }
-               : { title: "My items", empty: "Nothing saved yet", hide: "Hide",
-                   show: "Show", del: "Delete", go: "Fly to", objects: "objects",
-                   collapse: "Collapse list", expand: "Expand list" };
+    var T = { title: "My items", empty: "Nothing saved yet", hide: "Hide", show: "Show",
+              del: "Delete", go: "Fly to", objects: "objects", collapse: "Collapse list",
+              expand: "Expand list", exportBtn: "Export", importBtn: "Import",
+              exportTip: "Download all your items as a JSON file",
+              importTip: "Add items from a JSON file exported here (same names are replaced)",
+              tooLarge: "File too large (max 5 MB)", readError: "Could not read the file",
+              importing: "Importing ..." };
+    var MAX_IMPORT_BYTES = 5 * 1024 * 1024;
+    var NOTICE_MS = 10000;
     var HIGHLIGHT = Cesium.Color.fromCssColorString("#ff5a00");
     var SELECTION = Cesium.Color.fromCssColorString("#a855f7");
     var OTHER = Cesium.Color.fromCssColorString("#e5e7eb");
@@ -401,9 +403,46 @@
     }
 
     // ── list panel ───────────────────────────────────────────────────────────
-    function post(action, name) {
-        window.parent.postMessage({ type: "scratchpad-action", action: action, name: name, t: Date.now() },
-                                  ORIGIN);
+    function post(action, name, content) {
+        var msg = { type: "scratchpad-action", action: action, name: name, t: Date.now() };
+        if (typeof content === "string") msg.content = content;
+        window.parent.postMessage(msg, ORIGIN);
+    }
+
+    // Import: the file is read here and sent as text; the server checks it
+    // (it is untrusted) and answers with the new list and a notice.
+    function pickImportFile() {
+        var input = document.createElement("input");
+        input.type = "file";
+        input.accept = ".json,application/json";
+        input.style.display = "none";
+        input.onchange = function () {
+            var file = input.files && input.files[0];
+            input.remove();
+            if (!file) return;
+            if (file.size > MAX_IMPORT_BYTES) { showNotice({ text: T.tooLarge, error: true }); return; }
+            var reader = new FileReader();
+            reader.onload = function () {
+                showNotice({ text: T.importing });
+                post("import", null, String(reader.result || ""));
+            };
+            reader.onerror = function () { showNotice({ text: T.readError, error: true }); };
+            reader.readAsText(file);
+        };
+        document.body.appendChild(input);
+        input.click();
+    }
+
+    var noticeTimer = null;
+    function showNotice(notice) {
+        ensurePanel();
+        var el = panel.querySelector("[data-status]");
+        if (noticeTimer) { clearTimeout(noticeTimer); noticeTimer = null; }
+        if (!notice || !notice.text) { el.style.display = "none"; return; }
+        el.textContent = String(notice.text);
+        el.style.color = notice.error ? "#fca5a5" : "#86efac";
+        el.style.display = "block";
+        noticeTimer = setTimeout(function () { el.style.display = "none"; noticeTimer = null; }, NOTICE_MS);
     }
 
     // The header stays put and only the list scrolls, at most LIST_MAX_PX high
@@ -426,7 +465,10 @@
             '#citydb-scratchpad [data-list]::-webkit-scrollbar-thumb{background:#64748b;border-radius:3px}</style>' +
             '<div data-head style="display:flex;align-items:center;gap:6px;flex:none;cursor:pointer;user-select:none">' +
             '<span style="font-weight:600;flex:1">' + T.title + ' <span data-count style="font-weight:400;color:#94a3b8"></span></span>' +
+            '<button data-import type="button"></button><button data-export type="button"></button>' +
             '<span data-toggle style="color:#cbd5e1;font-size:11px"></span></div>' +
+            '<div data-status style="display:none;flex:none;margin-top:4px;font-size:11px;' +
+            'white-space:pre-line;word-break:break-word"></div>' +
             '<div data-list style="flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;' +
             'margin-top:4px;padding-right:2px;max-height:min(' + LIST_MAX_PX + 'px, calc(45vh - 40px))"></div>';
         listEl = panel.querySelector("[data-list]");
@@ -435,6 +477,16 @@
             try { localStorage.setItem(COLLAPSED_KEY, collapsed ? "1" : "0"); } catch (e) { /* no storage */ }
             updateCollapsed();
         };
+        [["[data-import]", T.importBtn, T.importTip, pickImportFile],
+         ["[data-export]", T.exportBtn, T.exportTip, function () { post("export"); }]].forEach(function (b) {
+            var el = panel.querySelector(b[0]);
+            el.textContent = b[1];
+            el.title = b[2];
+            el.style.cssText = "background:rgba(148,163,184,.18);border:1px solid #475569;color:#e2e8f0;" +
+                "cursor:pointer;border-radius:4px;padding:0 5px;font:11px/1.5 sans-serif";
+            // a click on a button must not collapse/expand the list
+            el.onclick = function (ev) { ev.stopPropagation(); b[3](); };
+        });
         updateCollapsed();
         (document.getElementById("cesiumContainer") || document.body).appendChild(panel);
     }
@@ -456,11 +508,19 @@
 
     function renderPanel(focus) {
         ensurePanel();
-        panel.style.display = items.length ? "flex" : "none";
+        // Shown once the scratchpad is active (the first list arrived), also
+        // when empty, so Import is reachable.
+        panel.style.display = "flex";
         panel.querySelector("[data-count]").textContent = "(" + items.length + ")";
         var scrollTop = listEl.scrollTop;  // a refresh rebuilds the rows; keep the place
         var focusRow = null;
         listEl.innerHTML = "";
+        if (!items.length) {
+            var empty = document.createElement("div");
+            empty.style.cssText = "color:#94a3b8;padding:2px 0";
+            empty.textContent = T.empty;
+            listEl.appendChild(empty);
+        }
         items.forEach(function (it) {
             var row = document.createElement("div");
             if (focus && focus.indexOf(it.name) >= 0) focusRow = row;
@@ -504,6 +564,7 @@
             return items.some(function (it) { return it.name === n && it.visible; });
         });
         renderPanel(focus);
+        if (msg.notice) showNotice(msg.notice);
         if (focus.length) flyTo(focus);
         console.log("[scratchpad-bridge] items:", items.length, "featureset buildings:", colorById.size,
                     "focus:", focus);
