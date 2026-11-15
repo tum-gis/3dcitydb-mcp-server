@@ -8,6 +8,8 @@ published GitHub release notes and the commit history.
 
 ## [Unreleased]
 
+## [1.2.1]
+
 ### Security
 - **HTTP/SSE transport requires authentication.** `3dcitydb-mcp-sse` now
   requires `Authorization: Bearer <token>` on `/mcp`, `/sse` and `/messages/`
@@ -39,6 +41,7 @@ published GitHub release notes and the commit history.
 - `.mcp.json` points at `http://localhost:8811/mcp/` and sends
   `Authorization: Bearer ${CITYDB_MCP_AUTH_TOKEN}`.
 - Minimum `mcp` version raised to 1.10 (`mcp.server.transport_security`).
+- Bumped the MCP server and ChatBot version from 1.2.0 to 1.2.1.
 
 ## [1.2.0]
 
