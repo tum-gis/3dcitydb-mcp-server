@@ -698,6 +698,7 @@ is a pure data change — no code changes required.
 | `LOCAL_MAX_TOKENS` | `16000` | Maximum tokens the local model may generate per response |
 | `OLLAMA_TIMEOUT` | `300` | Timeout in seconds for Ollama requests |
 | `AGENT_MAX_ITERATIONS` | `10` | Maximum ReAct tool-call iterations per question |
+| `AGENT_MAX_CORRECTIONS` | `3` | How often per question the model is sent back to fix its answer (claims an unsaved scratchpad item, empty reply, wrong language), per kind of problem |
 
 ### WebUI story distillation (optional)
 

@@ -25,8 +25,9 @@ from langchain.agents.output_parsers import ReActSingleInputOutputParser
 from webui.session import TurnControl
 from webui.llm_utils import long_result_note, scratch_save_reminder, scratch_tool_hint, scratch_tool_result
 from webui.llm_utils import (SAVE_CLAIM_NUDGE, claims_unsaved_item, scratch_saved_names,
-                              wrong_language_nudge)
+                              tool_args_without_nulls, wrong_language_nudge)
 from webui.llm_utils import (
+    MAX_CORRECTIONS,
     MAX_ITERATIONS,
     _log_context_usage,
     _parse_tool_result,
@@ -242,8 +243,9 @@ class _EventCallback(BaseCallbackHandler):
         self._tools_called = 0
         self._parse_errors = 0  # counts _require_tool_call failures to break the retry loop
         self.saved_names: list[str] = []  # scratchpad items saved in this turn
-        self._claim_guard_used = False  # _check_save_claim fired (once per turn)
-        self._language_guard_used = False  # _check_language fired (once per turn)
+        # How often _check_save_claim / _check_language sent the model back in
+        # this turn (each up to MAX_CORRECTIONS times).
+        self.corrections = {"claim": 0, "language": 0}
         # Consecutive unparseable LLM responses WITHOUT a successful tool
         # execution in between (see _RobustReActParser._record_parse_failure).
         # A model that keeps emitting an unparseable action (e.g. granite4.2's
@@ -919,30 +921,40 @@ class _RobustReActParser(ReActSingleInputOutputParser):
         return OutputParserException(message, observation=message, llm_output=finish.log or "",
                                      send_to_llm=True)
 
+    def _may_correct(self, kind: str) -> bool:
+        """Count one correction of this kind; False once MAX_CORRECTIONS were
+        sent in this turn (a model that keeps failing must not loop)."""
+        counts = getattr(self._cb, "corrections", None)
+        if counts is None:
+            counts = self._cb.corrections = {}
+        if counts.get(kind, 0) >= MAX_CORRECTIONS:
+            return False
+        counts[kind] = counts.get(kind, 0) + 1
+        return True
+
     def _check_save_claim(self, finish: AgentFinish) -> None:
-        """Send one correction if the answer reports a scratchpad item although
-        no save succeeded in this turn (once per turn, so it cannot loop)."""
-        if (len(self._tool_names) < 2 or getattr(self._cb, "_claim_guard_used", False)
+        """Send the model back if the answer reports a scratchpad item although
+        no save succeeded in this turn (up to MAX_CORRECTIONS times)."""
+        if (len(self._tool_names) < 2
                 or not claims_unsaved_item(self._user_question,
                                            str(finish.return_values.get("output", "")),
-                                           getattr(self._cb, "saved_names", []))):
+                                           getattr(self._cb, "saved_names", []))
+                or not self._may_correct("claim")):
             return
-        self._cb._claim_guard_used = True
-        print("[local] answer claims an unsaved item — asking once more", flush=True)
+        print(f"[local] answer claims an unsaved item — correction "
+              f"{self._cb.corrections['claim']}/{MAX_CORRECTIONS}", flush=True)
         raise self._correction(
             SAVE_CLAIM_NUDGE + "\nUse this format:\nAction: save_to_scratchpad\n"
             'Action Input: {"name": "...", "sql": "SELECT ..."}', finish)
 
     def _check_language(self, finish: AgentFinish) -> None:
-        """Ask once for a rewrite when the Final Answer is clearly in another
-        language (English/German) than the user's question."""
-        if getattr(self._cb, "_language_guard_used", False):
-            return
+        """Ask for a rewrite when the Final Answer is clearly in another
+        language than the user's question (up to MAX_CORRECTIONS times)."""
         nudge = wrong_language_nudge(self._user_question, str(finish.return_values.get("output", "")))
-        if not nudge:
+        if not nudge or not self._may_correct("language"):
             return
-        self._cb._language_guard_used = True
-        print("[local] answer is in another language — asking for a rewrite", flush=True)
+        print(f"[local] answer is in another language — correction "
+              f"{self._cb.corrections['language']}/{MAX_CORRECTIONS}", flush=True)
         raise self._correction(nudge + "\nUse this format:\nFinal Answer: ...", finish)
 
     def _parse_impl(self, text: str) -> AgentAction | AgentFinish:
@@ -1347,7 +1359,7 @@ def react_stream(
                         "Call the tool again with valid JSON.")
             print(f"[local] {name} → {json.dumps(args, ensure_ascii=False)[:160]}", flush=True)
             try:
-                raw = str(entry["run"](args))
+                raw = str(entry["run"](tool_args_without_nulls(args)))
             except Exception as exc:
                 raw = json.dumps({"error": str(exc)})
             callback.last_extra_raw = raw

@@ -143,17 +143,21 @@ def test_save_refuses_a_line_of_length_zero():
     assert "ST_3DLength(g) = 0" in sp._GEOM_SQL
 
 
-def test_save_refuses_a_3d_item_far_below_the_ground():
-    """Markers at z = height_m (28 m) in a city whose ground is at 499 m."""
+def test_save_keeps_a_3d_item_far_below_the_ground_with_a_height_hint():
+    """Markers at z = height_m (28 m) in a city whose ground is at 499 m: saved
+    (tunnels or pipes may lie that deep), with a hint how to fix the height."""
     def qdb(zmax):
         return FakeDb({"ST_HasArc": [{"n": 1, "vertices": 1, "ndims": 3, "zmax": zmax, "ewkb": "01"}],
                        "AS ground": [{"ground": 499.0}], "shape_ewkb": _shape_reply("POINT", 3),
                        "LIMIT 1": [{"geom": "g"}]})
-    out = sp.save_item(UID, "m", "SELECT g AS geom", item_class="3Dmarker", qdb=qdb(28.6), wdb=FakeDb())
-    assert not out["ok"] and "ST_ZMax(s.envelope)" in out["error"] and "470 m below" in out["error"]
-    out = sp.save_item(UID, "m", "SELECT g AS geom", item_class="3Dmarker", qdb=qdb(527.9),
+    out = sp.save_item(UID, "m", "SELECT g AS geom", item_class="3Dmarker", qdb=qdb(28.6),
                        wdb=FakeDb({"count(*) AS n": [{"n": 0}]}))
     assert out["ok"], out
+    assert "470 m below" in out["note"] and "ST_ZMax(s.envelope)" in out["note"]
+    assert "same name" in out["note"] and "underground, keep it" in out["note"]
+    out = sp.save_item(UID, "m", "SELECT g AS geom", item_class="3Dmarker", qdb=qdb(527.9),
+                       wdb=FakeDb({"count(*) AS n": [{"n": 0}]}))
+    assert out["ok"] and "below" not in out.get("note", ""), out
 
 
 # ── actions, purge ────────────────────────────────────────────────────────────
@@ -416,12 +420,14 @@ def test_prompt_block_teaches_compute_in_sql_and_the_recipes():
     assert "PostGIS computes, the scratchpad draws" in block
     assert "alpha = 1 - X/100" in block and "30 % -> 0.7" in block
     assert "SEVERAL ITEMS = ONE CALL" in block and "item_name" in block
-    assert "building_solid(objectid" in block and "building_footprint(objectid" in block
+    assert "feature_geometry(objectid, class, property" in block
+    assert "feature_boundary(objectid, class, surface_class" in block
+    assert "building_solid" not in block and "building_footprint" not in block
     assert "A `label` column sets the" in block and block.count("' m' AS label") == 2
     for recipe in ("CG_3DConvexHull", "CG_OptimalAlphaShape", "ST_DumpPoints", "ST_ZMax(s.envelope)",
                    "ST_3DShortestLine", "ST_Buffer(ST_Force2D(p.geom)", "generate_series", "ST_3DExtent"):
         assert recipe in block, recipe
-    assert len(block) < 6000  # weak models do worse with long prompts
+    assert len(block) < 6500  # weak models do worse with long prompts
 
 
 def test_sfcgal_functions_that_fail_at_run_time_are_not_advertised():
@@ -907,8 +913,11 @@ def test_provision_creates_the_helper_views():
     db.conn_params = {"dbname": "citydb"}
     out = sp.provision(db)
     assert out["table"] and out["views"] and out["role"]
-    created = " ".join(c[0] for c in db.calls)
-    assert "building_solid" in created and "building_footprint" in created
+    created = " ".join(str(c[0]) for c in db.calls)
+    assert "feature_geometry" in created and "feature_boundary" in created
+    # For every feature class (roads, bridges, ...), not only buildings.
+    views = " ".join(sp._HELPER_VIEWS_DDL)
+    assert "'Building'" not in views and "GroundSurface" not in views
 
 
 @pytest.mark.parametrize("question,first", [
@@ -977,42 +986,64 @@ def test_cloud_asks_once_when_the_answer_claims_an_unsaved_item(monkeypatch):
     assert "Create a group s of all buildings" in tool_msgs[-1]["content"]
 
 
-def test_cloud_claim_guard_fires_only_once(monkeypatch):
+def test_cloud_claim_guard_stops_after_max_corrections(monkeypatch):
     from types import SimpleNamespace as NS
+    from webui.backends import cloud
 
-    replies = [NS(choices=[NS(message=NS(content="The group s was created.", tool_calls=None))]),
-               NS(choices=[NS(message=NS(content="The group s was created.", tool_calls=None))])]
+    monkeypatch.setattr(cloud, "MAX_CORRECTIONS", 3)
+    claim = "The group s was created."
+    replies = [NS(choices=[NS(message=NS(content=claim, tool_calls=None))]) for _ in range(4)]
     events, sent = _cloud_run(monkeypatch, replies, "Create a group s of all buildings")
-    assert len(sent) == 2 and ("final", "The group s was created.") in events
+    assert len(sent) == 4 and ("final", claim) in events  # 3 corrections, then the answer stands
 
 
-def test_cloud_retries_an_empty_reply_once_then_answers(monkeypatch):
+def test_cloud_retries_an_empty_reply_up_to_max_corrections(monkeypatch):
     from types import SimpleNamespace as NS
+    from webui.backends import cloud
 
+    monkeypatch.setattr(cloud, "MAX_CORRECTIONS", 3)
     empty = NS(choices=[NS(message=NS(content="", tool_calls=None))])
-    events, sent = _cloud_run(monkeypatch, [empty, NS(choices=[NS(message=NS(content="42", tool_calls=None))])],
-                              "How many buildings?")
-    assert ("final", "42") in events and len(sent) == 2
-    events, sent = _cloud_run(monkeypatch, [empty, empty], "How many buildings?")
+    answer = NS(choices=[NS(message=NS(content="42", tool_calls=None))])
+    events, sent = _cloud_run(monkeypatch, [empty, empty, answer], "How many buildings?")
+    assert ("final", "42") in events and len(sent) == 3
+    events, sent = _cloud_run(monkeypatch, [empty] * 4, "How many buildings?")
     finals = [d for e, d in events if e == "final"]
-    assert len(sent) == 2 and finals and "without an answer" in finals[0]
+    assert len(sent) == 4 and finals and "without an answer" in finals[0]
 
 
-def test_local_parser_asks_once_when_the_answer_claims_an_unsaved_item():
+def test_max_corrections_is_configurable(monkeypatch):
+    import importlib
+
+    from webui import llm_utils
+
+    try:
+        monkeypatch.setenv("AGENT_MAX_CORRECTIONS", "5")
+        assert importlib.reload(llm_utils).MAX_CORRECTIONS == 5
+        monkeypatch.setenv("AGENT_MAX_CORRECTIONS", "many")
+        assert importlib.reload(llm_utils).MAX_CORRECTIONS == 3
+    finally:
+        monkeypatch.delenv("AGENT_MAX_CORRECTIONS")
+        importlib.reload(llm_utils)
+
+
+def test_local_parser_corrects_a_claimed_unsaved_item_up_to_max_corrections(monkeypatch):
     import queue
 
     from langchain_core.agents import AgentFinish
     from langchain_core.exceptions import OutputParserException
     from webui.backends import local
 
+    monkeypatch.setattr(local, "MAX_CORRECTIONS", 3)
     cb = local._EventCallback(queue.Queue())
     cb._tools_called = 1
     parser = local._RobustReActParser(cb, user_question="Put a marker on the tallest building",
                                       tool_names={"run_query", "save_to_scratchpad"})
     claim = "Thought: done\nFinal Answer: The marker was created."
-    with pytest.raises(OutputParserException, match="no save_to_scratchpad call succeeded"):
-        parser.parse(claim)
-    assert isinstance(parser.parse(claim), AgentFinish)  # only once per turn
+    for _ in range(3):
+        with pytest.raises(OutputParserException, match="no save_to_scratchpad call succeeded"):
+            parser.parse(claim)
+    assert isinstance(parser.parse(claim), AgentFinish)  # after 3 corrections the answer stands
+    assert cb._consecutive_parse_failures == 0  # corrections are no format errors
     cb2 = local._EventCallback(queue.Queue())
     cb2._tools_called = 1
     cb2.saved_names.append("marker_X")
@@ -1039,28 +1070,30 @@ def test_wrong_language_nudge(question, answer, expected):
     assert (expected in nudge) if expected else nudge == ""
 
 
-def test_cloud_asks_once_for_the_language_of_the_question(monkeypatch):
+def test_cloud_asks_for_the_language_of_the_question(monkeypatch):
     from types import SimpleNamespace as NS
+    from webui.backends import cloud
 
+    monkeypatch.setattr(cloud, "MAX_CORRECTIONS", 2)
     german = "Die Anzahl der Gebäude ist 331 und das ist die Antwort."
     replies = [NS(choices=[NS(message=NS(content=german, tool_calls=None))]),
                NS(choices=[NS(message=NS(content="There are 331 buildings.", tool_calls=None))])]
     events, sent = _cloud_run(monkeypatch, replies, "How many buildings are there in the dataset?")
     assert ("final", "There are 331 buildings.") in events and len(sent) == 2
     assert "Rewrite the same answer in English" in sent[1]["messages"][-1]["content"]
-    replies = [NS(choices=[NS(message=NS(content=german, tool_calls=None))]),
-               NS(choices=[NS(message=NS(content=german, tool_calls=None))])]
+    replies = [NS(choices=[NS(message=NS(content=german, tool_calls=None))]) for _ in range(3)]
     events, sent = _cloud_run(monkeypatch, replies, "How many buildings are there in the dataset?")
-    assert len(sent) == 2 and ("final", german) in events  # only once per turn
+    assert len(sent) == 3 and ("final", german) in events  # 2 corrections, then the answer stands
 
 
-def test_local_parser_asks_once_for_the_language_of_the_question():
+def test_local_parser_asks_for_the_language_of_the_question(monkeypatch):
     import queue
 
     from langchain_core.agents import AgentFinish
     from langchain_core.exceptions import OutputParserException
     from webui.backends import local
 
+    monkeypatch.setattr(local, "MAX_CORRECTIONS", 2)
     cb = local._EventCallback(queue.Queue())
     cb._tools_called = 1
     parser = local._RobustReActParser(cb, user_question="How many buildings are there in the dataset?",
@@ -1069,4 +1102,186 @@ def test_local_parser_asks_once_for_the_language_of_the_question():
     with pytest.raises(OutputParserException) as exc:
         parser.parse(german)
     assert exc.value.send_to_llm and "in English" in exc.value.observation
+    with pytest.raises(OutputParserException):
+        parser.parse(german)
     assert isinstance(parser.parse(german), AgentFinish)
+
+
+# ── six languages: English, German, French, Dutch, Japanese, Finnish ─────────
+
+@pytest.mark.parametrize("question", [
+    "Crée un groupe par classe énergétique.",
+    "Place un marqueur sur les 5 bâtiments les plus hauts.",
+    "Ajoute une zone tampon de 2 m autour de l'enveloppe.",
+    "Maak een groep per energieklasse.",
+    "Teken lijnen van de markers naar de dichtstbijzijnde gebouwen.",
+    "Voeg een buffer van 2 m toe rond de omhulling.",
+    "最も高い5つの建物の上にマーカーを置いてください。",
+    "フットプリントの周りに2Dのアルファシェイプを作成して。",
+    "Luo ryhmä jokaiselle energialuokalle.",
+    "Piirrä viivat merkeistä lähimpiin rakennuksiin.",
+    "Lisää 2 metrin puskuri kuoren ympärille.",
+])
+def test_scratchpad_intent_in_six_languages(question):
+    from webui import llm_utils
+
+    assert llm_utils.wants_scratchpad(question)
+
+
+@pytest.mark.parametrize("question", [
+    "Combien de bâtiments y a-t-il ?",
+    "Hoeveel gebouwen zijn er?",
+    "建物はいくつありますか？",
+    "Kuinka monta rakennusta on?",
+])
+def test_plain_questions_in_other_languages_are_no_scratchpad_intent(question):
+    from webui import llm_utils
+
+    assert not llm_utils.wants_scratchpad(question)
+
+
+@pytest.mark.parametrize("answer", [
+    "Le groupe a été créé dans le visualiseur.",
+    "De markers zijn aangemaakt.",
+    "マーカーを作成しました。",
+    "Merkit on luotu.",
+])
+def test_save_claims_in_other_languages(answer):
+    from webui import llm_utils
+
+    assert llm_utils.claims_unsaved_item("Create a marker on the tallest building", answer, [])
+
+
+@pytest.mark.parametrize("text,lang", [
+    ("Combien de bâtiments sont dans la base de données ?", "fr"),
+    ("Il y a 331 bâtiments dans cette ville et ils ont tous une hauteur.", "fr"),
+    ("Hoeveel gebouwen zijn er in de database?", "nl"),
+    ("Er zijn 331 gebouwen in de stad en het hoogste is 28 m.", "nl"),
+    ("データベースに建物はいくつありますか？", "ja"),
+    ("建物は331棟あり、最も高いものは28 mです。", "ja"),
+    ("Kuinka monta rakennusta tietokannassa on ja mikä on korkein?", "fi"),
+    ("How many buildings are there in the dataset?", "en"),
+    ("Wie viele Gebäude gibt es in der Datenbank?", "de"),
+    ("42", None),
+])
+def test_language_of_six_languages(text, lang):
+    from webui import llm_utils
+
+    assert llm_utils._language_of(text) == lang
+
+
+def test_language_ignores_sql_in_the_answer():
+    from webui import llm_utils
+
+    answer = ("Il y a 331 bâtiments dans la ville et ils sont tous en 3D.\n"
+              "```sql\nSELECT count(*) FROM feature f JOIN objectclass o ON o.id = f.objectclass_id "
+              "WHERE o.classname = 'Building' AND f.id IS NOT NULL\n```")
+    assert llm_utils._language_of(answer) == "fr"
+    assert llm_utils.wrong_language_nudge("Combien de bâtiments y a-t-il dans la ville ?", answer) == ""
+    nudge = llm_utils.wrong_language_nudge("建物はいくつありますか？", "There are 331 buildings in the city.")
+    assert "in Japanese" in nudge
+
+
+@pytest.mark.parametrize("question,first", [
+    ("Place un marqueur sur les 5 bâtiments les plus hauts.", "5"),
+    ("Teken lijnen van de markers naar de dichtstbijzijnde gebouwen.", "6"),
+    ("フットプリントの周りに2Dのアルファシェイプを作成して。", "3"),
+    ("3Dの凸包を作成して。", "2"),
+    ("Lisää 2 metrin puskuri.", "7"),
+])
+def test_recipes_are_routed_in_other_languages(question, first):
+    from webui import llm_utils
+
+    recipes = llm_utils.scratch_recipes_for(question)
+    assert recipes and recipes[0].startswith(first + " ")
+
+
+def test_cloud_runs_a_tool_call_written_as_text(monkeypatch):
+    """gpt-oss sometimes writes "Action: save_to_scratchpad / Action Input: {...}"
+    as text instead of a native call (evaluation 2026-11-16, Q1 and Q8)."""
+    from types import SimpleNamespace as NS
+
+    text = ('Action: save_to_scratchpad\nAction Input: {\n  "name": "rings",\n'
+            '  "sql": "SELECT ST_Collect(g) AS geom FROM t"\n}')
+    ran = []
+    replies = [NS(choices=[NS(message=NS(content=text, tool_calls=None))]),
+               NS(choices=[NS(message=NS(content="Saved rings.", tool_calls=None))])]
+    events, sent = _cloud_run(monkeypatch, replies, "Create closed rings per storey",
+                              run=lambda a: ran.append(a) or json.dumps(
+                                  {"scratchpad": {"ok": True, "name": "rings", "kind": "geometry"}}))
+    assert ran == [{"name": "rings", "sql": "SELECT ST_Collect(g) AS geom FROM t"}]
+    assert ("final", "Saved rings.") in events
+    history = [m for m in sent[1]["messages"] if isinstance(m, dict)]
+    call = next(m for m in history if m.get("role") == "assistant" and m.get("tool_calls"))
+    assert call["tool_calls"][0]["function"]["name"] == "save_to_scratchpad"
+    assert any(m.get("role") == "tool" and m.get("tool_call_id") == call["tool_calls"][0]["id"]
+               for m in history)
+
+
+@pytest.mark.parametrize("content", [
+    "Action: drop_everything\nAction Input: {\"x\": 1}",  # unknown tool
+    "Action: save_to_scratchpad\nAction Input: not json",
+    "Action: save_to_scratchpad\nAction Input: [1, 2]",
+    "The marker is at the top of the building.",
+])
+def test_text_tool_call_needs_a_known_tool_and_a_json_object(content):
+    from webui.backends import cloud
+
+    assert cloud._text_tool_call(content, {"save_to_scratchpad": {}}) is None
+
+
+def test_text_tool_call_accepts_the_gpt_oss_prefix():
+    from webui.backends import cloud
+
+    out = cloud._text_tool_call('Action: functions.save_to_scratchpad\nAction Input: ```json\n{"name": "a"}\n```',
+                                {"save_to_scratchpad": {}})
+    assert out == ("save_to_scratchpad", '{"name": "a"}')
+
+
+@pytest.mark.parametrize("question", [
+    "Add a 2m buffer (in 2D) around that alpha-wrapping.",
+    "Put a marker on top of the 5 tallest buildings with the height as labels.",
+])
+def test_short_english_questions_are_recognised(question):
+    from webui import llm_utils
+
+    assert llm_utils._language_of(question) == "en"
+
+
+def test_short_answer_in_the_wrong_language_is_caught():
+    """Evaluation 2026-11-16, English Q3: a one-line German answer."""
+    from webui import llm_utils
+
+    q = "Extract all points from the lod2Solid of building DEBY_LOD2_107800980 and show them as cornerpoints in green."
+    a = "Die Punkte wurden als **“cornerpoints”** in grün gespeichert – 1 Punktensatz (Multipoit Z)."
+    assert "in English" in llm_utils.wrong_language_nudge(q, a)
+
+
+def test_no_word_counts_for_two_languages():
+    from collections import Counter
+
+    from webui import llm_utils
+
+    seen = Counter(w for words in llm_utils._FUNCTION_WORDS.values() for w in set(words.split()))
+    assert [w for w, n in seen.items() if n > 1] == []
+
+
+def test_null_tool_arguments_are_dropped():
+    from webui import llm_utils
+
+    assert llm_utils.tool_args_without_nulls(
+        {"name": "l", "sql": "SELECT 1", "base_z": None, "height_m": None, "label": "", "alpha": 0}) == {
+        "name": "l", "sql": "SELECT 1", "label": "", "alpha": 0}
+
+
+def test_cloud_drops_null_arguments_before_the_tool_runs(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    call = NS(id="c1", function=NS(name="save_to_scratchpad", arguments=json.dumps(
+        {"name": "s", "sql": "SELECT 1 AS objectid", "base_z": None, "height_m": None})))
+    ran = []
+    replies = [NS(choices=[NS(message=NS(content="", tool_calls=[call]))]),
+               NS(choices=[NS(message=NS(content="Saved s.", tool_calls=None))])]
+    _cloud_run(monkeypatch, replies, "Create a group s of all buildings",
+               run=lambda a: ran.append(a) or json.dumps({"scratchpad": {"ok": True, "name": "s"}}))
+    assert ran == [{"name": "s", "sql": "SELECT 1 AS objectid"}]

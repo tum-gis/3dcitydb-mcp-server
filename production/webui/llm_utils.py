@@ -300,6 +300,14 @@ OPENAI_MODELS = [
 ]
 
 MAX_ITERATIONS = int(os.environ.get("AGENT_MAX_ITERATIONS", "10"))
+# How often per question the agent may send the model back to fix its answer
+# (claims an unsaved item, empty reply, wrong language), per kind of problem.
+# A limit is needed so a model that keeps failing cannot loop until the step
+# limit; AGENT_MAX_ITERATIONS still caps the whole turn.
+try:
+    MAX_CORRECTIONS = max(int(os.environ.get("AGENT_MAX_CORRECTIONS", "3")), 0)
+except ValueError:
+    MAX_CORRECTIONS = 3
 
 
 # ── Compact-mode auto-routing ──────────────────────────────────────────────────
@@ -1140,9 +1148,12 @@ line, points, marker position, rings, ...) in that SELECT. run_query only looks 
 - `sql` returns `objectid` rows (a group of city objects, coloured in the viewer) or a `geom`
   column (a geometry; heights kept = 3D, ST_Force2D(...) = flat 2D). A `label` column sets the
   label from a computed value (height, distance).
-- Shortcut views (use them instead of joining feature/property/geometry_data):
-  building_solid(objectid, lod, geom, height_m, envelope) = the 3D solid of each building,
-  building_footprint(objectid, geom) = its ground surface (3D polygons at ground height),
+- Shortcut views for every feature class (use them instead of joining feature/property/geometry_data):
+  feature_geometry(objectid, class, property, lod, geom, height_m, envelope) = every geometry of
+    every city object, e.g. class 'Building' with property 'lod2Solid' = the building's 3D solid,
+    class 'TrafficArea' = a road surface,
+  feature_boundary(objectid, class, surface_class, geom) = an object's boundary surfaces
+    (surface_class 'GroundSurface' = a building's footprint at ground height, 'RoofSurface', ...),
   my_scratchpad(name, label, class, color, geom, objectids text[]) = the user's saved items.
 - 2D or 3D: when the user says "2D" or "3D", pass class (2D: Polygon2D, MultiPolygon2D,
   LineString2D; 3D: Polygon3D, Solid3D, Surface3D, LineString3D) and compute in that dimension.
@@ -1160,56 +1171,66 @@ line, points, marker position, rings, ...) in that SELECT. run_query only looks 
 
 # (trigger, recipe): all recipes go into the system prompt; the save reminder
 # after a run_query repeats the ones whose trigger matches the question, next
-# to where the model writes the save call.
+# to where the model writes the save call. Triggers in the same six languages
+# as _SCRATCH_INTENT_WORDS. "2D"/"3D" without \b: in "3Dの" Python sees no word
+# boundary between "D" and a Japanese character.
+_2D = r"(?<![a-z0-9])2d(?![a-z0-9])"
+_3D = r"(?<![a-z0-9])3d(?![a-z0-9])"
 SCRATCHPAD_RECIPES = [
-    (r"group|class|klasse|gruppe|categor|kategor",
+    (r"group|class|klasse|gruppe|categor|kategor|catégor|groep|ryhm|luokk|グループ|分類|クラス|カテゴリ",
      """1 One group per value, ONE call (name e.g. energy -> energy_A, energy_B, ...):
   SELECT b.objectid, p.val_string AS item_name,
   CASE p.val_string WHEN '<v1>' THEN '#16a34a' WHEN '<v2>' THEN '#facc15' ... ELSE '#dc2626' END AS color
   FROM feature b JOIN property p ON p.feature_id = b.id AND p.name = '<attr>'
   WHERE b.objectclass_id = 901"""),
-    (r"\b3d\b.*(hull|wrap|hülle|huelle|umhüll|umhuell)|convex|konvex",
+    (_3D + r".*(hull|wrap|hülle|huelle|umhüll|umhuell|envelop|omhull|kuori|包)|convex|konvex|kupera|凸包",
      """2 3D hull / wrapping around buildings (one closed solid, class Solid3D):
-  SELECT CG_3DConvexHull(ST_Collect(s.geom)) AS geom FROM building_solid s
-  WHERE s.objectid IN (<ids or subquery>)
+  SELECT CG_3DConvexHull(ST_Collect(s.geom)) AS geom FROM feature_geometry s
+  WHERE s.property LIKE '%Solid' AND s.objectid IN (<ids or subquery>)
   (CG_3DAlphaWrapping(ST_Collect(s.geom), 10) only if the SFCGAL list above offers it;
   otherwise tell the user it is a convex hull.)"""),
-    (r"\b2d\b|alpha|concave|konkav|outline|umriss|footprint|grundriss",
+    (_2D + r"|alpha|アルファ|concav|konkav|outline|umriss|footprint|grundriss|contour|emprise|omtrek|"
+     r"voetafdruk|kovera|ääriviiva|pohjapiirr|輪郭|フットプリント|凹包",
      """3 2D alpha shape / alpha wrapping / concave outline around footprints (class MultiPolygon2D):
   SELECT CG_OptimalAlphaShape(ST_Union(ST_Force2D(f.geom)), false, 1) AS geom
-  FROM building_footprint f"""),
-    (r"point|punkt|vertex|vertices",
+  FROM feature_boundary f WHERE f.surface_class = 'GroundSurface'"""),
+    (r"point|punkt|vertex|vertices|sommet|punten|hoekpunt|piste|kärkipist|点",
      """4 All points (vertices) of a building's solid as one point set (class Point3D, size_m 0.3):
-  SELECT ST_Collect(DISTINCT d.geom) AS geom FROM building_solid s, ST_DumpPoints(s.geom) d
-  WHERE s.objectid = '<id>'"""),
-    (r"marker|markier|\bpin\b|tallest|highest|höchst|hoechst|on top",
+  SELECT ST_Collect(DISTINCT d.geom) AS geom FROM feature_geometry s, ST_DumpPoints(s.geom) d
+  WHERE s.objectid = '<id>' AND s.property LIKE '%Solid'"""),
+    (r"marker|markier|\bpin\b|tallest|highest|höchst|hoechst|on top|marqueur|plus haut|hoogste|merkki|"
+     r"korkein|マーカー|最も高い|一番高い|屋上",
      """5 Markers on top of the N tallest buildings with their height, ONE call
   (name marker, class 3Dmarker):
   SELECT s.objectid AS item_name, ST_MakePoint(ST_X(ST_Centroid(s.envelope)),
   ST_Y(ST_Centroid(s.envelope)), ST_ZMax(s.envelope)) AS geom,
   round(s.height_m::numeric, 1) || ' m' AS label
-  FROM building_solid s ORDER BY s.height_m DESC LIMIT <N>"""),
-    (r"line|linie|distance|abstand|entfernung|nearest|closest|nächst|naechst",
+  FROM feature_geometry s WHERE s.class = 'Building' AND s.property LIKE '%Solid'
+  ORDER BY s.height_m DESC LIMIT <N>"""),
+    (r"line|linie|distance|abstand|entfernung|nearest|closest|nächst|naechst|ligne|plus proche|lijn|"
+     r"afstand|dichtstbij|viiva|etäisyy|lähin|lähimp|線|距離|最寄り|最も近い",
      """6 3D line from each saved marker to the nearest other building, distance as label, ONE call
   (name line, class LineString3D):
   SELECT m.name AS item_name, ST_3DShortestLine(m.geom, n.geom) AS geom,
   round(n.d::numeric, 1) || ' m' AS label
   FROM my_scratchpad m CROSS JOIN LATERAL (SELECT s.geom, ST_3DDistance(m.geom, s.geom) AS d
-    FROM building_solid s
-    WHERE NOT ST_Intersects(ST_Force2D(s.envelope), ST_Force2D(m.geom))  -- not its own building
+    FROM feature_geometry s
+    WHERE s.class IN ('Building', 'BuildingPart') AND s.property LIKE '%Solid'
+      AND NOT ST_Intersects(ST_Force2D(s.envelope), ST_Force2D(m.geom))  -- not its own building
     ORDER BY 2 LIMIT 1) n
   WHERE m.name LIKE '<marker item name>_%'"""),
-    (r"buffer|puffer",
+    (r"buffer|puffer|tampon|puskur|vyöhyk|バッファ|緩衝",
      """7 Buffer around a saved item (2D, class Polygon2D):
   SELECT ST_Buffer(ST_Force2D(p.geom), <m>) AS geom FROM my_scratchpad p WHERE p.name = '<item>'"""),
-    (r"floor|storey|stories|stockwerk|geschoss|etage|\bring",
+    (r"floor|storey|stories|stockwerk|geschoss|etage|étage|anneau|verdieping|bouwla|kerro|rengas|renkaa|"
+     r"\bring|階|フロア|リング",
      """8 Rings of the footprint at several heights in ONE item (e.g. per storey: h = height / storeys,
   both from run_query: storeysAboveGround and the nested height value). The footprint is already
   at ground height, so only add i * h:
   SELECT ST_Collect(ST_Translate(ST_ExteriorRing(d.geom), 0, 0, i * <h>)) AS geom
-  FROM building_footprint f, ST_Dump(f.geom) d, generate_series(0, <storeys> - 1) i
-  WHERE f.objectid = '<id>'"""),
-    (r"bounding|\bbox\b|extent|quader",
+  FROM feature_boundary f, ST_Dump(f.geom) d, generate_series(0, <storeys> - 1) i
+  WHERE f.objectid = '<id>' AND f.surface_class = 'GroundSurface'"""),
+    (r"bounding|\bbox\b|extent|quader|boîte|englobant|begrenzingsdoos|rajaava|laatikko|バウンディング|外接",
      """9 Bounding box: 3D SELECT ST_3DExtent(b.envelope) AS geom (a closed box); 2D ST_Extent(...)."""),
 ]
 _SCRATCH_RECIPE_RES = [(re.compile(t, re.IGNORECASE), r) for t, r in SCRATCHPAD_RECIPES]
@@ -1226,9 +1247,9 @@ def scratch_recipes_for(question: str, limit: int = 2) -> list[str]:
     text = question or ""
     hits = sorted((m.start(), r) for rx, r in _SCRATCH_RECIPE_RES if (m := rx.search(text)))
     found = [r for _, r in hits]
-    if re.search(r"\b2d\b", text, re.IGNORECASE):
+    if re.search(_2D, text, re.IGNORECASE):
         found = [r for r in found if not r.startswith("2 ")]
-    elif re.search(r"\b3d\b", text, re.IGNORECASE):
+    elif re.search(_3D, text, re.IGNORECASE):
         found = [r for r in found if not r.startswith("3 ")]
     return found[:limit]
 
@@ -1274,17 +1295,33 @@ def build_scratchpad_payload(user_id: str, focus=()) -> dict | None:
 # Broad on purpose: a missed request costs the whole answer, a false match
 # only one reminder line. No "colour"/"Farbe"/"points"/"Punkte": "What colours do
 # the roofs have?" or "How many points does the solid have?" only ask for values
-# (the reminder sent gpt-oss into a loop there, evaluation round 2).
-_SCRATCH_INTENT_RE = re.compile(
-    r"speicher|merk|markier|notier|lösch|losch|ausblend|einblend|blende|gespeichert|"
-    r"erstell|zeichne|setze|füge|fuege|hinzu|ordne|gruppe|darstell|\bstelle\b.*\bdar\b|"
-    r"\bzeige\b.*\b(als|in)\b|beschrift|umhüll|umhuell|hülle|huelle|puffer|linie|\bring|"
-    r"punktmenge|transparen|\b(rot|grün|gruen|gelb|blau|orange)\w*\b|"
-    r"\bsave|\bstore|remember|\bmark|\bpin\b|delete|\bhide|\bshow\b.*\b(saved|my|as)\b|scratchpad|"
-    r"\bcreate|\bdraw|\bput\b|\badd\b|\bgroups?\b|\blabel|\bbuffer|\bhull|wrapping|"
-    r"\blines?\b|\brings?\b|pointset|\bhighlight|\bvisuali[sz]|"
-    r"\b(red|green|yellow|blue|orange)\b",
-    re.IGNORECASE)
+# (the reminder sent gpt-oss into a loop there, evaluation round 2). A plain
+# "show"/"zeige"/"toon" only counts with "as"/"als"/"in", for the same reason.
+# Languages of the countries that use CityGML most: English, German, French,
+# Dutch, Japanese, Finnish. Japanese has no spaces, so its patterns have no \b.
+_SCRATCH_INTENT_WORDS = {
+    "en": r"\bsave|\bstore|remember|\bmark|\bpin\b|delete|\bhide|\bshow\b.*\b(saved|my|as)\b|"
+          r"scratchpad|\bcreate|\bdraw|\bput\b|\badd\b|\bgroups?\b|\blabel|\bbuffer|\bhull|"
+          r"wrapping|\blines?\b|\brings?\b|pointset|\bhighlight|\bvisuali[sz]|"
+          r"\b(red|green|yellow|blue|orange)\b",
+    "de": r"speicher|merk|markier|notier|lösch|losch|ausblend|einblend|blende|gespeichert|"
+          r"erstell|zeichne|setze|füge|fuege|hinzu|ordne|gruppe|darstell|\bstelle\b.*\bdar\b|"
+          r"\bzeige\b.*\b(als|in)\b|beschrift|umhüll|umhuell|hülle|huelle|puffer|linie|\bring|"
+          r"punktmenge|transparen|\b(rot|grün|gruen|gelb|blau|orange)\w*\b",
+    "fr": r"enregistr|sauvegard|marqu|supprim|efface|masqu|\bcr[ée]e[rz]?\b|dessin|\btrace[rz]?\b|"
+          r"ajout|\bplace[rz]?\b|[ée]tiquet|tampon|enveloppe|\blignes?\b|anneau|\bgroupes?\b|"
+          r"\baffiche[rz]?\b.*\b(comme|en)\b|transparen|\b(rouges?|verte?s?|jaunes?|bleue?s?)\b",
+    "nl": r"opslaan|\bsla\b.*\bop\b|bewaar|markeer|verwijder|verberg|\bmaak|\bteken|\bvoeg\b.*\btoe\b|"
+          r"toevoeg|\btoon\b.*\b(als|in)\b|\blabel|omhull|\blijnen?\b|\bring|\bgroep|transparan|"
+          r"\b(rood|rode|groene?|geel|gele|blauwe?|oranje)\b",
+    "ja": r"保存|記録|マーク|印を|削除|非表示|作成|作って|描|追加|置いて|配置|ラベル|バッファ|緩衝|"
+          r"包絡|凸包|線|リング|グループ|透明|スクラッチパッド|(赤|緑|黄|青)(色|い|で)|オレンジ",
+    "fi": r"tallenn|merkits|merkitk|poista|piilota|\bluo\b|\bluokaa\b|piirr|lisää|lisaa|nimiö|nimio|"
+          r"puskur|vyöhyk|viiva|rengas|renkaa|ryhm|läpinäk|lapinak|"
+          r"\b(punai|vihre|keltai|sinise|sininen|orans)\w*",
+}
+_SCRATCH_INTENT_RE = re.compile("|".join(f"(?:{p})" for p in _SCRATCH_INTENT_WORDS.values()),
+                                re.IGNORECASE)
 
 
 def scratch_save_reminder(question: str) -> str:
@@ -1306,11 +1343,19 @@ def wants_scratchpad(question: str) -> bool:
 
 # An answer that reports a new item. Seen in every evaluation round: the model
 # says "created" although no save succeeded (production/docs/scratchpad-prompt-evaluation.md).
-_SAVE_CLAIM_RE = re.compile(
-    r"\b(created|saved|added|drawn|placed|stored|shown|displayed|erstellt|gespeichert|hinzugefügt|"
-    r"hinzugefuegt|angelegt|gezeichnet|gesetzt|platziert|eingefügt|eingefuegt|angezeigt|"
-    r"dargestellt)\b",
-    re.IGNORECASE)
+_SAVE_CLAIM_WORDS = {
+    "en": r"\b(created|saved|added|drawn|placed|stored|shown|displayed)\b",
+    "de": r"\b(erstellt|gespeichert|hinzugefügt|hinzugefuegt|angelegt|gezeichnet|gesetzt|platziert|"
+          r"eingefügt|eingefuegt|angezeigt|dargestellt)\b",
+    "fr": r"\b(cré[ée]|enregistré|sauvegardé|ajouté|dessiné|tracé|placé|affiché|marqué)e?s?\b",
+    "nl": r"\b(aangemaakt|gemaakt|opgeslagen|bewaard|toegevoegd|getekend|geplaatst|weergegeven|"
+          r"gemarkeerd)\b",
+    "ja": r"(保存|作成|追加|描画|配置|表示|マーク)(しました|されました|済み)|描きました|置きました",
+    "fi": r"\b(tallennettu|tallensin|luotu|loin|lisätty|lisäsin|piirretty|piirsin|merkitty|"
+          r"merkitsin|näytetty|sijoitettu)\w*",
+}
+_SAVE_CLAIM_RE = re.compile("|".join(f"(?:{p})" for p in _SAVE_CLAIM_WORDS.values()),
+                            re.IGNORECASE)
 
 SAVE_CLAIM_NUDGE = (
     "Your answer says an item was created, but no save_to_scratchpad call succeeded in this "
@@ -1334,44 +1379,69 @@ def scratch_saved_names(raw_result: str) -> list[str]:
 
 def claims_unsaved_item(question: str, answer: str, saved: list) -> bool:
     """True if the question asks for an item, nothing was saved this turn and
-    the answer still reports one as created (the backend then asks once more)."""
+    the answer still reports one as created (the backend then asks the model to
+    save it, up to MAX_CORRECTIONS times)."""
     return (not saved and wants_scratchpad(question)
             and bool(_SAVE_CLAIM_RE.search(answer or "")))
 
 
 # Answer language check. gpt-oss:20b answered most English questions in German
 # although the question was quoted next to "reply in the same language" (evaluation
-# round 3). Function words only, so German street names or attribute values in an
-# English answer do not count.
-_DE_WORDS = re.compile(r"\b(der|die|das|und|ist|sind|wurde|wurden|mit|nicht|für|auf|ein|eine|"
-                       r"einen|im|dem|den|des|zu|als|hat|haben|es|sie|wir|bitte|wie|viele|welche|"
-                       r"welcher|was|gibt|alle|erstelle|zeige|diese|dieses|um|füge)\b", re.IGNORECASE)
-_EN_WORDS = re.compile(r"\b(the|and|is|are|was|were|with|not|for|on|a|an|of|to|as|has|have|it|"
-                       r"they|we|please|this|that|which|how|many|what|there|all|create|show)\b",
-                       re.IGNORECASE)
+# round 3). Common words only (function words, and words every answer about a
+# saved item uses: building, saved, height, colours), so street names or
+# attribute values in another language do not count. A word used in two of the
+# languages ("die", "is", "de", "en", "des", "als", "was", "wie", "we", "ne",
+# "se", "points", "total") is not listed. Japanese is recognised by its script.
+LANGUAGE_NAMES = {"en": "English", "de": "German", "fr": "French", "nl": "Dutch",
+                  "ja": "Japanese", "fi": "Finnish"}
+_FUNCTION_WORDS = {
+    "en": "the and are were with not for of to as has have it they please this that which "
+          "how many what there all create show around from each into by at add put make draw "
+          "between their its be been these those per only also building buildings saved created "
+          "named height green red yellow blue item items line lines",
+    "de": "der das und ist sind wurde wurden mit nicht für auf ein eine einen im dem den zu hat "
+          "haben es sie wir bitte viele welche welcher gibt erstelle zeige diese dieses um füge "
+          "wird werden auch oder aber nur noch aus bei nach über dass kein keine jede jedes jeder "
+          "gebäude gebäudes punkte linie linien höhe gespeichert erstellt grün rot gelb blau",
+    "fr": "le la les est sont une et pour avec pas dans qui que sur au aux ce cette ces "
+          "combien quels quelles quel quelle ils nous vous ont été très mais aussi chaque "
+          "bâtiment bâtiments hauteur créé enregistré vert rouge jaune bleu ligne lignes",
+    "nl": "het een zijn niet voor met van op hoeveel welke wat deze dit wordt ook maar "
+          "naar bij uit hebben heeft elk elke gebouw gebouwen hoogte opgeslagen aangemaakt "
+          "groen rood geel blauw lijn lijnen",
+    "fi": "ja ei kuinka monta mitkä mikä kaikki ovat oli joka jotka tämä nämä että myös tai "
+          "kanssa sekä ole luo näytä jokainen rakennus rakennukset rakennusta rakennuksen "
+          "korkeus tallennettu luotu vihreä punainen keltainen sininen viiva viivat",
+}
+_LANG_WORD_RES = {lang: re.compile(r"\b(" + "|".join(words.split()) + r")\b", re.IGNORECASE)
+                  for lang, words in _FUNCTION_WORDS.items()}
+_JA_CHARS = re.compile(r"[぀-ヿ一-鿿]")  # kana and kanji
+_LATIN_WORD = re.compile(r"[^\W\d_]{2,}")
+_CODE = re.compile(r"```.*?```|`[^`]*`", re.DOTALL)  # SQL keywords (AND, ON, AS) are no language
 
 
 def _language_of(text: str) -> str | None:
-    """'en', 'de' or None (too short or unclear), from function words."""
-    de, en = len(_DE_WORDS.findall(text or "")), len(_EN_WORDS.findall(text or ""))
-    if de + en < 2:
-        return None
-    if de >= 2 * en + 1:
-        return "de"
-    if en >= 2 * de + 1:
-        return "en"
+    """'en', 'de', 'fr', 'nl', 'ja', 'fi' or None (too short or unclear)."""
+    text = _CODE.sub(" ", text or "")
+    ja = len(_JA_CHARS.findall(text))
+    if ja >= 4 and ja >= len([w for w in _LATIN_WORD.findall(text) if not _JA_CHARS.search(w)]):
+        return "ja"
+    scores = sorted(((len(rx.findall(text)), lang) for lang, rx in _LANG_WORD_RES.items()),
+                    reverse=True)
+    (best, lang), (second, _) = scores[0], scores[1]
+    if best >= 2 and best >= 2 * second + 1:
+        return lang
     return None
 
 
 def wrong_language_nudge(question: str, answer: str) -> str:
     """A request to rewrite ``answer`` when it is clearly in another language
-    (English/German) than ``question``; "" otherwise. Used once per turn."""
+    than ``question``; "" otherwise (also when either is unclear)."""
     q, a = _language_of(question), _language_of(answer)
     if not q or not a or q == a:
         return ""
-    name = {"en": "English", "de": "German"}[q]
     return (f"Your answer is not in the language of the user's question. Rewrite the same "
-            f"answer in {name}; do not call any tool.")
+            f"answer in {LANGUAGE_NAMES[q]}; do not call any tool.")
 
 
 def no_answer_text(saved: list) -> str:
@@ -1380,6 +1450,14 @@ def no_answer_text(saved: list) -> str:
         return ("The model stopped without an answer. Saved in this turn: "
                 + ", ".join(saved) + ".")
     return "The model stopped without an answer. Please try again or rephrase the question."
+
+
+def tool_args_without_nulls(args: dict) -> dict:
+    """The arguments without null values: gpt-oss fills unused optional fields
+    with null ("base_z": null), which the MCP server's schema check rejects
+    ("None is not of type 'number'"); the model then repeated the same call
+    until the step limit (evaluation 2026-11-16, Q5). null means "not given"."""
+    return {k: v for k, v in args.items() if v is not None}
 
 
 def scratch_tool_result(raw: str) -> dict:

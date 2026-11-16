@@ -127,9 +127,18 @@ def test_export_shape(tmp_path):
              "updated_at": ts, "geom": None, "objectids": ["B1", "B2"]},
         ],
     })
-    out = sp.export_items(UID, db=db)
+    out = sp.export_items(UID, db=db, chatbot_version="9.9.9")
     assert out["format"] == "3dcitydb-scratchpad" and out["version"] == 1 and out["srid"] == 25832
-    assert out["exported_at"]
+    # Who wrote the file, when, and with which versions (to tell old files apart later).
+    from citydb_mcp import __version__ as mcp_version
+
+    assert out["generator"] == {"name": "3DCityDB MCP Server", "mcp_server_version": mcp_version,
+                                "chatbot_version": "9.9.9",
+                                "url": "https://github.com/tum-gis/3dcitydb-mcp-server"}
+    assert datetime.datetime.fromisoformat(out["exported_at"]).tzinfo is not None
+    assert "3DCityDB MCP Server" in out["comment"]
+    assert list(out)[:5] == ["format", "version", "comment", "generator", "exported_at"]
+    assert "chatbot_version" not in sp.export_items(UID, db=db)["generator"]  # MCP-only use
     area, houses = out["items"]
     assert area["geom"].startswith("SRID=25832;POLYGON Z") and "objectids" not in area
     assert area["created_at"] == ts.isoformat() and area["alpha"] == 0.5

@@ -1,15 +1,18 @@
 """Native tool-calling backend for Anthropic and OpenAI providers."""
 
 import json
+import re
 import time as _time
+from types import SimpleNamespace
 from typing import Callable, Generator
 
 from webui.session import TurnControl
 from webui.llm_utils import (EMPTY_REPLY_NUDGE, SAVE_CLAIM_NUDGE, claims_unsaved_item,
                               no_answer_text, scratch_saved_names, wrong_language_nudge)
 from webui.llm_utils import (long_result_note, scratch_save_reminder, scratch_tool_hint,
-                              scratch_tool_result, wants_scratchpad)
+                              scratch_tool_result, tool_args_without_nulls, wants_scratchpad)
 from webui.llm_utils import (
+    MAX_CORRECTIONS,
     MAX_ITERATIONS,
     RUN_QUERY_TOOL,
     _SQL_FENCE_RE,
@@ -23,6 +26,28 @@ from webui.llm_utils import (
     _strip_reasoning_tags,
     _truncate_result,
 )
+
+
+_TEXT_CALL_RE = re.compile(r"Action:\s*`?([A-Za-z_][\w.]*)`?\s*\n\s*Action Input:\s*", re.IGNORECASE)
+
+
+def _text_tool_call(content: str, tools: dict) -> tuple[str, str] | None:
+    """(name, JSON arguments) when ``content`` is a call of one of ``tools``
+    written as ReAct text ("Action: <tool>" / "Action Input: {...}"); None
+    otherwise (unknown tool, no JSON object, arguments that are no object)."""
+    m = _TEXT_CALL_RE.search(content or "")
+    if not m:
+        return None
+    name = m.group(1).split(".")[-1]  # gpt-oss writes "functions.save_to_scratchpad"
+    if name not in tools:
+        return None
+    try:
+        args, _ = json.JSONDecoder().raw_decode(content[m.end():].lstrip("`json \n"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(args, dict):
+        return None
+    return name, json.dumps(args, ensure_ascii=False)
 
 
 def _reasoning_part_text(value) -> str:
@@ -105,13 +130,19 @@ def native_tool_stream(
     # Track content from a previous iteration to detect redundant tool calls.
     _cached_content: str = ""
     _last_tool_sql: str = ""
-    # Scratchpad items saved in this turn, and the one-shot guards (each may
-    # fire once, so they cannot loop): an empty reply, and an answer that
-    # claims an item although no save succeeded.
+    # Scratchpad items saved in this turn, and how often the model was sent
+    # back to fix its answer (an empty reply, an answer that claims an item
+    # although no save succeeded, an answer in another language than the
+    # question): each up to MAX_CORRECTIONS times, so a model that keeps
+    # failing cannot loop.
     _saved: list[str] = []
-    _empty_retry_used = False
-    _claim_guard_used = False
-    _language_guard_used = False  # wrong_language_nudge sent (once per turn)
+    _corrections = {"empty": 0, "claim": 0, "language": 0}
+
+    def _may_correct(kind: str) -> bool:
+        if _corrections[kind] >= MAX_CORRECTIONS:
+            return False
+        _corrections[kind] += 1
+        return True
 
     for iteration in range(MAX_ITERATIONS):
         if turn.stopped():
@@ -180,6 +211,21 @@ def native_tool_stream(
             flush=True,
         )
 
+        if not tool_calls and extra_tools:
+            text_call = _text_tool_call(content, extra_tools)
+            if text_call:
+                # gpt-oss sometimes writes the call as ReAct text ("Action: save_to_scratchpad /
+                # Action Input: {...}") instead of a native tool call (evaluation 2026-11-16,
+                # Q1 and Q8): run it like a native call instead of showing it as the answer.
+                name, arguments = text_call
+                call_id = f"text_call_{iteration}"
+                print(f"[cloud] tool call written as text — running {name}", flush=True)
+                tool_calls = [SimpleNamespace(id=call_id, function=SimpleNamespace(
+                    name=name, arguments=arguments))]
+                msg = {"role": "assistant", "content": content,
+                       "tool_calls": [{"id": call_id, "type": "function",
+                                       "function": {"name": name, "arguments": arguments}}]}
+
         if not tool_calls:
             if not force_text_response:
                 sql_match = _SQL_FENCE_RE.search(content)
@@ -243,19 +289,19 @@ def native_tool_stream(
             # Pure text — final answer
             if content:
                 visible, tagged_reasoning = _strip_reasoning_tags(content)
-                if (extra_tools and not _claim_guard_used
-                        and claims_unsaved_item(_last_user_q, visible, _saved)):
-                    _claim_guard_used = True
+                if (extra_tools and claims_unsaved_item(_last_user_q, visible, _saved)
+                        and _may_correct("claim")):
                     force_text_response = False
-                    print("[cloud] answer claims an unsaved item — asking once more", flush=True)
+                    print(f"[cloud] answer claims an unsaved item — correction "
+                          f"{_corrections['claim']}/{MAX_CORRECTIONS}", flush=True)
                     working_messages.append({"role": "assistant", "content": content})
                     working_messages.append({"role": "user", "content": SAVE_CLAIM_NUDGE})
                     continue
-                lang_nudge = "" if _language_guard_used else wrong_language_nudge(_last_user_q, visible)
-                if lang_nudge:
-                    _language_guard_used = True
+                lang_nudge = wrong_language_nudge(_last_user_q, visible)
+                if lang_nudge and _may_correct("language"):
                     force_text_response = True
-                    print("[cloud] answer is in another language — asking for a rewrite", flush=True)
+                    print(f"[cloud] answer is in another language — correction "
+                          f"{_corrections['language']}/{MAX_CORRECTIONS}", flush=True)
                     working_messages.append({"role": "assistant", "content": content})
                     working_messages.append({"role": "user", "content": lang_nudge})
                     continue
@@ -269,8 +315,7 @@ def native_tool_stream(
                     yield ("final", final_text)
                     return
             print("[cloud] WARNING: empty response (no text, no tool calls)", flush=True)
-            if not _empty_retry_used:
-                _empty_retry_used = True
+            if _may_correct("empty"):
                 working_messages.append({"role": "user", "content": EMPTY_REPLY_NUDGE})
                 continue
             yield ("final", no_answer_text(_saved))
@@ -313,7 +358,7 @@ def native_tool_stream(
                         raise ValueError("tool arguments must be an object")
                     print(f"[cloud] {tool_name} → {json.dumps(args, ensure_ascii=False)[:160]}", flush=True)
                     yield ("tool_call", {"tool": tool_name, "args": args, "iteration": iteration})
-                    raw_result = str(extra_tools[tool_name]["run"](args))
+                    raw_result = str(extra_tools[tool_name]["run"](tool_args_without_nulls(args)))
                 except Exception as exc:
                     raw_result = json.dumps({"error": str(exc)})
                 result_data = scratch_tool_result(raw_result)

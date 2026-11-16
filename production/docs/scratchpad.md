@@ -109,9 +109,16 @@ same id, so those clients can query `my_scratchpad` too.
   calls are dispatched by `tc.function.name`. After a successful `run_query` the loop normally forces a
   text answer (`tool_choice="none"`). It does **not** when extra tools exist and the question has save,
   create/draw or manage intent (`wants_scratchpad`), so "query, then save" works in one turn. The
-  intent pattern also matches "create", "put a marker", "add a buffer", "show ... in red", "erstelle",
-  "setze", "füge hinzu", "stelle ... dar", colour and transparency words; plain questions ("how many",
-  "show me all ... in <street>") do not match.
+  intent words (`_SCRATCH_INTENT_WORDS`) cover the languages of the countries that use CityGML most:
+  English, German, French, Dutch, Japanese and Finnish ("create", "put a marker", "add a buffer",
+  "erstelle", "füge hinzu", "crée", "ajoute", "maak", "voeg ... toe", "作成", "追加", "luo", "lisää",
+  colour and transparency words, ...). Japanese has no spaces, so its patterns match without word
+  boundaries. Plain questions ("how many", "show me all ... in <street>", "combien", "hoeveel",
+  "いくつ", "kuinka monta") do not match. A call of an extra tool that the model writes as text
+  ("Action: save_to_scratchpad" / "Action Input: {...}", seen with gpt-oss) is run like a native call
+  (`_text_tool_call`: a known tool name and a JSON object, nothing else). Both backends drop null
+  arguments before a scratchpad call (`tool_args_without_nulls`): gpt-oss sends unused optional
+  fields as null, which the MCP server's schema check rejects.
 - **Local ReAct backend** (`backends/local.py`): each extra tool becomes a LangChain Tool whose Action
   Input is JSON (`_parse_json_input`). The parser's `tool_names` include them, the "unknown tool" error
   lists the available tools, native Ollama `tool_calls` for extra tools are accepted (also with
@@ -138,25 +145,34 @@ one group per attribute value (with a colour column), 3D hull/wrapping, 2D alpha
 footprints, the vertices of a solid as a point set, markers on top of the N tallest buildings, 3D
 shortest lines from saved markers to the nearest building with the distance as label, a buffer around
 a saved item, footprint rings per storey in one item, and bounding boxes. The recipes use the helper
-views and placeholders, no dataset values. The block is about 5,300 characters.
+views and placeholders, no dataset values. The block is about 5,900 characters.
 
 The recipes are a list of (trigger, recipe) in `SCRATCHPAD_RECIPES`. All of them are in the system
 prompt; the save reminder that follows a `run_query` result (`scratch_save_reminder`) repeats the one
 or two whose trigger matches the question, the one mentioned first in the question first, right
 where the model writes the save call (`scratch_recipes_for`; a question that says 2D never gets the
-3D hull recipe, one that says 3D never the 2D alpha shape). The measurements with gpt-oss and qwen,
+3D hull recipe, one that says 3D never the 2D alpha shape). The triggers are in the same six
+languages as the intent words. The measurements with gpt-oss and qwen,
 and the SQL behind each recipe, are in
 [scratchpad-prompt-evaluation.md](scratchpad-prompt-evaluation.md).
 
-Both backends guard against two failures seen in every evaluation round, each at most once per turn
-so they cannot loop: an answer that reports an item as created although no save succeeded in the
-turn is sent back once with `SAVE_CLAIM_NUDGE` (`claims_unsaved_item`), and an empty reply (gpt-oss
-over the OpenAI-compatible API) is answered once with `EMPTY_REPLY_NUDGE`; a second empty reply ends
-the turn with a short text naming the items saved so far instead of an error. A third guard, also
-once per turn, asks for a rewrite when the answer is clearly German and the question English, or the
-other way round (`wrong_language_nudge`, counted on function words, so German street names in an
-English answer do not trigger it): gpt-oss:20b answered most English questions in German although
-the question was quoted next to the language rule. When the cloud backend reaches the step limit after
+**Corrections.** Both backends check the model's final answer for three failures seen in the
+evaluation rounds and send the model back to fix it:
+
+| Check | Seen in evaluation | Correction sent |
+|---|---|---|
+| The answer reports an item as created, but no save succeeded in the turn (`claims_unsaved_item`) | every round, all models: "The marker was created" with nothing drawn | `SAVE_CLAIM_NUDGE`: call `save_to_scratchpad` now, or say plainly that it could not be saved |
+| Empty reply | gpt-oss over the OpenAI-compatible API | `EMPTY_REPLY_NUDGE`: continue with a tool call or the answer |
+| The answer is clearly in another language than the question (`wrong_language_nudge`) | gpt-oss:20b answered most English questions in German | rewrite the same answer in the question's language |
+
+Each check may send the model back up to `AGENT_MAX_CORRECTIONS` times per question (default 3). The
+limit exists so a model that keeps failing cannot loop until the step limit; after it, the answer
+stands (an empty reply becomes a short text naming the items saved so far). `AGENT_MAX_ITERATIONS`
+still caps the whole turn. The language check counts common words (function words and words such
+as building, saved, height, colours) of English, German, French, Dutch and Finnish (a word used in
+two of them, such as "die", "de", "en", is not counted) and
+recognises Japanese by its script; code in backticks (SQL) is ignored, and street names or attribute
+values in another language do not trigger it. When the cloud backend reaches the step limit after
 successful saves, its closing request names those items instead of "no data could be retrieved".
 
 Words such as "colour", "Farbe", "points" or "Punkte" alone do not count as a request to draw: "What
@@ -164,16 +180,26 @@ colours do the roofs have?" and "How many points does the solid have?" only ask 
 
 ### Helper views
 
-`provision()` also creates two plain views in the 3DCityDB schema, so the save SQL does not have to
-repeat the long joins from a building to its geometry (weak models got them wrong):
+`provision()` also creates two plain views in the 3DCityDB schema. **Why:** in 3DCityDB v5 an
+object's geometry is three joins away (`feature` -> `property` -> `geometry_data`), its boundary
+surfaces five. Weak models wrote these joins wrong in every evaluation round (wrong property name,
+missing join, the boundary surface's geometry taken for the building's), and a wrong join means a
+wrong or empty item. With the views the save SQL needs no joins. The views cover **every feature
+class** (buildings, roads, bridges, tunnels, vegetation, water, ...), not only buildings:
 
 | View | Columns | Content |
 |---|---|---|
-| `building_solid` | `objectid, lod, geom, height_m, envelope` | The `lod1Solid`..`lod4Solid` geometry of each `Building` / `BuildingPart`; `height_m` is the Z range of its envelope. |
-| `building_footprint` | `objectid, geom` | The geometry of the building's `GroundSurface` boundaries (3D polygons at ground height). |
+| `feature_geometry` | `objectid, class, property, lod, geom, height_m, envelope` | Every geometry of every city object: `class` is the feature class (`Building`, `TrafficArea`, `Bridge`, ...), `property` the geometry property (`lod2Solid`, `lod2MultiSurface`, ...), `lod` its LoD (NULL for properties without one), `height_m` the Z range of the object's envelope. |
+| `feature_boundary` | `objectid, class, surface_class, geom` | The boundary surfaces of an object with their geometry: `surface_class` `GroundSurface` (a building's footprint at ground height), `RoofSurface`, `WallSurface`, `TrafficArea` of a `TrafficSpace`, ... |
 
-The query role reads them like any other table of the schema. If they cannot be created (a schema
-without these classes), `provision()` reports it under `error` and the rest still works.
+Examples: a building's solid is `feature_geometry WHERE class = 'Building' AND property LIKE
+'%Solid'`, a road surface `feature_geometry WHERE class = 'TrafficArea'`, a footprint
+`feature_boundary WHERE surface_class = 'GroundSurface'`.
+
+They are plain views: nothing is copied or stored, they are read-only, and filters on `objectid` or
+`class` are pushed down to the table indexes (the recipes run in 20-130 ms on the Harthof dataset,
+the same rows as direct joins). The query role reads them like any other table of the schema. If
+they cannot be created, `provision()` reports it under `error` and the rest still works.
 
 `CG_3DAlphaWrapping` and `CG_Extrude` on areas are in the PostGIS catalogue of the
 `3dcitydb-v5-docker-sfcgal-patched` image but fail at run time ("compiled against SFCGAL 2.0,
@@ -392,10 +418,12 @@ Rules (constants in `scratchpad.py`):
 - A line geometry of length 0 is refused with a hint to use `ST_3DShortestLine(a, b)` itself (a
   model drew `ST_MakeLine(marker, ST_StartPoint(ST_3DShortestLine(marker, b)))`: correct distance
   label, invisible line).
-- A 3D item whose highest point is more than `BELOW_GROUND_M = 100` m below the city objects around it
-  is refused: it was built from a relative height (a model used `height_m`, 28 m, as the Z of roof
-  markers where the ground is at 499 m). The error says to take Z from the geometry, e.g.
-  `ST_ZMax(s.envelope)`. Items saved with `clamp` are not checked.
+- Height hint: a 3D item whose highest point is more than `BELOW_GROUND_M = 100` m below the city
+  objects around it is **saved**, and the result carries a `note`: it was probably built from a
+  relative height (a model used `height_m`, 28 m, as the Z of roof markers where the ground is at
+  499 m). The note says to save it again under the same name with Z from the geometry, e.g.
+  `ST_ZMax(s.envelope)`, unless it is meant to lie underground (tunnels, pipes, basements may). Items
+  saved with `clamp` are not checked.
 - A flat class (`2Dmarker`, `Polygon2D`, ...) on a SELECT with heights drops them; the result's
   `note` says so (for `2Dmarker`: "use 3Dmarker to keep them").
 - `MAX_ITEMS = 100` per user (replacing an existing name is still allowed when full).
@@ -579,8 +607,12 @@ The file is plain JSON, not GeoJSON: geometries stay in the database's CRS with 
 person with the same dataset gets exactly the same items.
 
 ```json
-{"format": "3dcitydb-scratchpad", "version": 1, "srid": 25832,
+{"format": "3dcitydb-scratchpad", "version": 1,
+ "comment": "Scratchpad items exported from the 3DCityDB MCP Server chatbot. Import the file in the item list of the 3D viewer (same dataset and coordinate system).",
+ "generator": {"name": "3DCityDB MCP Server", "mcp_server_version": "1.2.1",
+               "chatbot_version": "1.2.1", "url": "https://github.com/tum-gis/3dcitydb-mcp-server"},
  "exported_at": "2026-11-13T10:00:00+00:00",
+ "srid": 25832,
  "items": [
    {"name": "my_area", "label": "Planned park", "kind": "geometry", "class": "Polygon3D",
     "color": "#16a34a", "alpha": 0.8, "clamp": false, "is_visible": true,
@@ -592,6 +624,10 @@ person with the same dataset gets exactly the same items.
     "objectids": ["DEBY_LOD2_4959457", "..."]}]}
 ```
 
+- `comment`, `generator`, `exported_at`: what wrote the file and when (UTC). JSON has no comments,
+  so these are fields. `generator` names the MCP server and chatbot versions, so a later version that
+  changes the format can tell old files apart; `chatbot_version` is missing when the export did not
+  come from the web UI. Import ignores these fields.
 - `srid`: the database SRID of the stored geometries (`database_srs`). `geom` is EWKT
   (`ST_AsEWKT`) for geometry items, `objectids` the list of feature ids for featuresets; the other one
   is left out. There is no user id in the file.
@@ -685,10 +721,14 @@ kept copy `window.__citydbScratchpad` also has no notice). Import reads the file
 - Prompt and intent: the block keeps the "PostGIS computes" rule, the alpha mapping, the
   `item_name` rule, the helper views and all recipes and stays under 6,000 characters; the save
   reminder repeats the matching recipe; `item_name` splits (names, own colours, by rank, limits,
-  clashes); the claim and empty-reply guards fire once (cloud and local backends); the query
+  clashes); the claim, empty-reply and language corrections stop after `AGENT_MAX_CORRECTIONS`
+  (cloud and local backends; configurable, invalid values fall back to 3); the query
   password does not depend on the database; a failing query-role login is provisioned once and
-  otherwise logged to stderr, never stdout; `provision()` creates the helper views; create/draw questions in English and German count as scratchpad
-  intent and get the save reminder, plain questions do not; `alpha` on save (stored, default 0.8,
+  otherwise logged to stderr, never stdout; `provision()` creates the helper views (no class filter
+  in them); a 3D item far below the ground is saved with a height note; create/draw questions,
+  save claims, the answer language and the recipe routing work in English, German, French, Dutch,
+  Japanese and Finnish, plain questions in these languages are no intent; the export file names the
+  generator, versions and time; `alpha` on save (stored, default 0.8,
   `"50%"` scaled, out of range refused) and in the tool schema; the SFCGAL probe advertises only
   working functions; the CLI activity names scratchpad tools with their arguments.
 

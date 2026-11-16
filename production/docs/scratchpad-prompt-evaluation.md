@@ -178,7 +178,7 @@ used 600 s as in `.env.example`.
 Round 2 = the changes 6 to 10 below; round 3 = plus the fixes from round 2; round 4 = plus the
 fixes from round 3. A last check of Q4+Q5 only (gpt-oss:20b native, after the recipe 6 change): EN 5
 correct lines (37.0/45.3/38.1/42.2/39.6 m) after a first wrong set of 4; DE markers at z = height
-(28 m instead of 528 m), which is now refused (change 13).
+(28 m instead of 528 m), which was then refused (change 13) and now gets a height hint (change 16).
 
 Per question in round 4 (gpt-oss:20b native): Q1 8 groups in one call (EN: E–H the same red), Q2
 convex hull, red, 0.5, Q3 Point3D 14 / 51 points, Q4 5 × 3Dmarker with the reference labels, Q6
@@ -242,7 +242,7 @@ Evening (rounds 2 to 4):
 6. **One call for many items** (`item_name` column, `_save_groups`). Q1, Q4 and Q5 needed five to
    eight saves; the models stopped after the first or hit the iteration limit. Now every distinct
    `item_name` becomes its own item with its own label and colour, in one call.
-7. **Helper views** `building_solid` and `building_footprint` created by `provision()`. The recipes
+7. **Helper views** `building_solid` and `building_footprint` created by `provision()` (for all feature classes since change 14). The recipes
    use them instead of the four-table joins that the weaker models got wrong.
 8. **Shorter prompt with routed recipes.** The save reminder repeats the one or two recipes whose
    trigger matches the question, right where the model writes the save call.
@@ -262,12 +262,60 @@ Evening (rounds 2 to 4):
     exclusion was rewritten wrongly); a 3D item more than 100 m below the city objects around it is
     refused with a hint to take Z from the geometry.
 
-Tests: 488 passed, 1 deselected (the known
+After review (2026-11-16):
+
+14. **Helper views for every feature class.** `building_solid` / `building_footprint` worked for
+    buildings only. They are replaced by `feature_geometry(objectid, class, property, lod, geom,
+    height_m, envelope)` and `feature_boundary(objectid, class, surface_class, geom)` without a class
+    filter, so road surfaces (`TrafficArea`), bridges or vegetation work the same way. On Harthof they
+    return the same rows as the old views (323 solids, 331 ground surfaces), and recipes 5 and 6 give
+    the same results (tallest building 32.2 m; lines 37.0 / 45.3 / 38.1 / 42.2 / 39.6 m).
+15. **Corrections up to `AGENT_MAX_CORRECTIONS` (default 3) instead of once.** The claim, empty-reply
+    and language checks may each send the model back three times per question; the limit only
+    stops a model that keeps failing from looping until the step limit.
+16. **Height hint instead of refusal.** A 3D item far below the ground is saved; the result carries
+    a note to save it again with an absolute Z unless it is meant to lie underground.
+17. **Six languages.** Intent words, save claims, the language check and the recipe triggers cover
+    English, German, French, Dutch, Japanese and Finnish.
+18. **Tool calls written as text.** In the first run after changes 14-17, gpt-oss:20b (EN) wrote the
+    save for Q1 and Q8 as ReAct text ("Action: save_to_scratchpad" / "Action Input: {...}") instead
+    of a native call; the SQL was right, but nothing ran. The cloud backend now runs such a call
+    like a native one (known tool and a JSON object only). In the same run Q7 was answered in German
+    and the language check did not fire: the English word list had become too short for the
+    question (the words shared with other languages had been removed); more English words fixed it.
+19. **null arguments.** In the second run gpt-oss:20b (DE, Q5) sent unused optional fields as
+    null (`"base_z": null`); the MCP server's schema check rejected every call ("None is not of
+    type 'number'") and the model repeated it until the step limit. Both backends now drop null
+    arguments before the call (`tool_args_without_nulls`). A one-line German answer to English Q3
+    was not recognised either: the language check now also counts common domain words (building,
+    saved, height, colours) in each language.
+
+Runs after review (gpt-oss:20b, native API, Harthof; ◐ = partly right):
+
+| Q | Run 1 EN | Run 1 DE | Run 2 EN | Run 2 DE | Run 3 EN | Run 3 DE |
+|---|---|---|---|---|---|---|
+| 1 groups | ✘ call as text | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 2 3D hull | ✓ | ✓ | ✓ | ✓ | ✓ | ✘ asked first, saved nothing |
+| 3 points | ✓ | ✓ | ✓ (German answer) | ✓ | ✓ | ✓ |
+| 4 markers | ✓ | ✓ | ◐ one item | ✓ | ✓ | ✓ |
+| 5 lines | ✘ 0.0 m | ◐ | ✘ | ✘ null args | ✓ reference distances | ◐ at ground level |
+| 6 2D alpha | ✓ | ✓ | ✓ | ✓ | ◐ 18-point outline | ✓ |
+| 7 buffer | ✓ (German answer) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 8 rings | ✘ call as text | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **total** | 5 | 7 + 1◐ | 6 + 1◐ | 7 | **7 + 1◐** | **6 + 1◐** |
+
+Run 1 = changes 14-17, run 2 = plus change 18, run 3 = plus change 19. About 5-7 minutes per session.
+Run 3 is at the level of round 4 (7/8 in both languages); the differences between runs are mostly
+sampling (gpt-oss answers the same question differently from run to run). All answers of run 3 were
+in the language of the question (the language check fired four times in English).
+
+Tests: 500 passed, 1 deselected (the known
 `test_codelists.py::TestCodelistStructure::test_de_function_and_usage_identical`).
 
 ## Remaining failures and proposed changes
 
-- **Claimed saves.** Guarded since the evening rounds (change 9), once per turn. The guard only
+- **Claimed saves.** Guarded since the evening rounds (change 9), up to three times per question
+  since change 15. The guard only
   sees whether *any* save succeeded in the turn, so a turn that re-saves something else and then
   claims the requested item passes (gpt-oss:20b DE round 4, Q5).
 - **gpt-oss:20b over ReAct** still fails multi-step questions (invalid tool-call JSON from Ollama,

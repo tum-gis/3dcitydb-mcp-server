@@ -876,7 +876,7 @@ def _on_scratch_export(user_id: str):
     from citydb_mcp.tools import scratchpad
 
     try:
-        data = scratchpad.export_items(user_id)
+        data = scratchpad.export_items(user_id, chatbot_version=CHATBOT_VERSION)
     except Exception as exc:
         print(f"[scratchpad] viewer export failed: {exc}", flush=True)
         payload = build_scratchpad_payload(user_id)

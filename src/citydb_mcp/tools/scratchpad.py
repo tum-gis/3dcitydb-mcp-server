@@ -346,26 +346,32 @@ SELECT name, label, kind, color, alpha, clamp, geom, objectids, is_visible, data
 FROM {schema}.scratchpad
 WHERE user_id = current_setting('citydb.user_id', true)"""
 
-# Shortcuts for the save SQL: the 3DCityDB joins from a building to its solid
-# or its ground surfaces are long, and weak models get them wrong. Plain views
-# (read-only, filters on objectid are pushed down to the indexes).
+# Shortcuts for the save SQL. In 3DCityDB v5 an object's geometry is three
+# joins away (feature -> property -> geometry_data), its boundary surfaces five;
+# weak models got these joins wrong in every evaluation round, with the views
+# they do not have to write them. For every feature class (buildings, roads,
+# bridges, vegetation, ...). Plain views: read-only, no data is copied, and
+# filters on objectid/class are pushed down to the indexes.
 _HELPER_VIEWS_DDL = [
-    """CREATE OR REPLACE VIEW {schema}.building_solid AS
-SELECT b.objectid, substring(gp.name from 4 for 1)::int AS lod,
-       g.geometry AS geom, ST_ZMax(b.envelope) - ST_ZMin(b.envelope) AS height_m, b.envelope
-FROM {schema}.feature b
-JOIN {schema}.objectclass oc ON oc.id = b.objectclass_id AND oc.classname IN ('Building', 'BuildingPart')
-JOIN {schema}.property gp ON gp.feature_id = b.id AND gp.name ~ '^lod[1-4]Solid$'
-JOIN {schema}.geometry_data g ON g.id = gp.val_geometry_id""",
-    """CREATE OR REPLACE VIEW {schema}.building_footprint AS
-SELECT b.objectid, g.geometry AS geom
-FROM {schema}.feature b
-JOIN {schema}.objectclass oc ON oc.id = b.objectclass_id AND oc.classname IN ('Building', 'BuildingPart')
-JOIN {schema}.property r ON r.feature_id = b.id AND r.name = 'boundary'
+    """CREATE OR REPLACE VIEW {schema}.feature_geometry AS
+SELECT f.objectid, oc.classname AS class, p.name AS property,
+       substring(p.name from '^lod([0-4])')::int AS lod, g.geometry AS geom,
+       ST_ZMax(f.envelope) - ST_ZMin(f.envelope) AS height_m, f.envelope
+FROM {schema}.feature f
+JOIN {schema}.objectclass oc ON oc.id = f.objectclass_id
+JOIN {schema}.property p ON p.feature_id = f.id AND p.val_geometry_id IS NOT NULL
+JOIN {schema}.geometry_data g ON g.id = p.val_geometry_id
+WHERE g.geometry IS NOT NULL""",
+    """CREATE OR REPLACE VIEW {schema}.feature_boundary AS
+SELECT f.objectid, oc.classname AS class, sc.classname AS surface_class, g.geometry AS geom
+FROM {schema}.feature f
+JOIN {schema}.objectclass oc ON oc.id = f.objectclass_id
+JOIN {schema}.property r ON r.feature_id = f.id AND r.name = 'boundary'
 JOIN {schema}.feature s ON s.id = r.val_feature_id
-JOIN {schema}.objectclass sc ON sc.id = s.objectclass_id AND sc.classname = 'GroundSurface'
+JOIN {schema}.objectclass sc ON sc.id = s.objectclass_id
 JOIN {schema}.property sp ON sp.feature_id = s.id AND sp.val_geometry_id IS NOT NULL
-JOIN {schema}.geometry_data g ON g.id = sp.val_geometry_id""",
+JOIN {schema}.geometry_data g ON g.id = sp.val_geometry_id
+WHERE g.geometry IS NOT NULL""",
 ]
 
 
@@ -466,16 +472,19 @@ _ZERO_LINE = ("the line has length 0 (both ends are the same point); use ST_3DSh
               "itself as geom, its start point is on a and its end point on b")
 
 # A 3D item whose highest point is this far below the city objects around it was
-# built from a relative height: a model used height_m (28 m) as the Z of roof
-# markers in a dataset whose ground is at 499 m (evaluation round 5).
+# probably built from a relative height: a model used height_m (28 m) as the Z of
+# roof markers in a dataset whose ground is at 499 m (evaluation round 5). The
+# item is saved anyway (it may be meant to lie underground); the result carries
+# this hint so the model can save it again with the right height.
 BELOW_GROUND_M = 100
 
 
 def _below_ground(zmax: float, ground: float) -> str:
-    return (f"the item lies {ground - zmax:.0f} m below the ground around it (its highest point is "
-            f"z {zmax:.1f}, the city objects nearby start at z {ground:.1f}): heights are absolute, "
-            f"take Z from the geometry (e.g. ST_ZMax(s.envelope) for a roof), not a relative height "
-            f"such as height_m")
+    return (f"height check: the item lies {ground - zmax:.0f} m below the ground around it (its "
+            f"highest point is z {zmax:.1f}, the city objects nearby start at z {ground:.1f}). "
+            f"Heights are absolute. If it should be on the ground or on a roof, save it again under "
+            f"the same name with Z taken from the geometry (e.g. ST_ZMax(s.envelope) for a roof), "
+            f"not a relative height such as height_m; if it is meant to be underground, keep it")
 
 # Describes a geometry (EWKB hex), optionally after the expression {expr} of g.
 _SHAPE_SQL = """
@@ -713,9 +722,10 @@ def save_item(user_id: str, name: str, sql: str, *, label: str | None = None,
             if row.get("zero_line"):
                 raise ValueError(_ZERO_LINE)
             if (row.get("ndims") or 2) > 2 and not clamp and row.get("zmax") is not None:
+                # Only a hint, the item is saved: tunnels, pipes or basements can lie deep.
                 ground = _ground_z(qdb, row["ewkb"])
                 if ground is not None and float(row["zmax"]) < ground - BELOW_GROUND_M:
-                    raise ValueError(_below_ground(float(row["zmax"]), ground))
+                    notes.append(_below_ground(float(row["zmax"]), ground))
             _check_vertices(row)
             meta, cls, clamp, _ = _shape(qdb, row["ewkb"], clamp=bool(clamp), item_class=item_class or None,
                                          height_m=height_m, extrude_m=extrude_m, base_z=base_z,
@@ -935,10 +945,21 @@ def _iso(value):
     return value.isoformat() if hasattr(value, "isoformat") else value
 
 
-def export_items(user_id: str, db: DatabaseConnection | None = None) -> dict:
+GENERATOR_NAME = "3DCityDB MCP Server"
+GENERATOR_URL = "https://github.com/tum-gis/3dcitydb-mcp-server"
+
+
+def export_items(user_id: str, db: DatabaseConnection | None = None,
+                 chatbot_version: str | None = None) -> dict:
     """All items of the user as the import/export file (a dict, see
-    production/docs/scratchpad.md). Raises ValueError without a valid user."""
+    production/docs/scratchpad.md). Raises ValueError without a valid user.
+
+    The file says what wrote it and when (``generator``, ``exported_at``), so
+    a later version that changes the format can tell old files apart.
+    ``chatbot_version`` comes from the web UI (the MCP package does not know it)."""
     import datetime
+
+    from citydb_mcp import __version__ as mcp_version
 
     _check_user(user_id)
     db = db or _owner_reader()
@@ -956,9 +977,16 @@ def export_items(user_id: str, db: DatabaseConnection | None = None) -> dict:
         else:
             item["objectids"] = list(r.get("objectids") or [])
         items.append(item)
-    out = {"format": FILE_FORMAT, "version": FILE_VERSION, "srid": _db_srid(db),
+    generator = {"name": GENERATOR_NAME, "mcp_server_version": mcp_version}
+    if chatbot_version:
+        generator["chatbot_version"] = chatbot_version
+    generator["url"] = GENERATOR_URL
+    out = {"format": FILE_FORMAT, "version": FILE_VERSION,
+           "comment": (f"Scratchpad items exported from the {GENERATOR_NAME} chatbot. Import the file "
+                       "in the item list of the 3D viewer (same dataset and coordinate system)."),
+           "generator": generator,
            "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-           "items": items}
+           "srid": _db_srid(db), "items": items}
     _audit("export", user_id, count=len(items))
     return out
 
