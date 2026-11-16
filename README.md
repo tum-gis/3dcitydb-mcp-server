@@ -254,7 +254,7 @@ attacks. `localhost`, `127.0.0.1` and `[::1]` are accepted on any port; add
 other names (e.g. the public name of a reverse proxy) to
 `CITYDB_MCP_ALLOWED_HOSTS` (comma-separated). Further settings:
 `CITYDB_MCP_MAX_CONNECTIONS` (default 32) and `CITYDB_STATEMENT_TIMEOUT_MS`
-(default 60000).
+(default 600000 = 10 minutes).
 
 > **Remote use:** a bearer token sent over plain HTTP can be read by anyone
 > on the network path. For access from other machines, put a reverse proxy
@@ -718,7 +718,7 @@ All options are set via environment variables (`.env` file or Docker Compose `en
 | `CITYDB_MCP_AUTH_TOKEN_FILE` | `/app/data/mcp_auth_token` (Docker) or user config dir | Where a generated token is stored |
 | `CITYDB_MCP_ALLOWED_HOSTS` | *(empty)* | Extra `Host` names accepted by the DNS-rebinding check (comma-separated; `host:*` for any port, `*` disables the check) |
 | `CITYDB_MCP_MAX_CONNECTIONS` | `32` | Maximum concurrent HTTP connections |
-| `CITYDB_STATEMENT_TIMEOUT_MS` | `60000` | Maximum run time of one SQL statement (`0` = none) |
+| `CITYDB_STATEMENT_TIMEOUT_MS` | `600000` | Maximum run time of one SQL statement in ms (10 minutes; `0` = none) |
 
 ### Fullstack only
 

@@ -30,7 +30,7 @@ published GitHub release notes and the commit history.
 - `/health` no longer returns database error details.
 - Limits: `CITYDB_MCP_MAX_CONNECTIONS` (default 32) for the HTTP server and a
   per-statement `statement_timeout` (`CITYDB_STATEMENT_TIMEOUT_MS`, default
-  60000 ms, `0` disables) on every database connection.
+  600000 ms = 10 minutes, `0` disables) on every database connection.
 - New `SECURITY.md` on reporting vulnerabilities privately.
 
 ### Changed

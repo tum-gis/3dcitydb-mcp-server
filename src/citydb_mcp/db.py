@@ -16,7 +16,7 @@ if _dotenv_path:
 
 _SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-_DEFAULT_STATEMENT_TIMEOUT_MS = 60000
+_DEFAULT_STATEMENT_TIMEOUT_MS = 600000  # 10 minutes; large datasets need long queries
 
 
 def _statement_timeout_ms() -> int:
@@ -79,7 +79,7 @@ class DatabaseConnection:
           boundary; application-level SQL string checks (e.g. in run_query)
           are only fast-fail conveniences on top of it.
         - statement_timeout: caps how long one statement may run
-          (CITYDB_STATEMENT_TIMEOUT_MS, default 60000; 0 disables), so a
+          (CITYDB_STATEMENT_TIMEOUT_MS, default 600000 = 10 min; 0 disables), so a
           runaway query cannot hold a pooled connection indefinitely.
         """
         conn.autocommit = True
