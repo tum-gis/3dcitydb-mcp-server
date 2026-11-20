@@ -1203,21 +1203,27 @@ _HEIGHT_PROPS = {
 TOOL_SCHEMAS = {
     "save_to_scratchpad": {
         "description": (
-            "Save a result under a name in the user's personal scratchpad (shown in the 3D viewer "
-            "when there is one, and reusable in later SQL through the view my_scratchpad). Give "
-            "EITHER `sql`: a read-only SELECT returning an `objectid` column (saved as a set of "
-            "features, e.g. buildings) or a `geom` column (saved as one geometry: point, line, "
-            "polygon, solid; several rows are combined), OR `geojson`: a GeoJSON geometry, Feature "
-            "or FeatureCollection in WGS84 lon/lat (e.g. points the user pasted). Saving an "
-            "existing name replaces it. SEVERAL ITEMS IN ONE CALL: add an `item_name` column; "
-            "every distinct value becomes its own item <name>_<value>, with its own `label` and "
-            "(optional `color` column, #rrggbb) its own colour, e.g. one group per class, one "
-            "marker per building, one line per pair. "
-            "Returns whether it was saved, how many objects and the "
-            "stored geometry type (\"Z\" = with heights). A 3D bounding box is "
-            "`ST_3DExtent(...) AS geom` (stored as a closed box, Solid3D), a 2D one "
-            "`ST_Extent(...) AS geom` (ST_MakeEnvelope is 2D only). height_m / extrude_m make "
-            "a 2D geometry 3D."
+            "Save an item in the user's personal scratchpad (drawn in the 3D viewer, reusable in "
+            "SQL via the view my_scratchpad). ONLY when the user asks to create, draw, save, keep, "
+            "mark or pin something; never to answer a question (finding, listing, counting or "
+            "showing data is run_query). "
+            "Give EITHER `sql`: a read-only SELECT returning an `objectid` column (a set of "
+            "features, e.g. buildings, coloured in the viewer) or a `geom` column (one geometry: "
+            "point, line, polygon, solid; several rows are combined), OR `geojson`: a GeoJSON "
+            "geometry, Feature or FeatureCollection in WGS84 lon/lat (e.g. points the user pasted). "
+            "Optional SELECT columns: `label` (a computed label, e.g. a height or distance); "
+            "`item_name` for SEVERAL ITEMS IN ONE CALL: every distinct value becomes its own item "
+            "<name>_<value> with its own label and (`color` column, #rrggbb) colour, e.g. one "
+            "group per class, one marker per building, one line per pair. "
+            "name: letters, digits, _ (no spaces); pick a short one if the user gives none and "
+            "tell it; saving an existing name replaces it. alpha = opacity 0-1: "
+            "X % transparency -> alpha = 1 - X/100. class = 2D or 3D as the user says (2D: "
+            "Polygon2D, LineString2D, 2Dmarker; 3D: Polygon3D, Solid3D, LineString3D, 3Dmarker; "
+            "Point3D = sphere); the stored geometry always matches the class (\"Z\" = with "
+            "heights). Bounding box: 3D `ST_3DExtent(...) AS geom` (a closed box, Solid3D), 2D "
+            "`ST_Extent(...) AS geom` (ST_MakeEnvelope is 2D only). height_m / extrude_m make a 2D "
+            "geometry 3D. Returns ok, name, count, stored type, colour and opacity: tell the user "
+            "the name and count."
         ),
         "inputSchema": {
             "type": "object",
@@ -1249,9 +1255,10 @@ TOOL_SCHEMAS = {
     },
     "scratchpad_action": {
         "description": (
-            "Show, hide, delete or fly to saved scratchpad items by name. "
-            "action: show | hide | delete | goto. Deleting more than one item needs confirm=true, "
-            "which you may only set after the user has confirmed that list."
+            "Show, hide, delete or fly to items the user SAVED before, by name. Not for showing "
+            "query results (the viewer highlights those by itself). "
+            "action: show | hide | delete | goto. Deleting more than one item: first ask the user "
+            "to confirm the list, then call again with confirm=true."
         ),
         "inputSchema": {
             "type": "object",
@@ -1270,8 +1277,10 @@ TOOL_SCHEMAS = {
             "(sphere/pipe radius), clamp, and its height. Only the given fields change. To give "
             "an item a height or make an area a solid use height_m / extrude_m: the stored "
             "geometry is converted and the class follows (2Dmarker -> 3Dmarker, Polygon2D -> "
-            "Polygon3D or Solid3D). A 3D class on a 2D item puts it on the ground with heights, "
-            "a 2D class removes the heights. For other changes save again under the same name."
+            "Polygon3D or Solid3D); base_z = absolute height instead of the ground. A 3D class on "
+            "a 2D item puts it on the ground with heights, a 2D class removes the heights; changing "
+            "only the class adds no height. X % transparency -> alpha = 1 - X/100. For other "
+            "changes save again under the same name."
         ),
         "inputSchema": {
             "type": "object",
@@ -1292,7 +1301,9 @@ TOOL_SCHEMAS = {
         "description": (
             "List the user's saved scratchpad items (name, label, kind, colour, visibility, "
             "number of objects or geometry type). For calculations query the view my_scratchpad "
-            "with run_query instead."
+            "with run_query instead, e.g. buildings within 100 m of a saved point: SELECT count(*) "
+            "FROM feature f, my_scratchpad p WHERE p.name = '<name>' AND f.objectclass_id = 901 "
+            "AND ST_DWithin(f.envelope, p.geom, 100)."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },

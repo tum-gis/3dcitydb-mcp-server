@@ -6,6 +6,18 @@ Both components are versioned together. The format is loosely based on
 with 1.2.0; the 1.0.x and 1.1.0 entries below were reconstructed from the
 published GitHub release notes and the commit history.
 
+## [Unreleased]
+
+### Changed
+- Scratchpad prompt: the `[SCRATCHPAD]` block in the system prompt is short
+  (3,307 -> about 860 characters) and says first when to use the tools (the
+  user explicitly asks to create, draw, save, keep, mark or pin something, or
+  to manage saved items) and when not: questions that find, list, count,
+  compare or "show me" data are answered with `run_query` only. The how-to
+  (columns, classes, boxes, heights, opacity) moved into the tool
+  descriptions, which also start with the rule; the example that saved "tall
+  buildings" (an ordinary question) is gone.
+
 ## [1.2.1]
 
 ### Security

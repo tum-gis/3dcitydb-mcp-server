@@ -32,6 +32,15 @@ CITYDB_SCRATCHPAD=true
   (via `extra_prompt_blocks()` in `production/webui/llm_utils.py`), so the web UI and the benchmark CLI
   see the same prompt (and get the same tools, see [CLI and benchmark](#cli-and-benchmark)). The
   block is `SCRATCHPAD_TOOLS_INSTRUCTIONS`.
+- **When, and when not.** The block is in every system prompt, also for questions that have nothing
+  to do with the scratchpad, so it is short (about 860 characters) and says first WHEN to use the
+  tools (the user explicitly asks to create, draw, save, keep, mark or pin something, or to manage
+  items they saved) and when NOT: questions that find, list, count, compare or "show me" data are
+  answered with `run_query` only, because the viewer highlights a query's objects by itself; if
+  unsure, the model answers with `run_query` and does not save. How to save (columns, `item_name`,
+  classes, 2D/3D, boxes, heights, opacity) is in the tool descriptions. The ReAct backend shows the
+  model only a tool's main description and its argument names, not the argument descriptions, so
+  everything the model needs is in the main description.
 - The MCP server (`src/citydb_mcp/server.py`) lists the four scratchpad tools only when
   `CITYDB_SCRATCHPAD=true`; `_execute_tool` dispatches them to `scratchpad.run_tool`.
 - The 3D viewer (`ENABLE_VIZ=true`) is needed to **display** items. Without it, saving and querying
@@ -284,7 +293,7 @@ it errs low (the lowest of the three), so a solid rather stands slightly in the 
 
 **Bounding boxes.** The model used `ST_MakeEnvelope` with six coordinates for a "3D bounding box";
 that function is 2D only. A 3D box is `ST_3DExtent(...)`, which returns a `box3d`. The tool's
-description and the prompt block now say so:
+description says so:
 
 ```sql
 -- 3D box around a saved set (closed box, Solid3D)
