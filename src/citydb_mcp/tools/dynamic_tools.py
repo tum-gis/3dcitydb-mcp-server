@@ -2901,9 +2901,45 @@ def get_spatial_capabilities(db: DatabaseConnection) -> dict:
                 "CG_Extrude(geom, x float, y float, z float) — extrudes a line to a surface or a surface to a volume",
                 "CG_3DBuffer(geom, radius float8, segments integer, buffer_type integer) — generates a 3D buffer around the input geometry; buffer_type: 0=rounded (default), 1=flat, 2=square; minimum 4 segments",
                 "CG_3DTranslate(geom, deltaX, deltaY, deltaZ) — translates (moves) a geometry by given offsets in 3D space",
-                "CG_3DAlphaWrapping(geom, relative_alpha int, relative_offset int) - computes the 3D alpha wrapping of a geometry; relative_alpha: 0-100 (default 10), relative_offset: 0-100 (default 10)",
+                "CG_3DConvexHull(geom) — closed 3D convex hull (e.g. of ST_Collect of several solids)",
+                "CG_OptimalAlphaShape(geom, allow_holes bool, nb_components int) — 2D alpha shape (concave outline) of the XY points; nb_components=1 gives one polygon. This is the 2D 'alpha wrapping': use it (on ST_Force2D input) whenever the user says 2D; ST_ConcaveHull(ST_Force2D(geom), 0.3) is the GEOS alternative",
             ]
+            capabilities["sfcgal_functions"] += _probe_sfcgal_optional(db)
     except Exception:
         pass
-    
+
     return capabilities
+
+
+# SFCGAL functions that exist in the PostGIS catalogue but may fail at run time
+# when PostGIS was compiled against an older SFCGAL (e.g. CG_3DAlphaWrapping
+# needs SFCGAL >= 2.1 at compile time, and CG_Extrude of an area returns a
+# Solid that PostGIS < SFCGAL 2.1 cannot read). Each is probed on a tiny
+# geometry, so the prompt only advertises what really works on this server.
+_SFCGAL_OPTIONAL = (
+    ("SELECT CG_3DAlphaWrapping('MULTIPOINT Z (0 0 0, 1 0 0, 0 1 0, 0 0 1)'::geometry, 10) IS NOT NULL AS ok",
+     "CG_3DAlphaWrapping(geom, relative_alpha int, relative_offset int) - computes the 3D alpha wrapping of a geometry (always a 3D surface; NEVER for a 2D request, use CG_OptimalAlphaShape then); relative_alpha: 0-100 (default 10), relative_offset: 0-100 (default 10)",
+     # Only the 3D wrapping is missing; gpt-oss read an earlier wording as "alpha
+     # shapes are not available" and used the 3D convex hull for a 2D request.
+     "CG_3DAlphaWrapping (the 3D alpha wrapping only) is NOT available on this server (PostGIS built "
+     "against an older SFCGAL): for a 3D wrapping use CG_3DConvexHull(ST_Collect(...)) and tell the "
+     "user it is a convex hull. This does not affect 2D: a 2D alpha shape / 2D alpha wrapping works "
+     "with CG_OptimalAlphaShape (above)"),
+    ("SELECT CG_Extrude('POLYGON((0 0, 1 0, 1 1, 0 0))'::geometry, 0, 0, 1) IS NOT NULL AS ok",
+     None,
+     "CG_Extrude works on lines only on this server (extruding an area fails): extrude an area's "
+     "ST_ExteriorRing for walls, or use CG_ExtrudeStraightSkeleton(area, 0.01, height) for a closed prism"),
+)
+
+
+def _probe_sfcgal_optional(db: DatabaseConnection) -> list[str]:
+    out = []
+    for probe, works, fails in _SFCGAL_OPTIONAL:
+        try:
+            ok = bool((db.execute_single(probe) or {}).get("ok"))
+        except Exception:
+            ok = False
+        text = works if ok else fails
+        if text:
+            out.append(text)
+    return out

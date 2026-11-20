@@ -6,8 +6,6 @@ Both components are versioned together. The format is loosely based on
 with 1.2.0; the 1.0.x and 1.1.0 entries below were reconstructed from the
 published GitHub release notes and the commit history.
 
-## [Unreleased]
-
 ## [1.2.1]
 
 ### Security
@@ -33,6 +31,17 @@ published GitHub release notes and the commit history.
   600000 ms = 10 minutes, `0` disables) on every database connection.
 - New `SECURITY.md` on reporting vulnerabilities privately.
 
+### Added
+- `save_to_scratchpad` can create **several items in one call**: an
+  `item_name` column makes one item per value (e.g. one group per energy
+  class, one marker per building), each with its own label and colour
+  (`label` / `color` columns).
+- Scratchpad **export and import** in the 3D viewer's item list (two icon
+  buttons): export downloads all of the user's items as a JSON file that names
+  the generator, the MCP server and chatbot versions and the export date and
+  time (UTC); import adds the items of such a file (same names are replaced).
+  The file is checked as untrusted input.
+
 ### Changed
 - **Default ports moved off commonly used ones:** MCP HTTP/SSE server
   `8080` → `8811` (`--port`, `MCP_SSE_PORT`), Gradio web UI `7860` → `7811`
@@ -42,6 +51,37 @@ published GitHub release notes and the commit history.
   `Authorization: Bearer ${CITYDB_MCP_AUTH_TOKEN}`.
 - Minimum `mcp` version raised to 1.10 (`mcp.server.transport_security`).
 - Bumped the MCP server and ChatBot version from 1.2.0 to 1.2.1.
+- The viewer's item list is English only ("My items"; it was German in
+  German-language browsers) and stays visible when empty.
+- The settings column is a sidebar that is closed by default (toggle at the
+  left edge), so the chat and the 3D viewer get the whole width. "New
+  conversation" and the context-window bar moved below the chat input.
+- The viewer's selection panel opens from a pointer icon in the top-right
+  toolbar (teal while selecting, with the number of selected features) instead
+  of sitting bottom-left over the clock and timeline.
+
+### Fixed
+- "Load / Refresh prompt" shows the whole system message the model gets,
+  including the scratchpad and flood-scene blocks (they were missing there and
+  in the prompt sizes shown after a rebuild and in "Clear chat").
+- A configured Ollama (`OLLAMA_BASE_URL`) stays the default provider when the
+  server does not answer at startup (e.g. while it loads a model); the UI no
+  longer falls back to anthropic with "No LLM provider configured".
+- The context-window bar follows a change of provider, model or context size
+  at once (it kept the previous provider's limit until the next turn).
+- `save_to_scratchpad` takes `alpha` (opacity, e.g. 0.7 for 30 % transparency);
+  it used to be dropped without a word, so the item kept 0.8 while the answer
+  said otherwise. Unknown tool arguments are now an error, a `Polygon2D` on a
+  one-part `MULTIPOLYGON` (an alpha shape) is stored as `MultiPolygon2D`
+  instead of being refused, and a save reports the stored colour and opacity.
+- The database prompt lists the 2D alpha shape (`CG_OptimalAlphaShape`) and
+  `CG_3DConvexHull`; `CG_3DAlphaWrapping` and extruding an area are probed at
+  startup and replaced by a workaround note where this PostGIS cannot run them. The note
+  says that only the 3D wrapping is missing, the 2D alpha shape works.
+- Context window of Ollama models: the model family's `<family>.context_length`
+  is read (e.g. `gptoss.context_length`; only `llama.` / `general.` were), and
+  Ollama models in OpenAI mode use the server's context (the size the model is
+  loaded with, else its maximum) instead of a fixed 200,000.
 
 ## [1.2.0]
 
