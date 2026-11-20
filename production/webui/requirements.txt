@@ -2,7 +2,7 @@
 # Pinned with compatible-release operators so patch updates flow in while
 # breaking minors do not.
 
-gradio>=5.0.0,<6.0.0
+gradio>=5.23.0,<6.0.0  # gr.Sidebar
 litellm~=1.48
 
 python-dotenv~=1.0

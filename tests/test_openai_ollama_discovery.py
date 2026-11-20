@@ -112,6 +112,76 @@ def test_default_provider_precedence() -> None:
         assert llm_utils.detect_default_provider() == "anthropic"
 
 
+def test_configured_but_unreachable_ollama_is_still_the_default() -> None:
+    """Only OLLAMA_BASE_URL in the .env and the server slow at startup (e.g.
+    busy loading a model): the UI must still start on Ollama, not on
+    anthropic with "No LLM provider configured"."""
+    with patch.dict(
+        os.environ,
+        {"OPENAI_API_KEY": "", "OPENAI_BASE_URL": "", "OPENAI_API_BASE": "",
+         "ANTHROPIC_API_KEY": "", "OLLAMA_BASE_URL": "http://ollama:11434"},
+        clear=False,
+    ), patch.object(llm_utils, "_ollama_reachable", return_value=False):
+        assert llm_utils.detect_default_provider() == "ollama"
+
+    with patch.dict(
+        os.environ,
+        {"OPENAI_API_KEY": "", "OPENAI_BASE_URL": "", "OPENAI_API_BASE": "",
+         "ANTHROPIC_API_KEY": "", "OLLAMA_BASE_URL": ""},
+        clear=False,
+    ), patch.object(llm_utils, "_ollama_reachable", return_value=False):
+        assert llm_utils.detect_default_provider() is None
+
+
+def test_context_length_from_model_info_any_model_family() -> None:
+    """Ollama names the key after the model family (values from the GPU server)."""
+    assert llm_utils._context_length_from_model_info(
+        {"gptoss.context_length": 131072, "gptoss.rope.scaling.original_context_length": 4096}) == 131072
+    assert llm_utils._context_length_from_model_info({"mistral3.context_length": 262144}) == 262144
+    assert llm_utils._context_length_from_model_info({"phi3.context_length": 16384}) == 16384
+    assert llm_utils._context_length_from_model_info({"general.architecture": "llama"}) is None
+
+
+def _ollama_server(ps_models, show_info, calls):
+    def fake_urlopen(request, timeout=0):
+        calls.append(request.full_url)
+        if request.full_url.endswith("/api/ps"):
+            return _Response({"models": ps_models})
+        if request.full_url.endswith("/api/show"):
+            return _Response({"model_info": show_info})
+        if request.full_url.endswith("/api/tags"):
+            return _Response({"models": [{"name": "gpt-oss:20b"}, {"name": "phi4:14b-q8_0"}]})
+        raise AssertionError(request.full_url)
+    return fake_urlopen
+
+
+def test_openai_mode_with_ollama_models_uses_the_servers_context() -> None:
+    env = {"OPENAI_API_KEY": "ollama", "OPENAI_BASE_URL": "http://gpu:11434/v1"}
+    llm_utils._ollama_ctx_cache.clear()
+    calls: list = []
+    # loaded: the size it runs with (/api/ps) wins
+    with patch.dict(os.environ, env, clear=False), patch.object(
+        llm_utils.urllib.request, "urlopen",
+        _ollama_server([{"name": "phi4:14b-q8_0", "context_length": 16384}], {}, calls),
+    ):
+        assert llm_utils._get_provider_ctx_limit("openai", "phi4:14b-q8_0") == 16384
+    assert "http://gpu:11434/api/ps" in calls  # the server of OPENAI_BASE_URL, without /v1
+
+    # not loaded: the trained maximum (/api/show)
+    with patch.dict(os.environ, env, clear=False), patch.object(
+        llm_utils.urllib.request, "urlopen",
+        _ollama_server([], {"gptoss.context_length": 131072}, []),
+    ):
+        assert llm_utils._get_provider_ctx_limit("openai", "gpt-oss:20b") == 131072
+
+    # a model that is not on the Ollama server (a commercial one): unchanged
+    with patch.dict(os.environ, env, clear=False), patch.object(
+        llm_utils.urllib.request, "urlopen", _ollama_server([], {}, []),
+    ):
+        assert llm_utils._get_provider_ctx_limit("openai", "gpt-4.1") == 200_000
+    llm_utils._ollama_ctx_cache.clear()
+
+
 def main() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = 0

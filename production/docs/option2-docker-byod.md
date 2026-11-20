@@ -59,14 +59,14 @@ Navigate to **http://localhost:7811**
 
 ### Provider & model
 
-In the left sidebar:
+In the **Settings** sidebar (closed by default; open it with the toggle at the left edge):
 
 1. Select **Anthropic**, **OpenAI**, or **Ollama**
 2. Choose a model from the dropdown
    - Anthropic and OpenAI models are pre-populated
    - Ollama models are fetched live from your `OLLAMA_HOST`; click **Refresh** if the list is empty
 3. Adjust **Temperature** if needed (default 0.1)
-4. Click **New conversation** to reset
+4. Click **New conversation** (below the chat input) to reset
 
 ### Chat
 

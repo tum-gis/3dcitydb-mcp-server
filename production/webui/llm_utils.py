@@ -17,7 +17,7 @@ _executor = _cf.ThreadPoolExecutor(max_workers=8)
 
 # ── Context-usage estimation & logging ────────────────────────────────────────
 
-_ollama_ctx_cache: dict[str, int] = {}
+_ollama_ctx_cache: dict[tuple[str, str], int] = {}  # (server, model) -> trained maximum
 
 
 def _msg_text(m) -> str:
@@ -60,41 +60,79 @@ def _estimate_tokens(messages: list) -> int:
     return sum(len(_msg_text(m)) for m in messages) // 3
 
 
-def _get_ollama_model_ctx(model: str) -> int:
-    """Query Ollama /api/show for the model's native context length. Result is cached."""
-    if model in _ollama_ctx_cache:
-        return _ollama_ctx_cache[model]
-    base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+def _context_length_from_model_info(info: dict) -> int | None:
+    """The trained context length in an Ollama /api/show model_info. Ollama
+    names it after the model family ("gptoss.context_length",
+    "mistral3.context_length", "llama.context_length", ...); the
+    "...rope.scaling.original_context_length" entry is not it."""
+    for key, value in (info or {}).items():
+        if (key == "context_length" or key.endswith(".context_length")) and "rope" not in key:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _loaded_ollama_ctx(model: str, base: str) -> int | None:
+    """The context the Ollama server actually runs `model` with, if it is
+    loaded right now (/api/ps). Not cached: it changes when the model is
+    reloaded with another size."""
     try:
-        import json as _j
+        with urllib.request.urlopen(urllib.request.Request(f"{base}/api/ps"), timeout=2) as resp:
+            data = json.loads(resp.read())
+        for m in data.get("models", []):
+            if model in (m.get("name"), m.get("model")) and m.get("context_length"):
+                return int(m["context_length"])
+    except Exception:
+        pass
+    return None
+
+
+def _get_ollama_model_ctx(model: str, base: str | None = None) -> int:
+    """The model's context on the Ollama server at `base` (default
+    OLLAMA_BASE_URL): the size it is loaded with (/api/ps), otherwise its
+    trained maximum (/api/show, cached), otherwise OLLAMA_NUM_CTX."""
+    base = (base or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")).rstrip("/")
+    loaded = _loaded_ollama_ctx(model, base)
+    if loaded:
+        return loaded
+    key = (base, model)
+    if key in _ollama_ctx_cache:
+        return _ollama_ctx_cache[key]
+    try:
         req = urllib.request.Request(
             f"{base}/api/show",
-            data=_j.dumps({"model": model}).encode(),
+            data=json.dumps({"model": model}).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
-            data = _j.loads(resp.read())
-        info = data.get("model_info", {})
-        ctx = (
-            info.get("llama.context_length")
-            or info.get("general.context_length")
-            or info.get("context_length")
-        )
+            data = json.loads(resp.read())
+        ctx = _context_length_from_model_info(data.get("model_info", {}))
         if ctx:
-            _ollama_ctx_cache[model] = int(ctx)
-            return int(ctx)
+            _ollama_ctx_cache[key] = ctx
+            return ctx
     except Exception:
         pass
     configured = int(os.environ.get("OLLAMA_NUM_CTX", "131072"))
-    _ollama_ctx_cache[model] = configured
+    _ollama_ctx_cache[key] = configured
     return configured
 
 
 def _get_provider_ctx_limit(provider: str, model: str) -> int:
-    """Return the effective context token limit for the given provider/model."""
+    """Return the effective context token limit for the given provider/model.
+
+    Ollama models also count in OpenAI mode (OPENAI_BASE_URL pointing at an
+    Ollama server): their window comes from that server, not the 200,000
+    assumed for commercial models. Ollama's OpenAI endpoint ignores a
+    per-request context size, so the server's own value is the real one."""
     if provider == "ollama":
         return _get_ollama_model_ctx(model)
+    if provider == "openai" and model and model in get_openai_ollama_models():
+        root = _ollama_root_from_openai_base(
+            os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE", ""))
+        return _get_ollama_model_ctx(model, root)
     return 200_000
 
 
@@ -432,6 +470,11 @@ def detect_default_provider() -> str | None:
         return "ollama"
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "anthropic"
+    # Configured but not answering right now (VPN down, server busy loading a
+    # model): still the provider of this .env. The UI says the server is not
+    # reachable and finds the models again on page load / "Refresh models".
+    if os.environ.get("OLLAMA_BASE_URL", "").strip():
+        return "ollama"
     return None
 
 
@@ -1167,6 +1210,18 @@ run_query: buildings within 100 m of a saved point
     AND f.objectclass_id = 901 AND ST_DWithin(f.envelope, p.geom, 100)"""
 
 
+def _scratch_reports(report) -> list:
+    """The single reports in a scratchpad result: one save, a list, or a save
+    with an item_name column ({"items": [...]}, one report per item)."""
+    out = []
+    for r in report if isinstance(report, list) else [report]:
+        if isinstance(r, dict) and isinstance(r.get("items"), list):
+            out.extend(r["items"])
+        else:
+            out.append(r)
+    return out
+
+
 def note_scratch_result(raw_result: str, focus: list) -> bool:
     """Read the "scratchpad" entry of a scratchpad tool result. Collects names the
     viewer should fly to (new items, goto) and returns True if anything changed."""
@@ -1177,7 +1232,7 @@ def note_scratch_result(raw_result: str, focus: list) -> bool:
     if not report:
         return False
     changed = False
-    for r in report if isinstance(report, list) else [report]:
+    for r in _scratch_reports(report):
         if not isinstance(r, dict) or not r.get("ok"):
             continue
         changed = True
@@ -1227,8 +1282,7 @@ def scratch_tool_result(raw: str) -> dict:
     if "items" in data:
         rows = data["items"] if isinstance(data["items"], list) else []
     else:
-        report = data.get("scratchpad", data)
-        rows = report if isinstance(report, list) else [report]
+        rows = _scratch_reports(data.get("scratchpad", data))
     rows = [r for r in rows if isinstance(r, dict)]
     errors = [str(r["error"]) for r in rows if r.get("ok") is False and r.get("error")]
     if data.get("error"):

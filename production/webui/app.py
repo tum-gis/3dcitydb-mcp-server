@@ -38,7 +38,7 @@ import gradio as gr
 
 from webui import __version__ as CHATBOT_VERSION
 from webui.llm_utils import (
-    ANTHROPIC_MODELS, OPENAI_MODELS, CHAT_INSTRUCTIONS, chat_instructions,
+    ANTHROPIC_MODELS, OPENAI_MODELS,
     detect_default_provider, models_for_provider,
     get_ollama_models, get_openai_ollama_models,
     _rows_to_markdown_table,
@@ -60,6 +60,7 @@ from webui.chat_runtime import (
     summarize_story_openai as _runtime_summarize_story_openai,
     prepare_chat_turn,
     stream_chat_turn,
+    system_message_content as _system_message_content,
 )
 from webui.model_profiles import profile_for_model
 from webui.session import (
@@ -404,15 +405,15 @@ def _refresh_system_prompt_stream() -> Generator[tuple, None, None]:
     else:
         elapsed = time.time() - started
         try:
-            size = len(_system_prompt_cache.get("full", ""))
-            # The LLM actually receives CHAT_INSTRUCTIONS + the assembled
-            # prompt; show both so the number matches the one reported by
-            # "Load / Refresh prompt" (len(CHAT_INSTRUCTIONS) + 2 newlines
-            # + size == the "Current prompt" figure).
+            assembled = _system_prompt_cache.get("full", "")
+            size = len(assembled)
+            # The LLM actually receives the chat instructions + the assembled
+            # prompt + the optional feature blocks (scratchpad, flood scene);
+            # show both so the second number matches "Load / Refresh prompt".
             size_note = (
                 f" — prompt: {size:,} chars"
-                f" (system prompt incl. chat instructions: "
-                f"{size + len(CHAT_INSTRUCTIONS) + 2:,} chars)"
+                f" (whole system message: "
+                f"{len(_system_message_content(assembled)):,} chars)"
                 if size else ""
             )
         except Exception:
@@ -717,7 +718,7 @@ def _gate_state(db_status: str) -> dict:
 
 
 def _make_ctx_bar(n_tok: int, ctx_limit: int) -> str:
-    """Build the context-window progress-bar HTML for the sidebar."""
+    """Build the context-window progress-bar HTML shown under the chat input."""
     pct = min((n_tok / ctx_limit * 100) if ctx_limit > 0 else 0, 100)
     if pct <= 50:
         r = int(pct / 50 * 255)
@@ -854,18 +855,83 @@ def _scratch_state_value(payload):
     return json.dumps({**payload, "t": time.time()}, ensure_ascii=False, default=str)
 
 
-def _on_scratch_sink(raw: str, request: gr.Request):
-    """A click in the viewer's item list (show / hide / delete / goto).
-    `raw` is untrusted browser input; the action runs for this tab's user only."""
+def _import_notice(report: dict) -> dict:
+    """Short text for the viewer's item list after an import."""
+    if not report.get("ok"):
+        return {"text": "Import failed: " + str(report.get("error") or "unknown error"), "error": True}
+    lines = [f"Imported {report.get('imported', 0)} item(s)"
+             + (f", {len(report['replaced'])} replaced" if report.get("replaced") else "") + "."]
+    skipped = report.get("skipped") or []
+    if skipped:
+        shown = "; ".join(f"{s.get('name')}: {s.get('reason')}" for s in skipped[:3])
+        more = f" (+{len(skipped) - 3} more)" if len(skipped) > 3 else ""
+        lines.append(f"Skipped {len(skipped)}: {shown}{more}")
+    missing = report.get("objects_not_found") or {}
+    if missing:
+        lines.append(f"{sum(missing.values())} object id(s) not found in this database "
+                     f"({', '.join(missing)}); kept anyway.")
+    return {"text": "\n".join(lines), "error": bool(skipped) and not report.get("imported")}
+
+
+def _on_scratch_export(user_id: str):
     from citydb_mcp.tools import scratchpad
 
     try:
+        data = scratchpad.export_items(user_id, chatbot_version=CHATBOT_VERSION)
+    except Exception as exc:
+        print(f"[scratchpad] viewer export failed: {exc}", flush=True)
+        payload = build_scratchpad_payload(user_id)
+        if payload is None:
+            return gr.update()
+        return _scratch_state_value({**payload, "notice": {"text": f"Export failed: {exc}", "error": True}})
+    print(f"[scratchpad] viewer export: {len(data['items'])} item(s)", flush=True)
+    payload = build_scratchpad_payload(user_id)
+    if payload is None:
+        return gr.update()
+    filename = time.strftime("scratchpad-%Y-%m-%d-%H%M.json")
+    return _scratch_state_value({**payload, "export": {"filename": filename, "data": data},
+                                 "notice": {"text": f"Exported {len(data['items'])} item(s) to {filename}."}})
+
+
+def _on_scratch_import(user_id: str, content):
+    from citydb_mcp.tools import scratchpad
+
+    if not isinstance(content, str):
+        report = {"ok": False, "error": "no file content"}
+    elif len(content.encode("utf-8", errors="replace")) > scratchpad.MAX_IMPORT_BYTES:
+        report = {"ok": False, "error": "file too large (max 5 MB)"}
+    else:
+        report = scratchpad.import_items(user_id, content)
+    print(f"[scratchpad] viewer import: ok={report.get('ok')} imported={report.get('imported')} "
+          f"replaced={len(report.get('replaced') or [])} skipped={len(report.get('skipped') or [])} "
+          f"error={report.get('error')}", flush=True)
+    payload = build_scratchpad_payload(user_id)
+    if payload is None:
+        return gr.update()
+    return _scratch_state_value({**payload, "notice": _import_notice(report)})
+
+
+def _on_scratch_sink(raw: str, request: gr.Request):
+    """A click in the viewer's item list (show / hide / delete / goto, export,
+    import). `raw` is untrusted browser input; the action runs for this tab's
+    user only."""
+    from citydb_mcp.tools import scratchpad
+
+    # the import content (max 5 MB) plus a little JSON around it
+    if not isinstance(raw, str) or len(raw) > scratchpad.MAX_IMPORT_BYTES * 2 + 4096:
+        return gr.update()
+    try:
         data = json.loads(raw) if raw else {}
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         data = {}
     if not isinstance(data, dict):
         return gr.update()
     action, name = data.get("action"), data.get("name")
+    if action in ("export", "import"):
+        user_id = user_for(getattr(request, "session_hash", None) or "local")
+        if action == "export":
+            return _on_scratch_export(user_id)
+        return _on_scratch_import(user_id, data.get("content"))
     if action not in scratchpad.ACTIONS or not scratchpad.valid_name(name):
         return gr.update()
     user_id = user_for(getattr(request, "session_hash", None) or "local")
@@ -1011,7 +1077,7 @@ def _chat_turn(
     history[-1][1] = "*Connecting to knowledge base…*"
     yield history, history, "*Idle.*", "", gr.update(), _NO_HL, _NO_CTX, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), cache_out, reasoning_history, story_history
     sp = _get_system_prompt(compact=effective_compact)
-    system_prompt = chat_instructions(full_lists) + "\n\n" + sp
+    system_prompt = _system_message_content(sp, full_lists)  # only measured for the log line
     total_chars = len(system_prompt)
     print(f"[prompt] sys: {len(system_prompt)} chars, msgs: {len(history)}, total: {total_chars}", flush=True)
 
@@ -1886,11 +1952,11 @@ _PRINT_CSS = """
   /* Hide all UI chrome: header, settings sidebar, tabs, trace,
      Cesium viewer, input row, per-message buttons, footer. */
   .header-bar,
-  #top-row > .column:first-child,
-  #top-row > .splitter,
+  #settings-sidebar,
   #chat-row > .column:nth-of-type(2),
   #chat-row > .splitter,
-  #chat-row > .column:first-child > .row:last-child,
+  .chat-input-row,
+  .chat-footer-row,
   .tab-container,
   .tab-wrapper,
   #agent-trace,
@@ -2112,7 +2178,7 @@ async (_win, _event_data) => {
   window.__citydbSplitsInit = true;
 
   var SPECS = [
-    { id: "top-row",  storage: "citydb.split.top",  minLeft: 200, minRight: 320 },
+    // The settings are a gr.Sidebar (own toggle), so only the chat row splits.
     { id: "chat-row", storage: "citydb.split.chat", minLeft: 320, minRight: 260 }
   ];
 
@@ -3147,10 +3213,24 @@ async (_win, _event_data) => {
   // Spatial scratchpad (scratchpad-bridge.js): the user's saved items. The
   // last list is kept, so a viewer that loads later can ask for it again.
   window._sendScratchpad = function (payload) {
-    window.__citydbScratchpad = payload;
+    // kept for a viewer that loads later, without the one-off notice
+    window.__citydbScratchpad = Object.assign({}, payload, { notice: null });
     var target = vizWindow();
     if (!target) return;
     target.postMessage(Object.assign({ type: "scratchpad" }, payload), window.location.origin);
+  };
+  // Export from the viewer's item list: the server puts the file into the
+  // scratch_state payload once; it is saved here and not passed on.
+  window._downloadScratchpad = function (exp) {
+    if (!exp || !exp.data) return;
+    var name = /^[A-Za-z0-9_.-]{1,80}$/.test(exp.filename || "") ? exp.filename : "scratchpad.json";
+    var blob = new Blob([JSON.stringify(exp.data, null, 2)], { type: "application/json" });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
   };
   window._reloadTiles = function () {
     var f = document.getElementById("cesium-iframe");
@@ -3184,7 +3264,9 @@ async (_win, _event_data) => {
     } else if (data.type === "scratchpad-action") {
       var sink = document.querySelector("#scratch-sink textarea");
       if (!sink) return;
-      sink.value = JSON.stringify({ action: data.action, name: data.name, t: data.t });
+      var msg = { action: data.action, name: data.name, t: data.t };
+      if (data.action === "import" && typeof data.content === "string") msg.content = data.content;
+      sink.value = JSON.stringify(msg);
       sink.dispatchEvent(new Event("input", { bubbles: true }));
     } else if (data.type === "selection_done") {
       // "Finish" in the viewer's selection panel: the selection itself was
@@ -3394,8 +3476,26 @@ def build_ui() -> gr.Blocks:
         .log-nav-controls { display:flex; align-items:center; gap:4px; }
         .log-nav-btn { min-width:32px !important; max-width:32px !important; padding:0 !important; height:28px !important; font-size:0.9rem !important; }
 
+        /* ── Settings sidebar toggle ───────────────────────────────
+           Gradio draws it in the page colours, so it disappears on the dark
+           theme. Inverse colours make it the one thing that stands out at
+           the left edge: dark on the light theme, light on the dark one.
+           (Gradio's chevron is drawn with borders, hence border-color.) */
+        #settings-sidebar .toggle-button {
+            background: #1e293b !important; border-color: #1e293b !important;
+            box-shadow: 0 1px 6px rgba(0,0,0,.35) !important;
+        }
+        #settings-sidebar .toggle-button .chevron-left { border-color: #f8fafc !important; }
+        .dark #settings-sidebar .toggle-button { background: #e2e8f0 !important; border-color: #e2e8f0 !important; }
+        .dark #settings-sidebar .toggle-button .chevron-left { border-color: #0f172a !important; }
+        #settings-sidebar .toggle-button:hover { filter: brightness(1.15); }
+
         /* ── Resizable column sections ─────────────────────────── */
         .resizable-row { position: relative; }
+        /* Under the chat input: the context bar takes the width, the
+           "New conversation" button keeps its own height, centred. */
+        .chat-footer-row { align-items: center !important; flex-wrap: nowrap !important; }
+        .chat-footer-row > .block:first-child { flex: 1 1 auto !important; min-width: 0 !important; }
         .resizable-row > div { min-width: 0 !important; }
         .splitter {
             position: absolute; top: 0; width: 8px; height: 100%;
@@ -3460,107 +3560,104 @@ def build_ui() -> gr.Blocks:
 
         reload_tiles_state = gr.State(0) if ENABLE_VIZ else None
 
-        with gr.Row(elem_classes="resizable-row", elem_id="top-row"):
-
-            # ── Sidebar ───────────────────────────────────────────────────────
-            with gr.Column(scale=1, min_width=220):
-                gr.Markdown("### Settings")
-                provider_radio = gr.Radio(
-                    choices=["anthropic", "openai", "ollama"],
-                    value=initial_provider,
-                    label="Provider / API",
-                )
-                model_dropdown = gr.Dropdown(
-                    choices=initial_models,
-                    value=initial_model,
-                    label="Model",
-                  elem_id="model-dropdown",
-                    allow_custom_value=True,
-                    info=initial_model_info,
-                )
-                dynamic_warn = gr.Markdown(
-                    visible=initial_is_ollama,
-                    value=initial_dynamic_warn,
-                )
-                refresh_ollama_btn = gr.Button(
-                  "Refresh models", size="sm", visible=initial_is_ollama or initial_openai_ollama
-                )
-                with gr.Row(equal_height=True, elem_classes="temperature-row"):
-                    set_temperature_checkbox = gr.Checkbox(
-                        label="Set temperature",
-                        value=False,
-                    scale=0,
-                      min_width=150,
-                      elem_id="set-temperature-checkbox",
-                    )
-                    temperature_slider = gr.Number(
-                      minimum=0.0, maximum=1.0, step=0.05,
-                      value=0.1, label="", show_label=False, interactive=False,
-                      scale=0,
-                      min_width=100,
-                    )
-                thinking_dropdown = gr.Dropdown(
-                    choices=["off", "low", "medium", "high"]
-                      + (["max"] if initial_provider == "openai" else []),
-                    value="off",
-                    label="Thinking",
-                  info="Reasoning level for thinking-capable models: Ollama uses "
-                    "think; OpenAI-compatible endpoints use reasoning_effort. "
-                    "off / low / medium / high"
-                    + (" (incl. max)" if initial_provider == "openai" else "")
-                    + ". Slower but more thorough.",
-                )
-                prompt_mode_radio = gr.Radio(
-                    choices=["auto", "compact", "full"],
-                    value="auto",
-                    label="Prompt mode",
-                    info="Auto picks compact for small local models. Override for complex queries.",
-                )
-                story_checkbox = gr.Checkbox(
-                    label="Keep a distilled summary of how the answer was found",
-                    value=True,
-                    visible=initial_is_ollama or initial_provider == "openai",
-                    info="After each turn that used the database, distills the successful path "
-                         "(purpose + working SQL + short result) into a compact story carried "
-                         "into later turns, so follow-ups can adapt earlier queries. "
-                         "Adds one extra blocking generation per tool-using turn.",
-                )
-                full_lists_checkbox = gr.Checkbox(
-                    label="Show every row in result tables",
-                    value=True,
-                    info="Lists all rows (e.g. every building ID) in the answer's table. "
-                         "Unchecked: results with more than 10 rows show 5 example rows, which "
-                         "answers faster. The full result is attached below the answer as "
-                         "CSV and JSON either way.",
-                )
-                reasoning_replay_checkbox = gr.Checkbox(
-                    label="Include all reasoning steps in context",
+        # ── Settings sidebar ──────────────────────────────────────────────────
+        # Closed by default so the chat and the 3D viewer get the whole width;
+        # Gradio's own toggle button at the left edge opens and closes it.
+        with gr.Sidebar(open=False, width=300, elem_id="settings-sidebar"):
+            gr.Markdown("### Settings")
+            provider_radio = gr.Radio(
+                choices=["anthropic", "openai", "ollama"],
+                value=initial_provider,
+                label="Provider / API",
+            )
+            model_dropdown = gr.Dropdown(
+                choices=initial_models,
+                value=initial_model,
+                label="Model",
+              elem_id="model-dropdown",
+                allow_custom_value=True,
+                info=initial_model_info,
+            )
+            dynamic_warn = gr.Markdown(
+                visible=initial_is_ollama,
+                value=initial_dynamic_warn,
+            )
+            refresh_ollama_btn = gr.Button(
+              "Refresh models", size="sm", visible=initial_is_ollama or initial_openai_ollama
+            )
+            with gr.Row(equal_height=True, elem_classes="temperature-row"):
+                set_temperature_checkbox = gr.Checkbox(
+                    label="Set temperature",
                     value=False,
-                    visible=initial_is_ollama or initial_provider == "openai",
-                    info="Feeds each turn's full reasoning trace back into context on later "
-                         "turns. Increases token usage significantly.",
+                scale=0,
+                  min_width=150,
+                  elem_id="set-temperature-checkbox",
                 )
-                num_ctx_dropdown = gr.Dropdown(
-                    choices=_CTX_OPTIONS,
-                    value=_CTX_DEFAULT,
-                    label="Context window (Ollama)",
-                    visible=initial_is_ollama,
-                    info="Tokens available to the model. 128K recommended for complex queries.",
+                temperature_slider = gr.Number(
+                  minimum=0.0, maximum=1.0, step=0.05,
+                  value=0.1, label="", show_label=False, interactive=False,
+                  scale=0,
+                  min_width=100,
                 )
-                reset_btn = gr.Button("New conversation", size="sm")
-                context_bar = gr.HTML(
-                    value="",
-                    elem_id="context-bar",
-                )
-                gr.Markdown("---")
-                status_bar = gr.HTML(value=get_status_html(initial_provider, initial_model))
-                gr.Markdown(
-                    "**API keys** are read from environment variables:  \n"
-                    "`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,  \n"
-                    "`OLLAMA_BASE_URL`  \n"
-                    "Set `OPENAI_BASE_URL` to route the OpenAI provider to vLLM, "
-                    "llama.cpp, or another OpenAI-compatible server."
-                )
+            thinking_dropdown = gr.Dropdown(
+                choices=["off", "low", "medium", "high"]
+                  + (["max"] if initial_provider == "openai" else []),
+                value="off",
+                label="Thinking",
+              info="Reasoning level for thinking-capable models: Ollama uses "
+                "think; OpenAI-compatible endpoints use reasoning_effort. "
+                "off / low / medium / high"
+                + (" (incl. max)" if initial_provider == "openai" else "")
+                + ". Slower but more thorough.",
+            )
+            prompt_mode_radio = gr.Radio(
+                choices=["auto", "compact", "full"],
+                value="auto",
+                label="Prompt mode",
+                info="Auto picks compact for small local models. Override for complex queries.",
+            )
+            story_checkbox = gr.Checkbox(
+                label="Keep a distilled summary of how the answer was found",
+                value=True,
+                visible=initial_is_ollama or initial_provider == "openai",
+                info="After each turn that used the database, distills the successful path "
+                     "(purpose + working SQL + short result) into a compact story carried "
+                     "into later turns, so follow-ups can adapt earlier queries. "
+                     "Adds one extra blocking generation per tool-using turn.",
+            )
+            full_lists_checkbox = gr.Checkbox(
+                label="Show every row in result tables",
+                value=True,
+                info="Lists all rows (e.g. every building ID) in the answer's table. "
+                     "Unchecked: results with more than 10 rows show 5 example rows, which "
+                     "answers faster. The full result is attached below the answer as "
+                     "CSV and JSON either way.",
+            )
+            reasoning_replay_checkbox = gr.Checkbox(
+                label="Include all reasoning steps in context",
+                value=False,
+                visible=initial_is_ollama or initial_provider == "openai",
+                info="Feeds each turn's full reasoning trace back into context on later "
+                     "turns. Increases token usage significantly.",
+            )
+            num_ctx_dropdown = gr.Dropdown(
+                choices=_CTX_OPTIONS,
+                value=_CTX_DEFAULT,
+                label="Context window (Ollama)",
+                visible=initial_is_ollama,
+                info="Tokens available to the model. 128K recommended for complex queries.",
+            )
+            gr.Markdown("---")
+            status_bar = gr.HTML(value=get_status_html(initial_provider, initial_model))
+            gr.Markdown(
+                "**API keys** are read from environment variables:  \n"
+                "`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,  \n"
+                "`OLLAMA_BASE_URL`  \n"
+                "Set `OPENAI_BASE_URL` to route the OpenAI provider to vLLM, "
+                "llama.cpp, or another OpenAI-compatible server."
+            )
+
+        with gr.Row(elem_id="top-row"):
 
             # ── Main area ─────────────────────────────────────────────────────
             with gr.Column(scale=4):
@@ -3604,7 +3701,9 @@ def build_ui() -> gr.Blocks:
                 with gr.Tab("Chat") as chat_tab:
                     viewer_html = None
                     if ENABLE_VIZ:
-                        with gr.Row(equal_height=True, elem_classes="resizable-row", elem_id="chat-row"):
+                        # Not equal_height: stretching the right column to the chat's
+                        # height spread the "3D view" header and the viewer apart.
+                        with gr.Row(equal_height=False, elem_classes="resizable-row", elem_id="chat-row"):
                             with gr.Column(scale=1, min_width=360):
                                 db_warning = gr.HTML(value="")
                                 go_import_btn = gr.Button(
@@ -3631,7 +3730,7 @@ def build_ui() -> gr.Blocks:
                                 # selection_sink textbox below. Empty when nothing
                                 # is selected.
                                 selection_badge = gr.Markdown("", elem_id="selection-badge")
-                                with gr.Row():
+                                with gr.Row(elem_classes="chat-input-row"):
                                     msg_input = gr.Textbox(
                                         placeholder="Assembling agent context, please wait…",
                                         label="", scale=8, lines=1,
@@ -3641,6 +3740,12 @@ def build_ui() -> gr.Blocks:
                                     send_btn = gr.Button("➤", variant="primary", scale=0, min_width=48, elem_id="send-btn", interactive=False)
                                     stop_btn = gr.Button("⏹", variant="stop", scale=0, min_width=48, elem_id="stop-btn", visible=False)
                                     export_pdf_btn = gr.Button("🖨", variant="secondary", scale=0, min_width=48, elem_id="export-pdf-btn")
+                                # Always visible under the input (the settings sidebar is
+                                # closed by default): context usage and a fresh start.
+                                with gr.Row(equal_height=False, elem_classes="chat-footer-row"):
+                                    context_bar = gr.HTML(value="", elem_id="context-bar")
+                                    reset_btn = gr.Button("New conversation", size="sm", scale=0,
+                                                          min_width=150, elem_id="new-chat-btn")
 
                             with gr.Column(scale=1, min_width=360):
                                 with gr.Row():
@@ -3648,7 +3753,9 @@ def build_ui() -> gr.Blocks:
                                     refresh_tiles_btn = gr.Button(
                                         "🔄 Recreate 3D tiles", size="sm", scale=0, min_width=160,
                                     )
-                                tiles_status = gr.Markdown("", elem_id="tiles-status")
+                                # Hidden until "Recreate 3D tiles" has something to say
+                                # (empty, it left a gap between the header and the viewer).
+                                tiles_status = gr.Markdown("", elem_id="tiles-status", visible=False)
                                 # Filled with the iframe by _on_load / after an import,
                                 # once the database has data.
                                 viewer_html = gr.HTML(value=_viewer_html(False))
@@ -3660,17 +3767,21 @@ def build_ui() -> gr.Blocks:
                                     from webui.importer import run_tiler
                                     busy = gr.update(value="⏳ Tiling…", interactive=False)
                                     idle = gr.update(value="🔄 Recreate 3D tiles", interactive=True)
+
+                                    def status(text: str):
+                                        return gr.update(value=text, visible=True)
+
                                     log = ""
-                                    yield busy, "*Generating 3D tiles…*", current_reload
+                                    yield busy, status("*Generating 3D tiles…*"), current_reload
                                     for chunk in run_tiler():
                                         log += chunk
                                         tail = "\n".join(log.replace("\r", "\n").splitlines()[-12:])
-                                        yield busy, f"```\n{tail}\n```", current_reload
+                                        yield busy, status(f"```\n{tail}\n```"), current_reload
                                     if "3D tile generation finished successfully" in log:
-                                        yield idle, "✓ 3D tiles recreated — reloading the viewer.", current_reload + 1
+                                        yield idle, status("✓ 3D tiles recreated — reloading the viewer."), current_reload + 1
                                     else:
                                         tail = "\n".join(log.replace("\r", "\n").splitlines()[-12:])
-                                        yield idle, f"⚠ Tiling did not finish.\n\n```\n{tail}\n```", current_reload
+                                        yield idle, status(f"⚠ Tiling did not finish.\n\n```\n{tail}\n```"), current_reload
 
                                 refresh_tiles_btn.click(
                                     fn=_refresh_tiles,
@@ -3719,7 +3830,7 @@ def build_ui() -> gr.Blocks:
                                         {"left": "$", "right": "$", "display": False},
                                     ],
                                 )
-                                with gr.Row():
+                                with gr.Row(elem_classes="chat-input-row"):
                                     msg_input = gr.Textbox(
                                         placeholder="Assembling agent context, please wait…",
                                         label="", scale=8, lines=1,
@@ -3729,6 +3840,12 @@ def build_ui() -> gr.Blocks:
                                     send_btn = gr.Button("➤", variant="primary", scale=0, min_width=48, elem_id="send-btn", interactive=False)
                                     stop_btn = gr.Button("⏹", variant="stop", scale=0, min_width=48, elem_id="stop-btn", visible=False)
                                     export_pdf_btn = gr.Button("🖨", variant="secondary", scale=0, min_width=48, elem_id="export-pdf-btn")
+                                # Always visible under the input (the settings sidebar is
+                                # closed by default): context usage and a fresh start.
+                                with gr.Row(equal_height=False, elem_classes="chat-footer-row"):
+                                    context_bar = gr.HTML(value="", elem_id="context-bar")
+                                    reset_btn = gr.Button("New conversation", size="sm", scale=0,
+                                                          min_width=150, elem_id="new-chat-btn")
 
                             with gr.Column(scale=2, min_width=300):
                                 gr.HTML(
@@ -3858,16 +3975,19 @@ def build_ui() -> gr.Blocks:
                         placeholder='Click "Load / Refresh prompt" to view the assembled prompt.',
                     )
 
-                    def _load_and_show_prompt(prompt_mode: str, provider: str, model: str):
+                    def _load_and_show_prompt(prompt_mode: str, provider: str, model: str,
+                                              full_lists: bool = True):
                         effective_compact, label = _resolve_compact(prompt_mode, provider, model)
                         sp = _get_system_prompt(compact=effective_compact)
-                        full = CHAT_INSTRUCTIONS + "\n\n" + sp
+                        # Exactly the system message of a chat turn, including the
+                        # scratchpad / flood-scene blocks (they used to be missing here).
+                        full = _system_message_content(sp, bool(full_lists))
                         size_label = f"**Current prompt:** {len(full):,} chars ({label}, {len(full)//3:,} tokens est.)"
                         return full, size_label
 
                     load_prompt_btn.click(
                         fn=_load_and_show_prompt,
-                        inputs=[prompt_mode_radio, provider_radio, model_dropdown],
+                        inputs=[prompt_mode_radio, provider_radio, model_dropdown, full_lists_checkbox],
                         outputs=[prompt_viewer, prompt_size_info],
                     )
 
@@ -3934,7 +4054,9 @@ def build_ui() -> gr.Blocks:
             scratch_state = gr.Textbox(visible=True, elem_id="scratch-state", label="", value="")
             scratch_state.change(
                 fn=None, inputs=[scratch_state], outputs=[],
-                js="(raw) => { if (raw) window._sendScratchpad(JSON.parse(raw)); }",
+                js=("(raw) => { if (!raw) return; var p = JSON.parse(raw);"
+                    " if (p.export) { window._downloadScratchpad(p.export); delete p.export; }"
+                    " window._sendScratchpad(p); }"),
             )
             scratch_sink = gr.Textbox(visible=True, elem_id="scratch-sink", label="")
             scratch_sink.change(fn=_on_scratch_sink, inputs=[scratch_sink],
@@ -4062,7 +4184,7 @@ def build_ui() -> gr.Blocks:
         def clear_chat(provider: str = "", model: str = "", prompt_mode: str = "auto", num_ctx_label: str = _CTX_DEFAULT):
             effective_compact, _ = _resolve_compact(prompt_mode, provider, model)
             sp = _get_system_prompt(compact=effective_compact)
-            base_msgs = [{"role": "system", "content": CHAT_INSTRUCTIONS + "\n\n" + sp}]
+            base_msgs = [{"role": "system", "content": _system_message_content(sp)}]
             base_tok = _estimate_tokens(base_msgs)
             num_ctx = _CTX_VALUES.get(num_ctx_label, 131072) if provider in _LOCAL_PROVIDERS else None
             ctx_limit_reset = num_ctx if num_ctx else (_get_provider_ctx_limit(provider, model) if provider else 131072)
@@ -4100,6 +4222,35 @@ def build_ui() -> gr.Blocks:
                      log_history_state, log_page_state, log_page_label, log_prev_btn, log_next_btn,
                      tool_cache_state, reasoning_state, story_state],
         )
+
+        def _context_bar_now(provider: str, model: str, prompt_mode: str, num_ctx_label: str,
+                             history: list, full_lists: bool):
+            """The context bar for the current settings and conversation, so a
+            change of provider, model or context size shows its own limit at
+            once (it used to keep the previous provider's until the next turn)."""
+            if not provider:
+                return gr.update()
+            effective_compact, _ = _resolve_compact(prompt_mode, provider, model)
+            msgs = [{"role": "system", "content": _system_message_content(
+                _get_system_prompt(compact=effective_compact), bool(full_lists))}]
+            for user_msg, assistant_msg in history or []:
+                if user_msg:
+                    msgs.append({"role": "user", "content": user_msg})
+                if assistant_msg:
+                    msgs.append({"role": "assistant", "content": assistant_msg})
+            num_ctx = _CTX_VALUES.get(num_ctx_label, 131072) if provider in _LOCAL_PROVIDERS else None
+            limit = num_ctx or _get_provider_ctx_limit(provider, model)
+            return _make_ctx_bar(_estimate_tokens(msgs), limit)
+
+        # The provider change resets the model dropdown, which fires
+        # model_dropdown.change, so the model and context-size events cover it.
+        for _ctx_trigger in (model_dropdown, num_ctx_dropdown):
+            _ctx_trigger.change(
+                fn=_context_bar_now,
+                inputs=[provider_radio, model_dropdown, prompt_mode_radio, num_ctx_dropdown,
+                        history_state, full_lists_checkbox],
+                outputs=[context_bar],
+            )
 
         log_prev_btn.click(
             fn=lambda h, p: navigate_logs(1, h, p),
