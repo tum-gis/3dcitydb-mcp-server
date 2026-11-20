@@ -23,6 +23,8 @@
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server giving AI assistants direct, natural language access to semantic 3D city models in CityGML managed within a [**3DCityDB v5**](https://github.com/3dcitydb/3dcitydb) geodatabase.
 
+Here you find the link to the Youtube playlist where we publish demos and tutorials on the MCP Server: [Youtube Playlist](https://www.youtube.com/watch?v=d-E4givqegQ&list=PLfndVKjQVtUQ)
+
 It dynamically resolves CityGML object classes, properties, codelists, and generic attributes from the database so the AI can answer both spatial and semantic queries stated in natural language, write and execute SQL queries, and reason about CityGML data — without any manual prompt engineering. 
 By including the MCP server in agentic coding environments, it becomes easy to create software that can read and write complex structured 3D city models compliant to the [OGC CityGML standard](https://www.ogc.org/standards/citygml/) (and using [3DCityDB V5](https://github.com/3dcitydb/3dcitydb) as the data repository).
 
