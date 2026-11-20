@@ -131,3 +131,20 @@ def test_tool_cache_is_bounded_and_formatted_for_followups(monkeypatch):
 
 def test_tool_cache_rejects_empty_result():
     assert chat_runtime.build_tool_cache("SELECT 1", [], 0) is None
+
+
+def test_system_message_content_is_what_the_model_gets(monkeypatch):
+    """The prompt viewer shows system_message_content(); it must equal the
+    system message of a chat turn, including the optional feature blocks
+    (the scratchpad block used to be missing from the viewer)."""
+    monkeypatch.setattr(chat_runtime, "extra_prompt_blocks", lambda: "[SCRATCHPAD] block")
+    for full_lists in (True, False):
+        shown = chat_runtime.system_message_content("database prompt", full_lists)
+        sent = chat_runtime.build_messages("q", [], "database prompt", full_lists=full_lists)[0]
+        assert sent == {"role": "system", "content": shown}
+        assert shown == (chat_runtime.chat_instructions(full_lists)
+                         + "\n\ndatabase prompt\n\n[SCRATCHPAD] block")
+
+    monkeypatch.setattr(chat_runtime, "extra_prompt_blocks", lambda: "")
+    assert chat_runtime.system_message_content("database prompt") == (
+        chat_runtime.CHAT_INSTRUCTIONS + "\n\ndatabase prompt")

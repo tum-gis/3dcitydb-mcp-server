@@ -48,13 +48,17 @@ docker compose -f production/docker-compose.fullstack.yml up -d
 
 This starts:
 - **`postgres`** — 3DCityDB v5 with SFCGAL on the internal Docker network
-- **`citydb-agent`** — Gradio UI at http://localhost:7860
+- **`citydb-agent`** — Gradio UI at http://localhost:7811 (change with `GRADIO_PORT`), and the
+  MCP server over HTTP at http://localhost:8811/mcp/ (published on `127.0.0.1` only; change with
+  `MCP_SSE_PORT`). MCP clients must send `Authorization: Bearer <token>`: set
+  `CITYDB_MCP_AUTH_TOKEN` in `production/.env`, or read the token generated on first start from
+  `production/data/mcp_auth_token`.
 
 Wait ~30 seconds for the database to initialize on first run (the health check will gate the agent startup).
 
 ### 4. Open the UI
 
-Navigate to **http://localhost:7860**
+Navigate to **http://localhost:7811**
 
 ### Optional: 3D view
 

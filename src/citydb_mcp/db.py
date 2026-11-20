@@ -16,6 +16,18 @@ if _dotenv_path:
 
 _SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+_DEFAULT_STATEMENT_TIMEOUT_MS = 600000  # 10 minutes; large datasets need long queries
+
+
+def _statement_timeout_ms() -> int:
+    """CITYDB_STATEMENT_TIMEOUT_MS as a non-negative int (0 = no timeout)."""
+    raw = os.getenv("CITYDB_STATEMENT_TIMEOUT_MS", "").strip()
+    try:
+        value = int(raw) if raw else _DEFAULT_STATEMENT_TIMEOUT_MS
+    except ValueError:
+        value = _DEFAULT_STATEMENT_TIMEOUT_MS
+    return max(value, 0)
+
 
 class DatabaseConnection:
     """Manages PostgreSQL connections to 3DCityDB v5.
@@ -66,11 +78,15 @@ class DatabaseConnection:
           regardless of what the application sends. This is the security
           boundary; application-level SQL string checks (e.g. in run_query)
           are only fast-fail conveniences on top of it.
+        - statement_timeout: caps how long one statement may run
+          (CITYDB_STATEMENT_TIMEOUT_MS, default 600000 = 10 min; 0 disables), so a
+          runaway query cannot hold a pooled connection indefinitely.
         """
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute("SET default_transaction_read_only = "
                         + ("on" if self.read_only else "off"))
+            cur.execute("SET statement_timeout = %s", (_statement_timeout_ms(),))
 
     def connect(self):
         """Back-compat: return a borrowed connection.

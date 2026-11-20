@@ -6,7 +6,9 @@
 # Starlette/uvicorn are needed only for the SSE transport; the stdio path
 # (used by the webui) does not import them.
 
-mcp~=1.0
+# 1.10 adds mcp.server.transport_security (DNS-rebinding protection), which
+# the HTTP/SSE transport uses.
+mcp~=1.10
 psycopg2-binary~=2.9
 python-dotenv~=1.0
 sqlglot~=23.0

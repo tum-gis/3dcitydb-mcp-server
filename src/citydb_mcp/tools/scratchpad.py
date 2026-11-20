@@ -1,5 +1,8 @@
 """Spatial scratchpad: per-user saved results that the 3D viewer can show.
 
+The viewer's item list can export all items of a user as a JSON file and
+import such a file (``export_items`` / ``import_items``).
+
 An item is either a *featureset* (a list of objectids, coloured in the tiles)
 or a *geometry* (pin, line, area, solid). Clients create and manage items with
 the MCP tools in ``TOOL_SCHEMAS`` (see production/docs/scratchpad.md);
@@ -17,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import threading
 
 from psycopg2 import sql as _pg_sql
@@ -61,6 +65,9 @@ _SOLID_CLASSES = ("Solid3D", "MultiSolid3D")
 _EXTRUDABLE = ("POLYGON", "MULTIPOLYGON", "LINESTRING", "MULTILINESTRING")
 
 
+_MULTI_OF = {"Polygon": "MultiPolygon", "LineString": "MultiLineString"}
+
+
 def classify(gtype: str, ndims: int, member_types=(), all_closed=False, clamp=False,
              requested: str | None = None) -> str:
     """The class of a geometry item: the requested one if it fits the geometry,
@@ -69,6 +76,11 @@ def classify(gtype: str, ndims: int, member_types=(), all_closed=False, clamp=Fa
     if requested:
         if requested not in GEOMETRY_CLASSES:
             raise ValueError(f"unknown class {requested!r} (allowed: {', '.join(GEOMETRY_CLASSES)})")
+        # Polygon2D asked, MULTIPOLYGON returned (an alpha shape always is one):
+        # same kind and dimension, so take the multi class instead of failing.
+        multi = _MULTI_OF.get(requested[:-2])
+        if multi and gtype == multi.upper():
+            requested = multi + requested[-2:]
         if gtype not in _CLASS_TYPES[requested]:
             raise ValueError(f"class {requested} does not fit a {gtype} geometry")
         if (ndims or 2) < 3 and requested not in FLAT_CLASSES:
@@ -95,6 +107,24 @@ def classify(gtype: str, ndims: int, member_types=(), all_closed=False, clamp=Fa
     raise ValueError(f"cannot store a {gtype} with mixed parts ({', '.join(sorted(members))}); "
                      "save the parts as separate items")
 DEFAULT_COLOR = "#ff5a00"
+DEFAULT_ALPHA = 0.8  # opacity; transparency = 1 - alpha
+
+
+def _check_alpha(value) -> float:
+    """Opacity 0-1. Also accepts "0.7", "70%" or 70 (percent of opacity)."""
+    if isinstance(value, bool):
+        raise ValueError("alpha must be a number between 0 and 1 (opacity)")
+    text = str(value).strip()
+    percent = text.endswith("%")
+    try:
+        alpha = float(text.rstrip("%").strip().replace(",", "."))
+    except ValueError:
+        raise ValueError(f"alpha must be a number between 0 and 1 (opacity), not {value!r}") from None
+    if percent or 1 < alpha <= 100:
+        alpha /= 100
+    if not 0 <= alpha <= 1:
+        raise ValueError("alpha must be between 0 and 1 (opacity; transparency = 1 - alpha)")
+    return alpha
 
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -143,6 +173,21 @@ def enabled() -> bool:
 
 def valid_name(name) -> bool:
     return isinstance(name, str) and bool(_NAME_RE.match(name))
+
+
+_TRANSLIT = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"})
+
+
+def safe_name(name) -> str:
+    """A valid item name made from a data value: umlauts transliterated
+    ("Röblingweg" -> "Roeblingweg"), other characters -> "_"."""
+    import unicodedata
+
+    text = unicodedata.normalize("NFKD", str(name or "").translate(_TRANSLIT))
+    text = re.sub(r"[^A-Za-z0-9_]+", "_", text.encode("ascii", "ignore").decode()).strip("_")
+    if text[:1].isdigit():
+        text = "_" + text
+    return text[:64]
 
 
 def user_settings(user_id) -> dict:
@@ -466,13 +511,13 @@ FROM q WHERE q.objectid IS NOT NULL"""
 
 _UPSERT_SQL = """
 INSERT INTO {schema}.scratchpad
-    (user_id, name, label, kind, class, color, clamp, geom, objectids, is_visible, data)
-VALUES (%s, %s, %s, %s, %s, %s, %s,
+    (user_id, name, label, kind, class, color, alpha, clamp, geom, objectids, is_visible, data)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
         CASE WHEN %s::text IS NULL THEN NULL ELSE ST_GeomFromEWKB(decode(%s, 'hex')) END,
         %s, true, %s::jsonb)
 ON CONFLICT (user_id, name) DO UPDATE SET
     label = EXCLUDED.label, kind = EXCLUDED.kind, class = EXCLUDED.class, color = EXCLUDED.color,
-    clamp = EXCLUDED.clamp, geom = EXCLUDED.geom, objectids = EXCLUDED.objectids,
+    alpha = EXCLUDED.alpha, clamp = EXCLUDED.clamp, geom = EXCLUDED.geom, objectids = EXCLUDED.objectids,
     is_visible = true, data = EXCLUDED.data, updated_at = now()"""
 
 
@@ -487,22 +532,80 @@ def _check_vertices(row: dict) -> None:
                          "simplify it (e.g. ST_Simplify, CG_3DConvexHull) first")
 
 
+MAX_GROUPS = 50  # items one save call may create through an item_name column
+SPLIT_COLUMN = "item_name"
+
+
+def _group_item_name(prefix: str, value) -> str:
+    """Item name for one item_name value: the value itself when it already
+    starts with the prefix, else prefix_value ("energy" + "A" -> "energy_A")."""
+    text = safe_name(value).lstrip("_")
+    if not text:
+        raise ValueError(f"item_name {value!r} has no letters or digits")
+    if text.lower().startswith(prefix.lower()):
+        return text[:64]
+    return f"{prefix}_{text}"[:64]
+
+
+def _save_groups(user_id: str, prefix: str, inner: str, columns: set, settings: dict,
+                 qdb: DatabaseConnection, wdb: DatabaseConnection, color, **kwargs) -> dict:
+    """One item per distinct item_name of the SELECT, each saved by save_item.
+    A color column gives each item its own colour, a label column its own
+    label; geom / objectid work per item as in a single save. The items are
+    saved one after another (not all-or-nothing); the report lists each."""
+    color_expr = "min(q.color::text)" if "color" in columns else "NULL"
+    groups = qdb.execute(
+        f"SELECT q.{SPLIT_COLUMN}::text AS v, {color_expr} AS c FROM ({inner}) q "
+        f"WHERE q.{SPLIT_COLUMN} IS NOT NULL GROUP BY 1 ORDER BY 1 LIMIT {MAX_GROUPS + 1}",
+        settings=settings)
+    if not groups:
+        raise ValueError(f"the {SPLIT_COLUMN} column is empty")
+    if len(groups) > MAX_GROUPS:
+        raise ValueError(f"more than {MAX_GROUPS} different {SPLIT_COLUMN} values; "
+                         "group the rows further or save in several calls")
+    names = [_group_item_name(prefix, g["v"]) for g in groups]
+    if len(set(names)) < len(names):
+        raise ValueError(f"different {SPLIT_COLUMN} values give the same item name; "
+                         "use values that differ in letters or digits")
+    items = []
+    for i, (group, item) in enumerate(zip(groups, names), 1):
+        # The i-th group by the same ordering as above; no data value goes into the SQL text.
+        sub = (f"SELECT * FROM (SELECT q.*, dense_rank() OVER (ORDER BY q.{SPLIT_COLUMN}::text) "
+               f"AS item_group FROM ({inner}) q WHERE q.{SPLIT_COLUMN} IS NOT NULL) z "
+               f"WHERE z.item_group = {i}")
+        own = group.get("c")
+        items.append(save_item(user_id, item, sub, split=False, qdb=qdb, wdb=wdb,
+                               color=own if isinstance(own, str) and _COLOR_RE.match(own) else color,
+                               **kwargs))
+    saved = [r["name"] for r in items if r.get("ok")]
+    return {"ok": bool(saved), "name": prefix, "items": items, "saved": len(saved),
+            "failed": len(items) - len(saved)}
+
+
 def save_item(user_id: str, name: str, sql: str, *, label: str | None = None,
               color: str | None = None, clamp: bool = False, item_class: str | None = None,
-              size_m: float | None = None, height_m: float | None = None,
+              alpha=None, size_m: float | None = None, height_m: float | None = None,
               extrude_m: float | None = None, base_z: float | None = None,
+              split: bool = True,
               qdb: DatabaseConnection | None = None,
               wdb: DatabaseConnection | None = None) -> dict:
     """Re-run ``sql`` read-only as the user and store its result under ``name``.
 
     A ``geom`` column makes a geometry item (rows are collected into one), an
     ``objectid`` column a featureset. Saving an existing name replaces it.
-    ``height_m`` / ``extrude_m`` / ``base_z`` make the geometry 3D (``_shape``)."""
+    ``height_m`` / ``extrude_m`` / ``base_z`` make the geometry 3D (``_shape``).
+    ``alpha`` is the opacity (0-1, default DEFAULT_ALPHA; transparency = 1 - alpha).
+
+    Optional columns: ``label`` (a computed label, e.g. a height, wins over the
+    argument) and ``item_name``: one item per distinct value, named
+    ``<name>_<value>``, with its own label and (``color`` column) colour; the
+    report then lists the items (``_save_groups``)."""
     try:
         _check_user(user_id)
         if not valid_name(name):
             raise ValueError(f"invalid name {name!r}: letters, digits, _ (no spaces), max 64")
         color = color if isinstance(color, str) and _COLOR_RE.match(color) else DEFAULT_COLOR
+        alpha = DEFAULT_ALPHA if alpha is None or alpha == "" else _check_alpha(alpha)
         inner = _inner_sql(sql)
         blocked = guard_sql(inner)
         if blocked:
@@ -515,6 +618,21 @@ def save_item(user_id: str, name: str, sql: str, *, label: str | None = None,
         if not probe:
             raise ValueError("the query returned no rows, nothing to save")
         columns = set(probe[0])
+        if split and SPLIT_COLUMN in columns:
+            return _save_groups(user_id, name, inner, columns, settings, qdb, wdb, color,
+                                label=label, clamp=clamp, item_class=item_class, alpha=alpha,
+                                size_m=size_m, height_m=height_m, extrude_m=extrude_m, base_z=base_z)
+        notes = []
+        if "label" in columns:
+            # A computed label (height, distance) wins: it matches the saved geometry.
+            rows = qdb.execute(f"SELECT string_agg(DISTINCT q.label::text, ', ') AS label, "
+                               f"count(DISTINCT q.label) AS labels FROM ({inner}) q", settings=settings)
+            computed = rows[0].get("label") if rows else None
+            if computed:
+                label = computed[:200]
+            if rows and int(rows[0].get("labels") or 0) > 1:
+                notes.append(f"{rows[0]['labels']} different labels were joined into one item label; "
+                             "for one item per row, save again with an item_name column (one item per value)")
         if "geom" in columns:
             row = qdb.execute(_GEOM_SQL.format(inner=inner), settings=settings)[0]
             if not row.get("ewkb"):
@@ -549,9 +667,17 @@ def save_item(user_id: str, name: str, sql: str, *, label: str | None = None,
         if isinstance(size_m, (int, float)) and size_m > 0:
             data["size_m"] = float(size_m)  # sphere radius / pipe radius in the viewer
         wdb.execute(_pg_sql.SQL(_UPSERT_SQL).format(schema=schema),
-                    (user_id, name, label, kind, cls, color, bool(clamp), ewkb, ewkb, ids, json.dumps(data)))
+                    (user_id, name, label, kind, cls, color, alpha, bool(clamp), ewkb, ewkb, ids,
+                     json.dumps(data)))
         _audit("save", user_id, name=name, kind=kind, **{"class": cls}, count=count, geometry_type=detail)
-        return {"ok": True, "name": name, "kind": kind, "class": cls, "count": count, "type": detail}
+        # color and alpha as stored, so the model can report what was really applied
+        out = {"ok": True, "name": name, "kind": kind, "class": cls, "count": count, "type": detail,
+               "color": color, "alpha": alpha}
+        if label:
+            out["label"] = label
+        if notes:
+            out["note"] = " ".join(notes)
+        return out
     except Exception as exc:
         return {"ok": False, "name": name, "error": str(exc)}
 
@@ -621,9 +747,7 @@ def update_item(user_id: str, name: str, *, label=None, color=None, alpha=None, 
                 raise ValueError("color must be #rrggbb")
             sets.append("color = %s"); params.append(color); changed["color"] = color
         if alpha is not None:
-            alpha = float(alpha)
-            if not 0 <= alpha <= 1:
-                raise ValueError("alpha must be between 0 and 1")
+            alpha = _check_alpha(alpha)
             sets.append("alpha = %s"); params.append(alpha); changed["alpha"] = alpha
         if size_m is not None:
             size_m = float(size_m)
@@ -660,6 +784,333 @@ def update_item(user_id: str, name: str, *, label=None, color=None, alpha=None, 
         return {"ok": True, "name": name, "updated": changed}
     except Exception as exc:
         return {"ok": False, "name": name, "error": str(exc)}
+
+
+# ── Export / import (the viewer's item list: a JSON file per user) ────────────
+# Plain JSON, not GeoJSON: geometries stay in the database's CRS with their
+# heights (EWKT), so another person with the same dataset gets exactly the
+# same items. The file is untrusted on import: every field is checked, the
+# geometry only ever reaches PostGIS as a bound parameter, and all rows are
+# written in one statement (one transaction).
+
+FILE_FORMAT = "3dcitydb-scratchpad"
+FILE_VERSION = 1
+MAX_IMPORT_BYTES = 5 * 1024 * 1024
+MAX_LABEL_CHARS = 500
+MAX_OBJECTID_CHARS = 256
+
+_EXPORT_SQL = """
+SELECT name, label, kind, class, color, alpha, clamp, is_visible, data, created_at, updated_at,
+       ST_AsEWKT(geom) AS geom, objectids
+FROM {schema}.scratchpad WHERE user_id = %s ORDER BY created_at, name"""
+
+_DB_SRID_SQL = "SELECT srid FROM {schema}.database_srs LIMIT 1"
+
+# Reads a geometry from the file (EWKT, bound parameter), gives it the file's
+# SRID if it has none and transforms it to the database's; describes the result.
+_IMPORT_SHAPE_SQL = """
+WITH i AS (SELECT ST_GeomFromEWKT(%(ewkt)s) AS g),
+s AS (SELECT CASE WHEN ST_SRID(i.g) = 0 THEN ST_SetSRID(i.g, %(file_srid)s) ELSE i.g END AS g FROM i),
+t AS (SELECT CASE WHEN ST_SRID(s.g) <> %(db_srid)s THEN ST_Transform(s.g, %(db_srid)s) ELSE s.g END AS g
+      FROM s)
+SELECT ST_NPoints(g) AS vertices, GeometryType(g) AS gtype, ST_NDims(g) AS ndims,
+       (SELECT array_agg(DISTINCT GeometryType(ST_GeometryN(g, k)))
+        FROM generate_series(1, ST_NumGeometries(g)) k) AS members,
+       (SELECT bool_and(GeometryType(ST_GeometryN(g, k)) IN ('POLYHEDRALSURFACE', 'TIN')
+                        AND ST_IsClosed(ST_GeometryN(g, k)))
+        FROM generate_series(1, ST_NumGeometries(g)) k) AS closed,
+       encode(ST_AsEWKB(g), 'hex') AS shape_ewkb
+FROM t"""
+
+_FOUND_SQL = "SELECT count(DISTINCT objectid) AS n FROM {schema}.feature WHERE objectid = ANY(%s::text[])"
+
+_IMPORT_ROW = ("(%s, %s, %s, %s, %s, %s, %s, %s, "
+               "CASE WHEN %s::text IS NULL THEN NULL ELSE ST_GeomFromEWKB(decode(%s, 'hex')) END, "
+               "%s::text[], %s, %s::jsonb, COALESCE(%s::timestamptz, now()))")
+
+_IMPORT_SQL = """
+INSERT INTO {{schema}}.scratchpad
+    (user_id, name, label, kind, class, color, alpha, clamp, geom, objectids, is_visible, data, created_at)
+VALUES {rows}
+ON CONFLICT (user_id, name) DO UPDATE SET
+    label = EXCLUDED.label, kind = EXCLUDED.kind, class = EXCLUDED.class, color = EXCLUDED.color,
+    alpha = EXCLUDED.alpha, clamp = EXCLUDED.clamp, geom = EXCLUDED.geom,
+    objectids = EXCLUDED.objectids, is_visible = EXCLUDED.is_visible, data = EXCLUDED.data,
+    updated_at = now()
+RETURNING name"""
+
+
+def _db_srid(db: DatabaseConnection) -> int:
+    rows = db.execute(_pg_sql.SQL(_DB_SRID_SQL).format(schema=_pg_sql.Identifier(db.schema)))
+    if not rows or rows[0].get("srid") is None:
+        raise ValueError("the database has no SRID (database_srs is empty)")
+    return int(rows[0]["srid"])
+
+
+def _iso(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+GENERATOR_NAME = "3DCityDB MCP Server"
+GENERATOR_URL = "https://github.com/tum-gis/3dcitydb-mcp-server"
+
+
+def export_items(user_id: str, *, chatbot_version: str,
+                 db: DatabaseConnection | None = None) -> dict:
+    """All items of the user as the import/export file (a dict, see
+    production/docs/scratchpad.md). Raises ValueError without a valid user.
+
+    The file always says what wrote it and when: ``generator`` (name, MCP
+    server and chatbot versions, URL) and ``exported_at`` (UTC). A later
+    version that changes the format can tell old files apart by them.
+    ``chatbot_version`` comes from the web UI (this package does not know it)."""
+    import datetime
+
+    from citydb_mcp import __version__ as mcp_version
+
+    _check_user(user_id)
+    db = db or _owner_reader()
+    rows = db.execute(_pg_sql.SQL(_EXPORT_SQL).format(schema=_pg_sql.Identifier(db.schema)), (user_id,))
+    items = []
+    for r in rows:
+        item = {"name": r["name"], "label": r.get("label"), "kind": r["kind"], "class": r.get("class"),
+                "color": r.get("color") or DEFAULT_COLOR,
+                "alpha": float(r["alpha"]) if r.get("alpha") is not None else 0.8,
+                "clamp": bool(r.get("clamp")), "is_visible": bool(r.get("is_visible")),
+                "data": r.get("data") if isinstance(r.get("data"), dict) else {},
+                "created_at": _iso(r.get("created_at")), "updated_at": _iso(r.get("updated_at"))}
+        if r["kind"] == "geometry":
+            item["geom"] = r.get("geom")
+        else:
+            item["objectids"] = list(r.get("objectids") or [])
+        items.append(item)
+    out = {"format": FILE_FORMAT, "version": FILE_VERSION,
+           "comment": (f"Scratchpad items exported from the {GENERATOR_NAME} chatbot. Import the file "
+                       "in the item list of the 3D viewer (same dataset and coordinate system)."),
+           "generator": {"name": GENERATOR_NAME, "mcp_server_version": mcp_version,
+                         "chatbot_version": str(chatbot_version), "url": GENERATOR_URL},
+           "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+           "srid": _db_srid(db), "items": items}
+    _audit("export", user_id, count=len(items))
+    return out
+
+
+def _parse_file(payload) -> dict:
+    """The file as a dict with format/version/items checked (ValueError otherwise)."""
+    if isinstance(payload, (bytes, bytearray)):
+        if len(payload) > MAX_IMPORT_BYTES:
+            raise ValueError(f"file too large (max {MAX_IMPORT_BYTES // (1024 * 1024)} MB)")
+        payload = payload.decode("utf-8", errors="strict")
+    if isinstance(payload, str):
+        if len(payload.encode("utf-8")) > MAX_IMPORT_BYTES:
+            raise ValueError(f"file too large (max {MAX_IMPORT_BYTES // (1024 * 1024)} MB)")
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, RecursionError):
+            raise ValueError("this is not a JSON file; only files exported from this list "
+                             "can be imported") from None
+    if not isinstance(payload, dict):
+        raise ValueError("not a scratchpad export file (expected a JSON object)")
+    if payload.get("format") != FILE_FORMAT:
+        if payload.get("type") in ("FeatureCollection", "Feature", "GeometryCollection"):
+            raise ValueError("this is a GeoJSON file; only scratchpad export files can be imported "
+                             "(to add GeoJSON, paste it into the chat)")
+        raise ValueError("not a scratchpad export file (it was not exported from this list)")
+    if payload.get("version") != FILE_VERSION:
+        raise ValueError(f"unsupported file version {payload.get('version')!r} (supported: {FILE_VERSION})")
+    srid = payload.get("srid")
+    if srid is not None and (isinstance(srid, bool) or not isinstance(srid, int) or not 0 < srid < 1_000_000):
+        raise ValueError("srid must be a positive integer")
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise ValueError("the file has no item list")
+    if len(items) > MAX_ITEMS:
+        raise ValueError(f"too many items in the file ({len(items)}, max {MAX_ITEMS})")
+    return payload
+
+
+def _has_nul(value) -> bool:
+    return "\x00" in value if isinstance(value, str) else False
+
+
+def _check_item(it) -> dict:
+    """One item of the file, checked and normalised (ValueError with the reason).
+    The geometry is checked later in the database."""
+    if not isinstance(it, dict):
+        raise ValueError("not an object")
+    name = it.get("name")
+    if not valid_name(name):
+        raise ValueError("invalid name (letters, digits, _; max 64)")
+    kind = it.get("kind")
+    if kind not in ("geometry", "featureset"):
+        raise ValueError("kind must be geometry or featureset")
+    label = it.get("label")
+    if label is not None and (not isinstance(label, str) or len(label) > MAX_LABEL_CHARS or _has_nul(label)):
+        raise ValueError(f"label must be text (max {MAX_LABEL_CHARS} characters)")
+    color = it.get("color")
+    color = color if isinstance(color, str) and _COLOR_RE.match(color) else DEFAULT_COLOR
+    alpha = it.get("alpha", 0.8)
+    if alpha is None:
+        alpha = 0.8
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not 0 <= alpha <= 1:
+        raise ValueError("alpha must be a number between 0 and 1")
+    clamp, visible = it.get("clamp", False), it.get("is_visible", True)
+    if not isinstance(clamp, bool) or not isinstance(visible, bool):
+        raise ValueError("clamp and is_visible must be true or false")
+    data = it.get("data")
+    data = {} if data is None else data
+    if not isinstance(data, dict):
+        raise ValueError("data must be an object")
+    data = dict(data)
+    size_m = data.get("size_m")
+    if size_m is not None and (isinstance(size_m, bool) or not isinstance(size_m, (int, float))
+                               or not 0 < size_m < 1e6):
+        data.pop("size_m")  # list_items casts it to a number
+    data_json = json.dumps(data, ensure_ascii=False)
+    if "\\u0000" in data_json:
+        raise ValueError("data contains a NUL character")
+    created = it.get("created_at")
+    if created is not None:
+        import datetime
+        try:
+            created = datetime.datetime.fromisoformat(str(created)).isoformat()
+        except ValueError:
+            created = None
+    cls = it.get("class")
+    if cls is not None and cls not in CLASSES:
+        raise ValueError(f"unknown class {cls!r}")
+    out = {"name": name, "label": label or None, "kind": kind, "class": cls, "color": color,
+           "alpha": float(alpha), "clamp": clamp, "is_visible": visible, "data": data_json,
+           "created_at": created, "geom": None, "objectids": None}
+    if kind == "featureset":
+        if cls not in (None, "FeatureSet"):
+            raise ValueError(f"class {cls} does not fit a featureset (FeatureSet)")
+        out["class"] = "FeatureSet"
+        ids = it.get("objectids")
+        if not isinstance(ids, list):
+            raise ValueError("a featureset needs an objectids list")
+        if len(ids) > MAX_FEATURESET:
+            raise ValueError(f"too many objects ({len(ids)}, max {MAX_FEATURESET})")
+        if not all(isinstance(i, str) and 0 < len(i) <= MAX_OBJECTID_CHARS and not _has_nul(i) for i in ids):
+            raise ValueError("objectids must be non-empty strings")
+        out["objectids"] = list(dict.fromkeys(ids))
+    else:
+        if cls == "FeatureSet":
+            raise ValueError("class FeatureSet needs kind featureset")
+        geom = it.get("geom")
+        if not isinstance(geom, str) or not geom.strip() or _has_nul(geom):
+            raise ValueError("a geometry item needs geom as EWKT text")
+        out["geom"] = geom.strip()
+    return out
+
+
+def import_items(user_id: str, payload, wdb: DatabaseConnection | None = None) -> dict:
+    """Add the items of an export file (str, bytes or dict) to the user's
+    scratchpad; an existing name is replaced. Items that fail a check are
+    skipped with the reason; a file that is not a scratchpad file writes nothing.
+    All rows go in with one statement, so either all valid items are stored or none."""
+    result = {"ok": False, "imported": 0, "replaced": [], "skipped": []}
+    try:
+        _check_user(user_id)
+        data = _parse_file(payload)
+    except (ValueError, UnicodeDecodeError) as exc:
+        result["error"] = str(exc)
+        return result
+    try:
+        wdb = wdb or writer_db()
+        schema = _pg_sql.Identifier(wdb.schema)
+        skipped = result["skipped"]
+        checked, seen = [], set()
+        for idx, raw in enumerate(data["items"]):
+            label = raw.get("name") if isinstance(raw, dict) and isinstance(raw.get("name"), str) else f"#{idx + 1}"
+            try:
+                item = _check_item(raw)
+            except ValueError as exc:
+                skipped.append({"name": label[:64], "reason": str(exc)})
+                continue
+            if item["name"] in seen:
+                skipped.append({"name": item["name"], "reason": "duplicate name in the file"})
+                continue
+            seen.add(item["name"])
+            checked.append(item)
+
+        db_srid = _db_srid(wdb) if any(i["kind"] == "geometry" for i in checked) else None
+        file_srid = data.get("srid") or db_srid
+        missing_objects = {}
+        ready = []
+        for item in checked:
+            try:
+                if item["kind"] == "geometry":
+                    try:
+                        rows = wdb.execute(_IMPORT_SHAPE_SQL, {"ewkt": item["geom"], "file_srid": file_srid,
+                                                               "db_srid": db_srid})
+                    except Exception as exc:
+                        raise ValueError("the geometry could not be read: "
+                                         + str(exc).strip().splitlines()[0][:200]) from exc
+                    meta = rows[0] if rows else {}
+                    if not meta.get("shape_ewkb"):
+                        raise ValueError("the geometry could not be read")
+                    if not meta.get("vertices"):
+                        raise ValueError("the geometry is empty")
+                    _check_vertices(meta)
+                    gtype = (meta.get("gtype") or "").upper()
+                    if item["class"]:
+                        # The class must fit the geometry type; heights are not
+                        # checked (the viewer draws either way, as it was saved).
+                        if gtype not in _CLASS_TYPES[item["class"]]:
+                            raise ValueError(f"class {item['class']} does not fit a {gtype} geometry")
+                    else:
+                        item["class"] = classify(gtype, meta["ndims"], meta.get("members") or (),
+                                                 bool(meta.get("closed")), item["clamp"])
+                    item["ewkb"] = meta["shape_ewkb"]
+                else:
+                    item["ewkb"] = None
+                    if item["objectids"]:
+                        try:
+                            found = wdb.execute(_pg_sql.SQL(_FOUND_SQL).format(schema=schema),
+                                                (item["objectids"],))
+                            n = len(item["objectids"]) - int(found[0]["n"] if found else 0)
+                            if n > 0:
+                                missing_objects[item["name"]] = n
+                        except Exception as exc:  # only information, never fatal
+                            print(f"[scratchpad] import: objectid check failed: {exc}", file=sys.stderr, flush=True)
+            except ValueError as exc:
+                skipped.append({"name": item["name"], "reason": str(exc)})
+                continue
+            ready.append(item)
+
+        existing = {r["name"] for r in wdb.execute(
+            _pg_sql.SQL("SELECT name FROM {}.scratchpad WHERE user_id = %s").format(schema), (user_id,))}
+        free = MAX_ITEMS - len(existing)
+        to_write = []
+        for item in ready:
+            if item["name"] not in existing:
+                if free <= 0:
+                    skipped.append({"name": item["name"], "reason": f"scratchpad full ({MAX_ITEMS} items)"})
+                    continue
+                free -= 1
+            to_write.append(item)
+
+        written = []
+        if to_write:
+            params = []
+            for it in to_write:
+                params += [user_id, it["name"], it["label"], it["kind"], it["class"], it["color"], it["alpha"],
+                           it["clamp"], it["ewkb"], it["ewkb"], it["objectids"], it["is_visible"], it["data"],
+                           it["created_at"]]
+            query = _pg_sql.SQL(_IMPORT_SQL.format(rows=", ".join([_IMPORT_ROW] * len(to_write)))).format(
+                schema=schema)
+            written = [r["name"] for r in wdb.execute(query, tuple(params))]
+        result.update(ok=True, imported=len(written),
+                      replaced=[n for n in written if n in existing])
+        if missing_objects:
+            result["objects_not_found"] = missing_objects
+        _audit("import", user_id, names=written, replaced=result["replaced"],
+               skipped=[s["name"] for s in skipped])
+        return result
+    except Exception as exc:
+        result.update(ok=False, imported=0, replaced=[], error=str(exc))
+        return result
 
 
 def touch_user(user_id: str, wdb: DatabaseConnection | None = None) -> None:
@@ -758,7 +1209,11 @@ TOOL_SCHEMAS = {
             "features, e.g. buildings) or a `geom` column (saved as one geometry: point, line, "
             "polygon, solid; several rows are combined), OR `geojson`: a GeoJSON geometry, Feature "
             "or FeatureCollection in WGS84 lon/lat (e.g. points the user pasted). Saving an "
-            "existing name replaces it. Returns whether it was saved, how many objects and the "
+            "existing name replaces it. SEVERAL ITEMS IN ONE CALL: add an `item_name` column; "
+            "every distinct value becomes its own item <name>_<value>, with its own `label` and "
+            "(optional `color` column, #rrggbb) its own colour, e.g. one group per class, one "
+            "marker per building, one line per pair. "
+            "Returns whether it was saved, how many objects and the "
             "stored geometry type (\"Z\" = with heights). A 3D bounding box is "
             "`ST_3DExtent(...) AS geom` (stored as a closed box, Solid3D), a 2D one "
             "`ST_Extent(...) AS geom` (ST_MakeEnvelope is 2D only). height_m / extrude_m make "
@@ -768,12 +1223,17 @@ TOOL_SCHEMAS = {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description":
-                         "Identifier: letters, digits, underscore, no spaces, e.g. affected_2013."},
+                         "Identifier: letters, digits, underscore, no spaces, e.g. affected_2013. "
+                         "With an item_name column it is the prefix (energy -> energy_A, energy_B)."},
                 "sql": {"type": "string", "description":
-                        "SELECT returning objectid rows or a geom column (not both needed)."},
+                        "SELECT returning objectid rows or a geom column (not both needed); "
+                        "optional columns: label, item_name (one item per value), color."},
                 "geojson": {"description": "GeoJSON (object or string) instead of sql."},
                 "label": {"type": "string", "description": "Text shown on the map (optional)."},
                 "color": {"type": "string", "description": "Colour as #rrggbb (optional)."},
+                "alpha": {"type": "number", "description":
+                          "Opacity 0-1 (optional, default 0.8). Transparency = 1 - alpha: "
+                          "30 % transparency = 0.7."},
                 "clamp": {"type": "boolean", "description":
                           "true = drape a 2D shape on the terrain (optional)."},
                 "class": {"type": "string", "enum": list(GEOMETRY_CLASSES), "description":
@@ -912,6 +1372,17 @@ def run_tool(name: str, arguments: dict, ctx_user_id=None) -> dict:
     the report under "scratchpad" (save/action) so callers can react to it."""
     user_id = effective_user_id(ctx_user_id)
     args = arguments or {}
+    schema = TOOL_SCHEMAS.get(name)
+    if schema is not None:
+        # An argument the tool does not know used to be dropped without a word,
+        # so the model reported e.g. a transparency that was never applied.
+        # null values count as absent (some models send every optional field).
+        allowed = schema["inputSchema"]["properties"]
+        unknown = sorted(k for k, v in args.items() if k not in allowed and v is not None)
+        if unknown:
+            return {"scratchpad": {"ok": False, "name": args.get("name"),
+                                   "error": f"unknown argument(s) {', '.join(unknown)}; {name} takes: "
+                                            f"{', '.join(allowed)}. Nothing was changed."}}
     if name == "save_to_scratchpad":
         sql, geojson = args.get("sql"), args.get("geojson")
         if bool(sql) == bool(geojson):
@@ -929,7 +1400,8 @@ def run_tool(name: str, arguments: dict, ctx_user_id=None) -> dict:
             return {"scratchpad": {"ok": False, "name": args.get("name"), "error": str(exc)}}
         return {"scratchpad": save_item(user_id, str(args.get("name") or ""), query,
                                         label=args.get("label"), color=args.get("color"),
-                                        clamp=clamp, item_class=args.get("class"), **numbers)}
+                                        alpha=args.get("alpha"), clamp=clamp,
+                                        item_class=args.get("class"), **numbers)}
     if name == "scratchpad_action":
         names = args.get("names")
         if isinstance(names, str):

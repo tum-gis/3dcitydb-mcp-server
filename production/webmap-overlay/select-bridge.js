@@ -188,42 +188,98 @@
 
     // ── tree panel ───────────────────────────────────────────────────────────
     function openTree(objectid) {
+        // A click in the 3D view opens the panel, so the browsed tree is
+        // never built out of sight while the panel is closed.
         fetchFeatureTree(objectid).then(function (tree) {
             lastTree = tree;
+            collapsed = false;
             renderPanel(tree);
         }).catch(function (err) {
             console.warn("[select-bridge] feature-tree failed:", err);
+            collapsed = false;
             renderPanel(lastTree, err);
         });
     }
 
-    // One persistent panel, visible from page load — not just after a pick.
-    // An earlier version used a separate floating toggle button that got
-    // hidden once the tree panel appeared, which left no visible way to
-    // tell selection mode was on, or to turn it off. Everything now lives
-    // in this one panel so there is always a single, obvious place to look.
+    // A Selection button in the viewer's top-right toolbar (next to the
+    // stock client's icons) opens and closes the panel below it. The button
+    // is always visible and shows the state: teal while selecting is on,
+    // with the number of selected features as a badge. (An earlier version
+    // had a floating toggle that got hidden behind the panel, and later a
+    // bottom-left panel that covered the clock and timeline.)
     //
-    // Collapsed by default: the full tree/summary/action body takes real
-    // screen space, and most users won't want to select anything the
-    // instant the viewer loads. Collapsed, only the compact header row
-    // shows (title, selecting on/off, a count badge, the expand arrow) at
-    // the same bottom-left spot — selecting stays fully usable while
-    // collapsed, so someone can turn it on, click around in the 3D view,
-    // and only expand later to see what they picked.
+    // Closed by default: most users won't want to select anything the
+    // instant the viewer loads. Selecting keeps working while the panel is
+    // closed; a click on a feature opens it to show the feature's tree.
     var panel = null, toggleBtn = null, treeBody = null, nextBtn = null, finishBtn = null,
         summaryEl = null, countBadge = null, collapseBtn = null, actionsRow = null;
     var collapsed = true;
 
+    // ── toolbar button ───────────────────────────────────────────────────────
+    // Lucide "mouse-pointer-click" line icon; fixed markup, never data.
+    var SELECT_ICON = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+        'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" ' +
+        'style="display:block;margin:auto">' +
+        '<path d="M14 4.1 12 6"/><path d="m5.1 8-2.9-.8"/><path d="m6 12-1.9 2"/>' +
+        '<path d="M7.2 2.2 8 5.1"/><path d="M9.037 9.69a.498.498 0 0 1 .653-.653l11 4.5a.5.5 0 0 1' +
+        '-.074.949l-4.349 1.041a1 1 0 0 0-.74.739l-1.04 4.35a.5.5 0 0 1-.95.074z"/></svg>';
+    var toolBtn = null, toolBadge = null, toolRetry = null;
+
+    function ensureToolButton() {
+        if (toolBtn) return true;
+        var bar = document.querySelector(".cesium-viewer-toolbar");
+        if (!bar) {
+            // The client builds its toolbar after this script runs; retry.
+            if (!toolRetry) toolRetry = setTimeout(function () { toolRetry = null; renderToolButton(); }, 300);
+            return false;
+        }
+        toolBtn = document.createElement("button");
+        toolBtn.type = "button";
+        toolBtn.id = "citydb-select-button";
+        toolBtn.className = "cesium-button cesium-toolbar-button";
+        toolBtn.setAttribute("aria-label", "Selection");
+        toolBtn.style.position = "relative";
+        toolBtn.innerHTML = SELECT_ICON;
+        toolBadge = document.createElement("span");
+        toolBadge.style.cssText =
+            "position:absolute;top:-5px;right:-5px;min-width:16px;height:16px;padding:0 4px;" +
+            "box-sizing:border-box;border-radius:8px;background:#4f46e5;color:#fff;" +
+            "font:600 10px/16px sans-serif;text-align:center;pointer-events:none;display:none;";
+        toolBtn.appendChild(toolBadge);
+        toolBtn.onclick = function () {
+            collapsed = !collapsed;
+            renderPanel(lastTree);
+        };
+        bar.appendChild(toolBtn);
+        // The toolbar's own drop-downs (base layers, help) open over the panel.
+        bar.style.zIndex = "10000";
+        return true;
+    }
+
+    function renderToolButton() {
+        if (!ensureToolButton()) return;
+        var n = Object.keys(selection).length;
+        toolBadge.textContent = n > 99 ? "99+" : String(n);
+        toolBadge.style.display = n ? "" : "none";
+        toolBtn.style.background = selecting ? "#0d9488" : "";
+        toolBtn.style.color = selecting ? "#fff" : "";
+        toolBtn.style.opacity = tilesetReady ? "" : ".6";
+        toolBtn.title = "Selection: " + (!tilesetReady ? "waiting for the 3D tiles"
+            : selecting ? "on (click features in the 3D view)" : "off")
+            + (n ? ", " + n + " selected" : "") + ". Click to " + (collapsed ? "open" : "close") + " the panel.";
+    }
+
     function ensurePanel() {
         if (panel) return;
         panel = document.createElement("div");
-        // Bottom-left, clear of the stock client's own top-left show/hide
-        // toolbox button — top-left overlapped it and got partially hidden.
-        // 34px clears the client's bottom credit/attribution bar.
+        // Top right, below the toolbar (its buttons are 32 px high at top 5 px)
+        // and its Selection button; the bottom stays free for the clock,
+        // timeline and the "My items" list. max-height keeps it above that list.
         panel.style.cssText =
-            "position:absolute;bottom:34px;left:8px;z-index:9999;display:flex;flex-direction:column;" +
-            "gap:6px;max-width:280px;background:rgba(30,41,59,.94);color:#f8fafc;" +
-            "padding:8px 10px;border-radius:6px;font:12px/1.5 sans-serif;max-height:60%;" +
+            "position:absolute;top:44px;right:5px;z-index:9999;display:none;flex-direction:column;" +
+            "gap:6px;width:280px;max-width:calc(100% - 10px);box-sizing:border-box;" +
+            "background:rgba(30,41,59,.94);color:#f8fafc;" +
+            "padding:8px 10px;border-radius:6px;font:12px/1.5 sans-serif;max-height:calc(55% - 44px);" +
             "box-shadow:0 1px 6px rgba(0,0,0,.5);";
 
         var header = document.createElement("div");
@@ -238,12 +294,13 @@
         countBadge = document.createElement("span");
         countBadge.style.cssText = "font-size:11px;opacity:.8;margin-left:auto;";
         collapseBtn = document.createElement("button");
-        collapseBtn.title = "Show/hide the selection panel";
+        collapseBtn.title = "Close the panel (selecting keeps its state; the toolbar button shows it)";
+        collapseBtn.textContent = "×";
         collapseBtn.style.cssText =
-            "cursor:pointer;font:12px sans-serif;padding:2px 7px;border-radius:5px;border:none;" +
+            "cursor:pointer;font:14px/1 sans-serif;padding:2px 7px;border-radius:5px;border:none;" +
             "background:#64748b;color:#f8fafc;";
         collapseBtn.onclick = function () {
-            collapsed = !collapsed;
+            collapsed = true;
             renderPanel(lastTree);
         };
         header.appendChild(title);
@@ -303,6 +360,7 @@
             "border-radius:5px;border:none;background:#4f46e5;color:#f8fafc;display:none;";
         finishBtn.onclick = function () {
             lastTree = null;
+            collapsed = true;  // done: close the panel; the toolbar badge keeps the count
             if (tilesetReady && selecting) setSelecting(false);
             else renderPanel(null);
             window.parent.postMessage({ type: "selection_done" }, ORIGIN);
@@ -448,14 +506,12 @@
             summaryEl.appendChild(sectionLabel("… and " + (ids.length - _selMax) + " more"));
         }
 
-        // Collapsed: only the header row (title, on/off, count, arrow) shows,
-        // at the same spot — selecting itself keeps working while collapsed.
-        treeBody.style.display = collapsed ? "none" : "";
-        summaryEl.style.display = collapsed ? "none" : "";
-        actionsRow.style.display = collapsed ? "none" : "flex";
+        // Closed: the whole panel is hidden; the toolbar button shows the
+        // state, and selecting itself keeps working.
+        panel.style.display = collapsed ? "none" : "flex";
+        actionsRow.style.display = "flex";
         countBadge.textContent = ids.length ? "(" + ids.length + ")" : "";
-        collapseBtn.textContent = collapsed ? "▸" : "▾";
-        panel.style.maxHeight = collapsed ? "" : "60%";
+        renderToolButton();
     }
 
     // Off by default — the user turns it on when they actually want to

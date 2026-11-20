@@ -13,13 +13,24 @@ _FIELDS = ("user_id", "session_id", "turn_id")
 
 _tool_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar("citydb_tool_ctx", default={})
 
+# Whether the client-supplied ``_ctx`` is trusted. True for the stdio transport,
+# whose only client is the web UI's own subprocess. The HTTP/SSE transport sets
+# it to False: any HTTP client could otherwise claim another user's id and read
+# or change that user's scratchpad. Untrusted calls fall back to the shared
+# CITYDB_SCRATCHPAD_MCP_USER identity (see tools/scratchpad.effective_user_id).
+trust_client_ctx: bool = True
+
 
 def split_tool_ctx(arguments: dict | None) -> tuple[dict, dict]:
-    """Return ``(arguments without _ctx, sanitized ctx)``."""
+    """Return ``(arguments without _ctx, sanitized ctx)``.
+
+    ``_ctx`` is always stripped; when ``trust_client_ctx`` is False the
+    returned context is empty.
+    """
     arguments = dict(arguments or {})
     raw = arguments.pop(_CTX_KEY, None)
     ctx = {}
-    if isinstance(raw, dict):
+    if trust_client_ctx and isinstance(raw, dict):
         ctx = {k: str(raw[k]) for k in _FIELDS if raw.get(k)}
     return arguments, ctx
 

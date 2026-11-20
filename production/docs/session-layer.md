@@ -125,8 +125,10 @@ Also listed in `production/.env.example`.
   that user. That is fine for low-value data. Before storing personal content (uploads, memory)
   outside the lab, put a real login in front (e.g. a reverse-proxy auth) and take `user_id` from its
   header instead. Only the source of the id changes.
-- `_ctx` over the SSE endpoint can be set by any MCP client. It is the caller's own context, not a
-  privilege.
+- `_ctx` is only trusted on the stdio transport, whose only client is the web UI's own subprocess.
+  The HTTP/SSE server (`3dcitydb-mcp-sse`) sets `tool_context.trust_client_ctx = False`: it strips
+  `_ctx` and ignores it, so HTTP clients cannot pose as another user and share the
+  `CITYDB_SCRATCHPAD_MCP_USER` identity instead.
 - There is no database-level isolation yet. That is the scratchpad's job.
 - `_prompt_stale` and the caches stay process-wide on purpose: they describe the schema and dataset,
   not the user.

@@ -18,13 +18,26 @@
 
     var ORIGIN = window.location.origin;
     var ID_PROPERTIES = ["objectid", "id", "GMLID", "gmlid"];
-    var DE = (navigator.language || "").toLowerCase().indexOf("de") === 0;
-    var T = DE ? { title: "Meine Objekte", empty: "Noch nichts gespeichert", hide: "Ausblenden",
-                   show: "Einblenden", del: "Löschen", go: "Hinfliegen", objects: "Objekte",
-                   collapse: "Liste einklappen", expand: "Liste ausklappen" }
-               : { title: "My items", empty: "Nothing saved yet", hide: "Hide",
-                   show: "Show", del: "Delete", go: "Fly to", objects: "objects",
-                   collapse: "Collapse list", expand: "Expand list" };
+    var T = { title: "My items", empty: "Nothing saved yet", hide: "Hide", show: "Show",
+              del: "Delete", go: "Fly to", objects: "objects", collapse: "Collapse list",
+              expand: "Expand list", exportBtn: "Export", importBtn: "Import",
+              exportTip: "Download all your items as a JSON file",
+              importTip: "Add items from a JSON file exported here (same names are replaced)",
+              tooLarge: "File too large (max 5 MB)", readError: "Could not read the file",
+              notJson: "Only .json files exported from this list can be imported",
+              importing: "Importing ..." };
+    // Small line icons (Lucide-style) for the header buttons: arrow out of a
+    // tray = export (download), arrow into a tray = import (upload).
+    var ICON_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+        'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">';
+    var ICONS = {
+        importBtn: ICON_SVG + '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>' +
+                   '<polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>',
+        exportBtn: ICON_SVG + '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>' +
+                   '<polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+    };
+    var MAX_IMPORT_BYTES = 5 * 1024 * 1024;
+    var NOTICE_MS = 10000;
     var HIGHLIGHT = Cesium.Color.fromCssColorString("#ff5a00");
     var SELECTION = Cesium.Color.fromCssColorString("#a855f7");
     var OTHER = Cesium.Color.fromCssColorString("#e5e7eb");
@@ -401,9 +414,48 @@
     }
 
     // ── list panel ───────────────────────────────────────────────────────────
-    function post(action, name) {
-        window.parent.postMessage({ type: "scratchpad-action", action: action, name: name, t: Date.now() },
-                                  ORIGIN);
+    function post(action, name, content) {
+        var msg = { type: "scratchpad-action", action: action, name: name, t: Date.now() };
+        if (typeof content === "string") msg.content = content;
+        window.parent.postMessage(msg, ORIGIN);
+    }
+
+    // Import: the file is read here and sent as text; the server checks it
+    // (it is untrusted) and answers with the new list and a notice.
+    function pickImportFile() {
+        var input = document.createElement("input");
+        input.type = "file";
+        input.accept = ".json,application/json";
+        input.style.display = "none";
+        input.onchange = function () {
+            var file = input.files && input.files[0];
+            input.remove();
+            if (!file) return;
+            // The file dialog's filter is only a suggestion ("All files" bypasses it).
+            if (!/\.json$/i.test(file.name || "")) { showNotice({ text: T.notJson, error: true }); return; }
+            if (file.size > MAX_IMPORT_BYTES) { showNotice({ text: T.tooLarge, error: true }); return; }
+            var reader = new FileReader();
+            reader.onload = function () {
+                showNotice({ text: T.importing });
+                post("import", null, String(reader.result || ""));
+            };
+            reader.onerror = function () { showNotice({ text: T.readError, error: true }); };
+            reader.readAsText(file);
+        };
+        document.body.appendChild(input);
+        input.click();
+    }
+
+    var noticeTimer = null;
+    function showNotice(notice) {
+        ensurePanel();
+        var el = panel.querySelector("[data-status]");
+        if (noticeTimer) { clearTimeout(noticeTimer); noticeTimer = null; }
+        if (!notice || !notice.text) { el.style.display = "none"; return; }
+        el.textContent = String(notice.text);
+        el.style.color = notice.error ? "#fca5a5" : "#86efac";
+        el.style.display = "block";
+        noticeTimer = setTimeout(function () { el.style.display = "none"; noticeTimer = null; }, NOTICE_MS);
     }
 
     // The header stays put and only the list scrolls, at most LIST_MAX_PX high
@@ -426,7 +478,10 @@
             '#citydb-scratchpad [data-list]::-webkit-scrollbar-thumb{background:#64748b;border-radius:3px}</style>' +
             '<div data-head style="display:flex;align-items:center;gap:6px;flex:none;cursor:pointer;user-select:none">' +
             '<span style="font-weight:600;flex:1">' + T.title + ' <span data-count style="font-weight:400;color:#94a3b8"></span></span>' +
+            '<button data-import type="button"></button><button data-export type="button"></button>' +
             '<span data-toggle style="color:#cbd5e1;font-size:11px"></span></div>' +
+            '<div data-status style="display:none;flex:none;margin-top:4px;font-size:11px;' +
+            'white-space:pre-line;word-break:break-word"></div>' +
             '<div data-list style="flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;' +
             'margin-top:4px;padding-right:2px;max-height:min(' + LIST_MAX_PX + 'px, calc(45vh - 40px))"></div>';
         listEl = panel.querySelector("[data-list]");
@@ -435,6 +490,20 @@
             try { localStorage.setItem(COLLAPSED_KEY, collapsed ? "1" : "0"); } catch (e) { /* no storage */ }
             updateCollapsed();
         };
+        [["[data-import]", ICONS.importBtn, T.importBtn, T.importTip, pickImportFile],
+         ["[data-export]", ICONS.exportBtn, T.exportBtn, T.exportTip, function () { post("export"); }]
+        ].forEach(function (b) {
+            var el = panel.querySelector(b[0]);
+            el.innerHTML = b[1];  // fixed markup from ICONS above, never data
+            el.title = b[2] + ": " + b[3];
+            el.setAttribute("aria-label", b[2]);
+            el.style.cssText = "background:none;border:0;color:#cbd5e1;cursor:pointer;padding:0 3px;" +
+                "display:inline-flex;align-items:center;line-height:0";
+            el.onmouseenter = function () { el.style.color = "#f8fafc"; };
+            el.onmouseleave = function () { el.style.color = "#cbd5e1"; };
+            // a click on a button must not collapse/expand the list
+            el.onclick = function (ev) { ev.stopPropagation(); b[4](); };
+        });
         updateCollapsed();
         (document.getElementById("cesiumContainer") || document.body).appendChild(panel);
     }
@@ -456,11 +525,19 @@
 
     function renderPanel(focus) {
         ensurePanel();
-        panel.style.display = items.length ? "flex" : "none";
+        // Shown once the scratchpad is active (the first list arrived), also
+        // when empty, so Import is reachable.
+        panel.style.display = "flex";
         panel.querySelector("[data-count]").textContent = "(" + items.length + ")";
         var scrollTop = listEl.scrollTop;  // a refresh rebuilds the rows; keep the place
         var focusRow = null;
         listEl.innerHTML = "";
+        if (!items.length) {
+            var empty = document.createElement("div");
+            empty.style.cssText = "color:#94a3b8;padding:2px 0";
+            empty.textContent = T.empty;
+            listEl.appendChild(empty);
+        }
         items.forEach(function (it) {
             var row = document.createElement("div");
             if (focus && focus.indexOf(it.name) >= 0) focusRow = row;
@@ -504,6 +581,7 @@
             return items.some(function (it) { return it.name === n && it.visible; });
         });
         renderPanel(focus);
+        if (msg.notice) showNotice(msg.notice);
         if (focus.length) flyTo(focus);
         console.log("[scratchpad-bridge] items:", items.length, "featureset buildings:", colorById.size,
                     "focus:", focus);

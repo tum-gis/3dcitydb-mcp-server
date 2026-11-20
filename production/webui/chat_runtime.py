@@ -162,6 +162,16 @@ def trim_messages(
     return system + kept, dropped
 
 
+def system_message_content(system_prompt: str, full_lists: bool = True) -> str:
+    """The whole system message the model gets: the chat instructions, the
+    assembled prompt and the prompt blocks of optional features (scratchpad,
+    flood scene). Chat turns and the web UI's prompt viewer both use this,
+    so the viewer shows exactly what the model reads."""
+    content = chat_instructions(full_lists) + "\n\n" + system_prompt
+    extra = extra_prompt_blocks()
+    return content + ("\n\n" + extra if extra else "")
+
+
 def build_messages(
     user_message: str,
     history: list,
@@ -185,11 +195,8 @@ def build_messages(
     """
     reasoning_history = reasoning_history or []
     story_history = story_history or []
-    system_content = chat_instructions(full_lists) + "\n\n" + system_prompt
-    extra = extra_prompt_blocks()
-    if extra:
-        system_content += "\n\n" + extra
-    messages: list[dict] = [{"role": "system", "content": system_content}]
+    messages: list[dict] = [{"role": "system",
+                             "content": system_message_content(system_prompt, full_lists)}]
 
     for index, (user_msg, assistant_msg) in enumerate(history):
         if user_msg:
