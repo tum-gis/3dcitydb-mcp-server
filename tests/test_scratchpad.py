@@ -86,12 +86,13 @@ def test_save_featureset_reruns_the_sql_as_the_user():
     out = sp.save_item(UID, "affected_2013", "SELECT f.objectid FROM feature f;",
                        color="#dc2626", qdb=qdb, wdb=wdb)
     assert out == {"ok": True, "name": "affected_2013", "kind": "featureset", "class": "FeatureSet",
-                   "count": 2, "type": "objectids"}
+                   "count": 2, "type": "objectids", "color": "#dc2626", "alpha": sp.DEFAULT_ALPHA}
     assert all(c[2] == {"citydb.user_id": UID} for c in qdb.calls)  # read as the user
     upsert = wdb.calls[-1]
     assert "ON CONFLICT" in upsert[0]
-    assert upsert[1][:6] == (UID, "affected_2013", None, "featureset", "FeatureSet", "#dc2626")
-    assert upsert[1][9] == ["B1", "B2"]
+    assert upsert[1][:7] == (UID, "affected_2013", None, "featureset", "FeatureSet", "#dc2626",
+                             sp.DEFAULT_ALPHA)
+    assert upsert[1][10] == ["B1", "B2"]
 
 
 def test_save_geometry_keeps_it_out_of_the_model():
@@ -102,9 +103,9 @@ def test_save_geometry_keeps_it_out_of_the_model():
     out = sp.save_item(UID, "my_house", "SELECT geom FROM x", label="My house", size_m=2, qdb=qdb, wdb=wdb)
     assert out["ok"] and out["kind"] == "geometry" and out["type"] == "POINT Z" and out["class"] == "3Dmarker"
     params = wdb.calls[-1][1]
-    assert params[3] == "geometry" and params[7] == "01ab" and params[9] is None
+    assert params[3] == "geometry" and params[8] == "01ab" and params[10] is None
     assert params[5] == sp.DEFAULT_COLOR  # no colour given
-    assert json.loads(params[10])["size_m"] == 2.0
+    assert json.loads(params[11])["size_m"] == 2.0
 
 
 @pytest.mark.parametrize("name,sql,error", [
@@ -463,7 +464,7 @@ def test_save_with_extrude_and_a_featureset_with_height():
     out = sp.save_item(UID, "block", "SELECT ST_Extent(envelope) AS geom FROM feature", extrude_m=10,
                        qdb=qdb, wdb=wdb)
     assert out["class"] == "Solid3D" and out["type"] == "POLYHEDRALSURFACE Z"
-    assert wdb.calls[-1][1][7] == "changed"  # the extruded geometry is stored
+    assert wdb.calls[-1][1][8] == "changed"  # the extruded geometry is stored
     qdb = FakeDb({"LIMIT 1": [{"objectid": "B1"}], "array_agg(DISTINCT": [{"n": 1, "ids": ["B1"]}]})
     out = sp.save_item(UID, "s", "SELECT 'B1' AS objectid", height_m=5, qdb=qdb, wdb=FakeDb())
     assert "no geometry of its own" in out["error"]
@@ -591,3 +592,131 @@ def test_list_mode_reaches_the_prompt_and_the_backend(monkeypatch):
     list(chat_runtime.stream_chat_turn(settings, [], lambda sql: ""))
     assert seen["full_lists"] is False
     assert chat_runtime.ChatTurnSettings(provider="openai", model="m").full_lists is True
+
+
+# ── Save tool: alpha on save, multi classes, unknown arguments (2026-11-20) ────
+
+def _featureset_dbs():
+    qdb = FakeDb({"LIMIT 1": [{"objectid": "B1"}], "array_agg(DISTINCT": [{"n": 1, "ids": ["B1"]}]})
+    return qdb, FakeDb({"count(*) AS n": [{"n": 0}]})
+
+
+@pytest.mark.parametrize("given,stored", [(0.7, 0.7), ("0.7", 0.7), ("70%", 0.7), (70, 0.7), (None, 0.8)])
+def test_save_stores_the_opacity(given, stored):
+    """30 % transparency (alpha 0.7) used to be dropped: the item kept 0.8."""
+    qdb, wdb = _featureset_dbs()
+    out = sp.save_item(UID, "g", "SELECT 'B1' AS objectid", alpha=given, qdb=qdb, wdb=wdb)
+    assert out["ok"] and out["alpha"] == pytest.approx(stored)
+    assert wdb.calls[-1][1][6] == pytest.approx(stored)
+    assert "alpha = EXCLUDED.alpha" in wdb.calls[-1][0]  # saving again replaces it
+
+
+@pytest.mark.parametrize("bad", [150, -0.1, "half", True, 101])
+def test_save_refuses_an_impossible_opacity(bad):
+    qdb, wdb = _featureset_dbs()
+    out = sp.save_item(UID, "g", "SELECT 'B1' AS objectid", alpha=bad, qdb=qdb, wdb=wdb)
+    assert out["ok"] is False and "alpha" in out["error"]
+
+
+def test_run_tool_passes_alpha_to_save(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(sp, "save_item", lambda *a, **k: seen.update(k) or {"ok": True})
+    sp.run_tool("save_to_scratchpad", {"name": "a", "sql": "SELECT 1", "alpha": 0.7}, UID)
+    assert seen["alpha"] == 0.7
+    assert "alpha" in sp.TOOL_SCHEMAS["save_to_scratchpad"]["inputSchema"]["properties"]
+
+
+@pytest.mark.parametrize("requested,gtype,expected", [
+    ("Polygon2D", "MULTIPOLYGON", "MultiPolygon2D"),
+    ("Polygon3D", "MULTIPOLYGON", "MultiPolygon3D"),
+    ("LineString2D", "MULTILINESTRING", "MultiLineString2D"),
+    ("Polygon2D", "POLYGON", "Polygon2D"),
+])
+def test_a_single_class_on_a_multi_geometry_takes_the_multi_class(requested, gtype, expected):
+    """CG_OptimalAlphaShape always returns a MULTIPOLYGON: Polygon2D used to be refused."""
+    ndims = 3 if requested.endswith("3D") else 2
+    assert sp.classify(gtype, ndims, requested=requested) == expected
+
+
+def test_a_2d_class_on_a_solid_is_still_refused():
+    with pytest.raises(ValueError, match="does not fit"):
+        sp.classify("POLYHEDRALSURFACE", 3, requested="Polygon2D")
+
+
+def test_unknown_arguments_are_an_error_not_silently_dropped(monkeypatch):
+    called = []
+    monkeypatch.setattr(sp, "save_item", lambda *a, **k: called.append(k) or {"ok": True})
+    out = sp.run_tool("save_to_scratchpad", {"name": "a", "sql": "SELECT 1", "opacity": 0.7}, UID)
+    report = out["scratchpad"]
+    assert report["ok"] is False and "opacity" in report["error"] and "alpha" in report["error"]
+    assert not called  # nothing saved
+    # null values of unknown fields count as absent (some models send every optional field)
+    out = sp.run_tool("save_to_scratchpad", {"name": "a", "sql": "SELECT 1", "opacity": None}, UID)
+    assert called and out["scratchpad"]["ok"] is True
+    out = sp.run_tool("scratchpad_action", {"action": "hide", "names": ["a"], "colour": "red"}, UID)
+    assert out["scratchpad"]["ok"] is False and "colour" in out["scratchpad"]["error"]
+
+
+# ── Several items in one call: the item_name column (2026-11-20) ───────────────
+
+def _group_dbs(groups, labels=None):
+    """qdb answering the group list, the probe, a label and a featureset."""
+    replies = {"AS v,": groups,
+               "string_agg(DISTINCT q.label": [{"label": labels, "labels": 1 if labels else 0}],
+               "LIMIT 1": [{"objectid": "B1", "item_name": "x", "label": "y"}],
+               "array_agg(DISTINCT": [{"n": 2, "ids": ["B1", "B2"]}]}
+    return FakeDb(replies), FakeDb({"count(*) AS n": [{"n": 0}]})
+
+
+def test_item_name_column_makes_one_item_per_value():
+    qdb, wdb = _group_dbs([{"v": "A", "c": "#16a34a"}, {"v": "B", "c": "#dc2626"}, {"v": "C", "c": None}])
+    out = sp.save_item(UID, "energy", "SELECT f.objectid, p.val_string AS item_name, '#16a34a' AS color "
+                       "FROM feature f", color="#123456", qdb=qdb, wdb=wdb)
+    assert out["ok"] and out["saved"] == 3 and out["failed"] == 0
+    assert [i["name"] for i in out["items"]] == ["energy_A", "energy_B", "energy_C"]
+    # each item its own colour from the color column; a missing one falls back to the argument
+    assert [i["color"] for i in out["items"]] == ["#16a34a", "#dc2626", "#123456"]
+    upserts = [c for c in wdb.calls if "ON CONFLICT" in c[0]]
+    assert [u[1][1] for u in upserts] == ["energy_A", "energy_B", "energy_C"]
+    # the i-th group is selected by its rank, no data value goes into the SQL text
+    subs = [c[0] for c in qdb.calls if "item_group" in c[0]]
+    assert subs and all("'A'" not in q and "'B'" not in q for q in subs)
+
+
+def test_item_name_values_become_valid_names():
+    assert sp._group_item_name("street", "Röblingweg 3") == "street_Roeblingweg_3"
+    assert sp._group_item_name("energy", "energy_A") == "energy_A"  # already prefixed
+    with pytest.raises(ValueError):
+        sp._group_item_name("x", "!!!")
+
+
+def test_item_name_refuses_too_many_or_clashing_groups():
+    qdb, wdb = _group_dbs([{"v": str(i), "c": None} for i in range(sp.MAX_GROUPS + 1)])
+    out = sp.save_item(UID, "g", "SELECT objectid, x AS item_name FROM t", qdb=qdb, wdb=wdb)
+    assert out["ok"] is False and "more than" in out["error"]
+    qdb, wdb = _group_dbs([{"v": "a b", "c": None}, {"v": "a-b", "c": None}])
+    out = sp.save_item(UID, "g", "SELECT objectid, x AS item_name FROM t", qdb=qdb, wdb=wdb)
+    assert out["ok"] is False and "same item name" in out["error"]
+
+
+def test_label_column_sets_the_label_and_the_web_ui_reads_grouped_results():
+    qdb, wdb = _group_dbs([{"v": "1", "c": None}], labels="32.2 m")
+    out = sp.save_item(UID, "marker", "SELECT objectid, '1' AS item_name, '32.2 m' AS label FROM t",
+                       qdb=qdb, wdb=wdb)
+    assert out["items"][0]["label"] == "32.2 m"
+
+    import sys as _sys
+    _sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "production"))
+    from webui import llm_utils
+    raw = json.dumps({"scratchpad": {"ok": True, "name": "energy", "saved": 1, "failed": 1, "items": [
+        {"ok": True, "name": "energy_A", "kind": "featureset"},
+        {"ok": False, "name": "energy_B", "error": "boom"}]}})
+    focus = []
+    assert llm_utils.note_scratch_result(raw, focus) and focus == ["energy_A"]
+    shown = llm_utils.scratch_tool_result(raw)
+    assert shown["row_count"] == 2 and shown["error"] == "boom"
+
+
+def test_the_tool_description_offers_the_item_name_column():
+    spec = sp.TOOL_SCHEMAS["save_to_scratchpad"]
+    assert "SEVERAL ITEMS IN ONE CALL" in spec["description"] and "item_name" in spec["description"]
