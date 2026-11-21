@@ -18,7 +18,7 @@
 
     var ORIGIN = window.location.origin;
     var ID_PROPERTIES = ["objectid", "id", "GMLID", "gmlid"];
-    var T = { title: "My items", empty: "Nothing saved yet", hide: "Hide", show: "Show",
+    var T = { title: "Scratchpad items", empty: "Nothing saved yet", hide: "Hide", show: "Show",
               del: "Delete", go: "Fly to", objects: "objects", collapse: "Collapse list",
               expand: "Expand list", exportBtn: "Export", importBtn: "Import",
               exportTip: "Download all your items as a JSON file",

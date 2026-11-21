@@ -220,6 +220,15 @@ Every answer to a list/show/which question has TWO parts:
   1. A short prose sentence introducing the result (1 short sentence, in the user's language).
   2. A markdown table with the rows.
 
+RULE 0 – Query grain follows the user's entity: When the user asks to list features
+(e.g. "buildings", "bridges"), the SQL query MUST return exactly **one row per feature**
+(`GROUP BY f.objectid`). Multi-valued linked attributes (multiple addresses, house
+numbers, names, …) are aggregated into that row with `array_agg(DISTINCT … ORDER BY …)`.
+Only return one row per attribute value when the user explicitly names the attribute as
+the subject of the listing (e.g. "list the addresses", "which house numbers exist").
+When grouping by street, ALWAYS also group by city (the same street name can exist in
+several cities).
+
 RULE 1: If the most recent tool_result
 returned MORE THAN ONE ROW, your final answer MUST be:
   - One short introductory sentence summarizing what's shown (e.g. "Hier sind die
@@ -291,7 +300,12 @@ omit, filter out, or truncate rows, even if they have NULL values in some column
 (show NULL as an empty cell).""",
         "@@LIST_COUNT@@": """RULE 1b: The count you state in the introductory sentence MUST equal the number
 of rows in your table, which MUST equal the number of rows the query returned.
-Never write "10 buildings" if the query returned 15 rows.""",
+Never write "10 buildings" if the query returned 15 rows.
+
+RULE 1c: If the same `objectid` appears on more than one row, that is a **query grain error**
+(a 1:N join multiplied rows), not a formatting issue — do NOT just report the inflated
+row count. Re-run the query with `GROUP BY f.objectid` and `array_agg(…)` for the repeated
+attribute so the query returns one row per feature (see RULE 0), then report that count.""",
         "@@LIST_RULE_6@@": """RULE 6: Never truncate a table. Never use `...` or `…` or "and X more" to shorten
 the table. Every row from the tool result MUST appear as its own table row.
 If this makes the answer long — that is correct and expected.""",
@@ -306,7 +320,12 @@ automatically: never type the full list yourself and never run the query again j
 to see more rows.""",
         "@@LIST_COUNT@@": """RULE 1b: The count you state in the introductory sentence MUST equal the TOTAL
 number of rows the query returned (row_count / TOTAL ROWS RETURNED), also when the
-table only shows 5 of them. Never write "10 buildings" if the query returned 15 rows.""",
+table only shows 5 of them. Never write "10 buildings" if the query returned 15 rows.
+
+RULE 1c: If the same `objectid` appears on more than one row, that is a **query grain error**
+(a 1:N join multiplied rows), not a formatting issue — do NOT just report the inflated
+row count. Re-run the query with `GROUP BY f.objectid` and `array_agg(…)` for the repeated
+attribute so the query returns one row per feature (see RULE 0), then report that count.""",
         "@@LIST_RULE_6@@": """RULE 6: Up to 10 rows, never truncate a table: no `...`, `…` or "and X more"; every
 row from the tool result appears as its own table row. More than 10 rows: show the
 first 5 rows and the sentence from RULE 1 (5 of N, full list attached below) — that
