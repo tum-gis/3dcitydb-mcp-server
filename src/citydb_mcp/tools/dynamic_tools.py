@@ -2062,12 +2062,15 @@ _INTERIOR_CLASSNAMES = {           # Classes that imply LoD4/interior structure
 }
 
 
-def get_examples(available_objectclass_ids: list[int], classnames: set[str] | None = None) -> ExamplesLibrary:
+def get_examples(available_objectclass_ids: list[int], classnames: set[str] | None = None,
+                 addresses_present: bool = True) -> ExamplesLibrary:
     """
     Returns canonical query pattern templates filtered to this dataset.
     Patterns 0–6 use generic <PLACEHOLDER> IDs and are always included.
     Pattern 7 (transportation) is only included when transportation classes exist.
     Pattern 8 (containment) is only included when interior/room classes exist.
+    Pattern 9 (one row per feature / aggregate addresses) is only included when the
+    dataset has addresses (addresses_present).
     Maps to UML: ExamplesLibrary
     """
     patterns = {
@@ -2183,7 +2186,26 @@ WHERE inner_f.objectclass_id = <INNER_CLASS_ID>
   AND inner_g.geometry IS NOT NULL
   AND outer_g.geometry IS NOT NULL
   AND (outer_g.geometry_properties->>'type')::int IN (9, 10, 11)  -- container must be Solid
-ORDER BY outer_f.objectid, inner_f.objectid;"""
+ORDER BY outer_f.objectid, inner_f.objectid;""",
+
+        "9_one_row_per_feature":
+"""-- One row per feature, multi-valued linked attributes aggregated.
+-- Use this when the user asks to LIST features that have a multi-valued attribute
+-- (e.g. "show the buildings on street X"): a feature can carry 0..N addresses, so a
+-- plain 1:N join would emit one row per address and double-count features.
+-- GROUP BY the feature's objectid and aggregate the repeated value(s); when grouping
+-- by street, ALSO group by city (the same street name can exist in several cities).
+SELECT f.objectid,
+       a.street,
+       a.city,
+       array_agg(DISTINCT a.house_number ORDER BY a.house_number) AS house_numbers
+FROM feature f
+JOIN property p ON p.feature_id = f.id AND p.name = 'address'
+JOIN address a  ON a.id = p.val_address_id
+WHERE f.objectclass_id = <ID>
+  AND a.street ILIKE '%<street>%'
+GROUP BY f.objectid, a.street, a.city
+ORDER BY a.street, a.city, MIN(a.house_number);"""
 
     }
 
@@ -2196,6 +2218,11 @@ ORDER BY outer_f.objectid, inner_f.objectid;"""
     # Pattern 8: spatial containment — only relevant when interior/room classes exist.
     if classnames is not None and not classnames.intersection(_INTERIOR_CLASSNAMES):
         patterns.pop("8_containment", None)
+
+    # Pattern 9: one row per feature / aggregate addresses — only relevant when the
+    # dataset actually has postal addresses.
+    if not addresses_present:
+        patterns.pop("9_one_row_per_feature", None)
 
     all_queries = list(patterns.values())
 
@@ -2803,8 +2830,10 @@ FROM feature f
 WHERE f.objectclass_id = {oc_id};""")
 
     examples.append(f"""\
--- {func_label.capitalize()} {classname}s in {top_street} (objectid for map highlighting)
-SELECT f.objectid, a.street, a.house_number
+-- {func_label.capitalize()} {classname}s in {top_street} (one row per feature;
+-- multi-valued addresses aggregated, grouped by street AND city)
+SELECT f.objectid, a.street, a.city,
+       array_agg(DISTINCT a.house_number ORDER BY a.house_number) AS house_numbers
 FROM feature f
 JOIN property p_func ON p_func.feature_id = f.id AND p_func.name = 'function'
 JOIN property p_addr ON p_addr.feature_id = f.id AND p_addr.name = 'address'
@@ -2812,7 +2841,8 @@ JOIN address a ON a.id = p_addr.val_address_id
 WHERE f.objectclass_id = {oc_id}
   AND p_func.val_string = '{func_code}'
   AND a.street ILIKE '%{top_street}%'
-ORDER BY a.house_number;""")
+GROUP BY f.objectid, a.street, a.city
+ORDER BY a.street, a.city, MIN(a.house_number);""")
 
     examples.append(f"""\
 -- 5 tallest {classname}s by height

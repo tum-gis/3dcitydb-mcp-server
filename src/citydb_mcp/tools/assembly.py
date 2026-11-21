@@ -281,7 +281,11 @@ def _assemble_prompt_uncached(
 
     available_ids = [oc.id for oc in catalog.object_classes]
     available_classnames = {oc.classname for oc in catalog.object_classes}
-    examples = _run(get_examples, available_ids, classnames=available_classnames) if include_query_agent_extras else None
+    # Pattern 9 (one row per feature / aggregate addresses) is only relevant when the
+    # dataset actually has postal addresses.
+    addresses_present = bool(vocab.street_count or vocab.city_count)
+    examples = _run(get_examples, available_ids, classnames=available_classnames,
+                    addresses_present=addresses_present) if include_query_agent_extras else None
 
     # Concrete synthesized examples using real DB values
     synth_examples = synthesize_examples(db, catalog, static_cl, vocab)
@@ -718,9 +722,11 @@ _TABLE_DESCRIPTIONS = {
     ),
     "address": (
         "Postal addresses linked to features via `property.val_address_id`. "
+        "A feature may have 0..N addresses; count distinct feature ids, not address rows, "
+        "when counting buildings or other features. "
         "Use `ILIKE '%street%'` on the `street` column for fuzzy name matching. "
         "`multi_point` holds one or more 3D points marking where the address is located on/in "
-        "the associated building (a `GM_MultiPoint`, per the CityGML `Address` type — CityGML "
+        "the associated feature (a `GM_MultiPoint`, per the CityGML `Address` type — CityGML "
         "3.0 Core §34)."
     ),
     "codelist": (
@@ -794,6 +800,17 @@ def _render_address_vocabulary(vocab, compact: bool = False) -> str:
             "name can occur in more than one city — when filtering or grouping by street name "
             "you MUST also filter/join on `city` (e.g. `AND a.city = '<city>'`) to avoid mixing "
             "buildings from different cities."
+        )
+
+    # Only emit the cardinality caveat when this dataset actually has
+    # addresses, so a schema without postal data stays noise-free.
+    if vocab.street_count > 0 or vocab.city_count > 0:
+        lines.append(
+            "⚠️ **Address ↔ feature cardinality:** a feature (Building, or other CityGML feature "
+            "types) may have 0..N addresses, linked through `property.val_address_id`. So count "
+            "**distinct feature ids** (`COUNT(DISTINCT f.id)` via feature → property → address), "
+            "not address rows, when counting buildings or other features. Only count `address` rows "
+            "when the user explicitly asks for the number of addresses."
         )
 
     return "\n".join(lines)
@@ -1506,6 +1523,7 @@ def _render_examples(examples: ExamplesLibrary) -> str:
         "6_cte_arithmetic":  "Pattern 6 — CTE arithmetic (subtract / compare two aggregations)",
         "7_intersection_surface": "Pattern 7 — Intersection/Section surface area (confirmed 2-hop)",
         "8_containment":          "Pattern 8 — Spatial containment (X inside Y) — fallback when no explicit relationship exists",
+        "9_one_row_per_feature":  "Pattern 9 — One row per feature (aggregate multi-valued addresses, group by street AND city)",
     }
 
     if examples.examples_by_pattern:

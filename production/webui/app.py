@@ -1465,7 +1465,7 @@ def on_provider_change(provider: str, thinking: str) -> tuple:
     thinking_choices = ["off", "low", "medium", "high"] + (
         ["max"] if provider == "openai" else []
     )
-    thinking_value = thinking if thinking in thinking_choices else "off"
+    thinking_value = thinking if thinking in thinking_choices else "medium"
     return (
         gr.update(choices=models, value=default, info=info),
         gr.update(visible=is_ollama or openai_ollama),
@@ -1949,10 +1949,11 @@ _PRINT_CSS = """
     max-width: 100% !important;
   }
 
-  /* Hide all UI chrome: header, settings sidebar, tabs, trace,
+  /* Hide all UI chrome: header, settings panel, tabs, trace,
      Cesium viewer, input row, per-message buttons, footer. */
   .header-bar,
-  #settings-sidebar,
+  #top-row > .column:first-of-type,
+  #top-row > .splitter,
   #chat-row > .column:nth-of-type(2),
   #chat-row > .splitter,
   .chat-input-row,
@@ -2178,7 +2179,7 @@ async (_win, _event_data) => {
   window.__citydbSplitsInit = true;
 
   var SPECS = [
-    // The settings are a gr.Sidebar (own toggle), so only the chat row splits.
+    { id: "top-row",  storage: "citydb.split.top",  minLeft: 60, minRight: 480 },
     { id: "chat-row", storage: "citydb.split.chat", minLeft: 320, minRight: 260 }
   ];
 
@@ -2200,6 +2201,9 @@ async (_win, _event_data) => {
       var cs = [];
       for (var i = 0; i < row.children.length; i++) {
         var el = row.children[i];
+        // A collapsed settings panel doesn't count, so the main area takes
+        // the whole row while it is hidden.
+        if (el.id === "settings-column" && el.classList.contains("settings-collapsed")) continue;
         if (el !== row.querySelector(".splitter") && isCol(el)) cs.push(el);
       }
       return { left: cs[0], right: cs[1] };
@@ -2226,6 +2230,12 @@ async (_win, _event_data) => {
     function position() {
       var c = getCols();
       if (c.left) handle.style.left = c.left.getBoundingClientRect().width + "px";
+      // While the settings panel is collapsed the splitter has nothing to
+      // split (only one column in the row) — hide it.
+      if (row.id === "top-row") {
+        var s = document.getElementById("settings-column");
+        handle.style.display = (s && s.classList.contains("settings-collapsed")) ? "none" : "";
+      }
     }
     function clamp(w) {
       var maxW = row.getBoundingClientRect().width - spec.minRight - 12;
@@ -2250,11 +2260,33 @@ async (_win, _event_data) => {
     try { saved = JSON.parse(localStorage.getItem(spec.storage) || "null"); } catch (e) {}
     if (saved && typeof saved.w === "number") apply(clamp(saved.w));
     else position();
+    // Exposed for window._toggleSettings: while the settings panel is
+    // collapsed the main column is the only one in the row, so the usual
+    // two-column apply() does not apply. __fillLeft lets it absorb the
+    // whole row; __restore brings back the previously saved split.
+    row.__fillLeft = function () {
+      var c = getCols();
+      if (!c.left) return;
+      c.left.style.flex = "1 1 0px";
+      c.left.style.width = "auto";
+      c.left.style.maxWidth = "none";
+    };
+    row.__restore = function () {
+      var s = null;
+      try { s = JSON.parse(localStorage.getItem(spec.storage) || "null"); } catch (e) {}
+      if (s && typeof s.w === "number") apply(clamp(s.w));
+      else position();
+    };
+
 
     handle.addEventListener("mousedown", function (e) {
       e.preventDefault();
       var c0 = getCols();
       if (!c0.left) return;
+      // Dragging the top-row splitter re-expands a collapsed settings panel.
+      if (spec.id === "top-row" && c0.left.classList.contains("settings-collapsed")) {
+        c0.left.classList.remove("settings-collapsed");
+      }
       var startX = e.clientX, startW = c0.left.getBoundingClientRect().width, lastW = startW;
       handle.classList.add("active");
       document.body.classList.add("splitting");
@@ -2299,6 +2331,89 @@ async (_win, _event_data) => {
     var pending = SPECS.some(function (s) { return !document.getElementById(s.id); });
     SPECS.forEach(setupRow);
     if (pending && ++tries < 100) setTimeout(poll, 200);
+  })();
+
+  // ── Settings panel collapse/expand ─────────────────
+  // #settings-column is an in-flow gr.Column inside #top-row. Collapsed
+  // state lives in localStorage (default: expanded). While collapsed the
+  // panel is hidden entirely and a "Settings" tab button appears in the
+  // menu line (before Chat) to bring it back; clicking it removes the
+  // tab again.
+  function settingsCol() { return document.getElementById("settings-column"); }
+  function settingsTabBtn() { return document.querySelector(".tab-container button.settings-tab-btn"); }
+  function visibleTabNav() {
+    var navs = document.querySelectorAll(".tab-container");
+    for (var j = 0; j < navs.length; j++)
+      if (navs[j].className.indexOf("visually-hidden") < 0) return navs[j];
+    return null;
+  }
+  function showSettingsTab() {
+    var nav = visibleTabNav();
+    if (!nav || settingsTabBtn()) return;
+    var b = document.createElement("button");
+    b.type = "button";
+    // Copy the tab buttons' class but drop "selected": the fake tab is never
+    // the active tab, and keeping it would draw the selection underline.
+    // Use a plain string split (no regex) so backslash escapes are not a
+    // factor — className tokens are single-space separated.
+    var cls = String(nav.children[0].className)
+      .split(" ")
+      .filter(function (t) { return t && t !== "selected"; })
+      .join(" ");
+    b.className = cls + " settings-tab-btn";
+    b.textContent = "Settings";
+    b.addEventListener("click", function () { window._toggleSettings(false); });
+    nav.insertBefore(b, nav.firstChild);
+  }
+  function hideSettingsTab() {
+    var b = settingsTabBtn();
+    if (b && b.parentNode) b.parentNode.removeChild(b);
+  }
+  window._toggleSettings = function (force) {
+    var c = settingsCol();
+    if (!c) return;
+    var collapsed = force === undefined ? !c.classList.contains("settings-collapsed") : force;
+    c.classList.toggle("settings-collapsed", collapsed);
+    try { localStorage.setItem("citydb.settings.collapsed", collapsed ? "1" : "0"); } catch (e) {}
+    if (collapsed) showSettingsTab(); else hideSettingsTab();
+    // While collapsed the main column is the only one in the row: let it
+    // absorb the full width and hide the splitter; on expand restore the
+    // previously saved split.
+    setTimeout(function () {
+      var r = document.getElementById("top-row");
+      if (!r || !r.__fillLeft) return;
+      var h = r.querySelector(":scope > .splitter");
+      if (collapsed) {
+        r.__fillLeft();
+        if (h) h.style.display = "none";
+      } else {
+        if (h) h.style.display = "";
+        r.__restore();
+      }
+    }, 60);
+  };
+  // Keep the fake tab in sync if Svelte re-renders the tab bar.
+  (function watchTabNav() {
+    if (!document.querySelector(".tab-wrapper")) { setTimeout(watchTabNav, 200); return; }
+    new MutationObserver(function () {
+      var c = settingsCol();
+      if (c && c.classList.contains("settings-collapsed")) showSettingsTab();
+    }).observe(document.querySelector(".tab-wrapper"), { childList: true, subtree: true });
+  })();
+  // Apply the persisted state once the panel has rendered (default: open).
+  (function applySettingsState() {
+    var c = settingsCol();
+    if (!c) { setTimeout(applySettingsState, 200); return; }
+    var collapsed = false;
+    try { collapsed = localStorage.getItem("citydb.settings.collapsed") === "1"; } catch (e) {}
+    if (collapsed) window._toggleSettings(true);
+  })();
+  // The collapse button is a plain DOM element inside the settings header
+  // (see gr.HTML in app.py), so bind its click here rather than via Gradio.
+  (function bindSettingsCollapse() {
+    var b = document.getElementById("settings-collapse");
+    if (!b) { setTimeout(bindSettingsCollapse, 200); return; }
+    b.addEventListener("click", function () { window._toggleSettings(true); });
   })();
 
   // ── Defer the Cesium viewer start until its iframe is actually visible ──
@@ -3476,26 +3591,43 @@ def build_ui() -> gr.Blocks:
         .log-nav-controls { display:flex; align-items:center; gap:4px; }
         .log-nav-btn { min-width:32px !important; max-width:32px !important; padding:0 !important; height:28px !important; font-size:0.9rem !important; }
 
-        /* ── Settings sidebar toggle ───────────────────────────────
-           Gradio draws it in the page colours, so it disappears on the dark
-           theme. Inverse colours make it the one thing that stands out at
-           the left edge: dark on the light theme, light on the dark one.
-           (Gradio's chevron is drawn with borders, hence border-color.) */
-        #settings-sidebar .toggle-button {
-            background: #1e293b !important; border-color: #1e293b !important;
-            box-shadow: 0 1px 6px rgba(0,0,0,.35) !important;
+        /* Settings panel (in-flow column, collapsible).
+           Styled as a boxed panel so it reads as a settings area even
+           without Gradio's sidebar chrome. While collapsed the whole
+           panel is hidden and a "Settings" tab (injected by _RESIZE_JS)
+           appears in the menu line to bring it back (state in
+           localStorage, default open). getCols() skips the panel while
+           collapsed so the main area takes the full row width. */
+        #settings-column {
+            background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px;
+            padding: 6px 12px 12px 12px; align-self: flex-start;
         }
-        #settings-sidebar .toggle-button .chevron-left { border-color: #f8fafc !important; }
-        .dark #settings-sidebar .toggle-button { background: #e2e8f0 !important; border-color: #e2e8f0 !important; }
-        .dark #settings-sidebar .toggle-button .chevron-left { border-color: #0f172a !important; }
-        #settings-sidebar .toggle-button:hover { filter: brightness(1.15); }
+        .dark #settings-column { background: #0f172a; border-color: #1e293b; }
+        #settings-column > .block:first-child { margin-top: 0 !important; }
+        /* "Settings" heading + collapse button on one line */
+        #settings-column .settings-header {
+            display: flex; align-items: center; gap: 10px;
+            margin: 0 0 8px 0;
+        }
+        #settings-column .settings-header h3 {
+            font-size: 1.15rem; font-weight: 600; line-height: 1.2;
+        }
+        .settings-collapse-btn {
+            border: 1px solid #cbd5e1; background: #f8fafc; color: #475569;
+            border-radius: 4px; font-size: 0.72rem; line-height: 1;
+            padding: 4px 10px; cursor: pointer;
+        }
+        .settings-collapse-btn:hover { background: #e2e8f0; border-color: #94a3b8; }
+        .dark .settings-collapse-btn { background: #1e293b; color: #cbd5e1; border-color: #334155; }
+        .dark .settings-collapse-btn:hover { background: #334155; }
+        #settings-column.settings-collapsed {
+            display: none !important;
+        }
 
         /* ── Resizable column sections ─────────────────────────── */
         .resizable-row { position: relative; }
         /* Under the chat input: the context bar takes the width, the
            "New conversation" button keeps its own height, centred. */
-        .chat-footer-row { align-items: center !important; flex-wrap: nowrap !important; }
-        .chat-footer-row > .block:first-child { flex: 1 1 auto !important; min-width: 0 !important; }
         .resizable-row > div { min-width: 0 !important; }
         .splitter {
             position: absolute; top: 0; width: 8px; height: 100%;
@@ -3560,106 +3692,130 @@ def build_ui() -> gr.Blocks:
 
         reload_tiles_state = gr.State(0) if ENABLE_VIZ else None
 
-        # ── Settings sidebar ──────────────────────────────────────────────────
-        # Closed by default so the chat and the 3D viewer get the whole width;
-        # Gradio's own toggle button at the left edge opens and closes it.
-        with gr.Sidebar(open=False, width=300, elem_id="settings-sidebar"):
-            gr.Markdown("### Settings")
-            provider_radio = gr.Radio(
-                choices=["anthropic", "openai", "ollama"],
-                value=initial_provider,
-                label="Provider / API",
-            )
-            model_dropdown = gr.Dropdown(
-                choices=initial_models,
-                value=initial_model,
-                label="Model",
+
+        with gr.Row(elem_classes="resizable-row", elem_id="top-row"):
+
+            # -- Settings panel (in-flow, collapsible) ---------------------
+            # Restored as a real gr.Column (instead of a fixed gr.Sidebar) so
+            # #top-row keeps its drag splitter and sits below the header; the
+            # panel can be collapsed into a "Settings" tab in the menu line (JS in _RESIZE_JS,
+            # state persisted in localStorage; default: expanded).
+            with gr.Column(scale=1, elem_id="settings-column"):
+                # Settings heading + collapse button share one line so the
+                # button doesn't waste a row of its own. Collapsing hides the
+                # panel and inserts a "Settings" tab into the menu line
+                # (JS in _RESIZE_JS; state in localStorage).
+                gr.HTML(
+                    '<div class="settings-header">'
+                    "<h3 style=\"margin:0;\">Settings</h3>"
+                    '<button id="settings-collapse" type="button" class="settings-collapse-btn">'
+                    "\u25b4 Collapse</button>"
+                    "</div>"
+                )
+                provider_radio = gr.Radio(
+                    choices=["anthropic", "openai", "ollama"],
+                    value=initial_provider,
+                    label="Provider / API",
+                )
+                model_dropdown = gr.Dropdown(
+                    choices=initial_models,
+                    value=initial_model,
+                    label="Model",
               elem_id="model-dropdown",
-                allow_custom_value=True,
-                info=initial_model_info,
-            )
-            dynamic_warn = gr.Markdown(
-                visible=initial_is_ollama,
-                value=initial_dynamic_warn,
-            )
-            refresh_ollama_btn = gr.Button(
+                    allow_custom_value=True,
+                    info=initial_model_info,
+                )
+                dynamic_warn = gr.Markdown(
+                    visible=initial_is_ollama,
+                    value=initial_dynamic_warn,
+                )
+                refresh_ollama_btn = gr.Button(
               "Refresh models", size="sm", visible=initial_is_ollama or initial_openai_ollama
-            )
-            with gr.Row(equal_height=True, elem_classes="temperature-row"):
-                set_temperature_checkbox = gr.Checkbox(
+                )
+                with gr.Row(equal_height=True, elem_classes="temperature-row"):
+                    set_temperature_checkbox = gr.Checkbox(
                     label="Set temperature",
                     value=False,
-                scale=0,
+                    scale=0,
                   min_width=150,
                   elem_id="set-temperature-checkbox",
-                )
-                temperature_slider = gr.Number(
+                    )
+                    temperature_slider = gr.Number(
                   minimum=0.0, maximum=1.0, step=0.05,
                   value=0.1, label="", show_label=False, interactive=False,
                   scale=0,
                   min_width=100,
-                )
-            thinking_dropdown = gr.Dropdown(
-                choices=["off", "low", "medium", "high"]
+                    )
+                thinking_dropdown = gr.Dropdown(
+                    choices=["off", "low", "medium", "high"]
                   + (["max"] if initial_provider == "openai" else []),
-                value="off",
-                label="Thinking",
+                    # Default to a moderate reasoning level for both providers.
+                    # "max"/"high" break tool-calling on small models (especially
+                    # via OpenAI-compatible endpoints with reasoning_effort), so
+                    # "medium" is the safe default.
+                    value="medium",
+                    label="Thinking",
               info="Reasoning level for thinking-capable models: Ollama uses "
-                "think; OpenAI-compatible endpoints use reasoning_effort. "
-                "off / low / medium / high"
-                + (" (incl. max)" if initial_provider == "openai" else "")
-                + ". Slower but more thorough.",
-            )
-            prompt_mode_radio = gr.Radio(
-                choices=["auto", "compact", "full"],
-                value="auto",
-                label="Prompt mode",
-                info="Auto picks compact for small local models. Override for complex queries.",
-            )
-            story_checkbox = gr.Checkbox(
-                label="Keep a distilled summary of how the answer was found",
-                value=True,
-                visible=initial_is_ollama or initial_provider == "openai",
-                info="After each turn that used the database, distills the successful path "
+                    "think; OpenAI-compatible endpoints use reasoning_effort. "
+                    "off / low / medium / high"
+                    + (" (incl. max)" if initial_provider == "openai" else "")
+                    + ". Slower but more thorough.",
+                )
+                prompt_mode_radio = gr.Radio(
+                    choices=["auto", "compact", "full"],
+                    value="auto",
+                    label="Prompt mode",
+                    info="Auto picks compact for small local models. Override for complex queries.",
+                )
+                story_checkbox = gr.Checkbox(
+                    label="Keep a distilled summary of how the answer was found",
+                    value=True,
+                    visible=initial_is_ollama or initial_provider == "openai",
+                    info="After each turn that used the database, distills the successful path "
                      "(purpose + working SQL + short result) into a compact story carried "
                      "into later turns, so follow-ups can adapt earlier queries. "
                      "Adds one extra blocking generation per tool-using turn.",
-            )
-            full_lists_checkbox = gr.Checkbox(
-                label="Show every row in result tables",
-                value=True,
-                info="Lists all rows (e.g. every building ID) in the answer's table. "
+                )
+                full_lists_checkbox = gr.Checkbox(
+                    label="Show every row in result tables",
+                    value=True,
+                    info="Lists all rows (e.g. every building ID) in the answer's table. "
                      "Unchecked: results with more than 10 rows show 5 example rows, which "
                      "answers faster. The full result is attached below the answer as "
                      "CSV and JSON either way.",
-            )
-            reasoning_replay_checkbox = gr.Checkbox(
-                label="Include all reasoning steps in context",
-                value=False,
-                visible=initial_is_ollama or initial_provider == "openai",
-                info="Feeds each turn's full reasoning trace back into context on later "
+                )
+                reasoning_replay_checkbox = gr.Checkbox(
+                    label="Include all reasoning steps in context",
+                    value=False,
+                    visible=initial_is_ollama or initial_provider == "openai",
+                    info="Feeds each turn's full reasoning trace back into context on later "
                      "turns. Increases token usage significantly.",
-            )
-            num_ctx_dropdown = gr.Dropdown(
-                choices=_CTX_OPTIONS,
-                value=_CTX_DEFAULT,
-                label="Context window (Ollama)",
-                visible=initial_is_ollama,
-                info="Tokens available to the model. 128K recommended for complex queries.",
-            )
-            gr.Markdown("---")
-            status_bar = gr.HTML(value=get_status_html(initial_provider, initial_model))
-            gr.Markdown(
-                "**API keys** are read from environment variables:  \n"
-                "`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,  \n"
-                "`OLLAMA_BASE_URL`  \n"
-                "Set `OPENAI_BASE_URL` to route the OpenAI provider to vLLM, "
-                "llama.cpp, or another OpenAI-compatible server."
-            )
+                )
+                num_ctx_dropdown = gr.Dropdown(
+                    choices=_CTX_OPTIONS,
+                    value=_CTX_DEFAULT,
+                    label="Context window (Ollama)",
+                    visible=initial_is_ollama,
+                    info="Tokens available to the model. 128K recommended for complex queries.",
+                )
+                reset_btn = gr.Button("New conversation", size="sm")
+                context_bar = gr.HTML(
+                    value="",
+                    elem_id="context-bar",
+                )
+                gr.Markdown("---")
+                status_bar = gr.HTML(value=get_status_html(initial_provider, initial_model))
+                gr.Markdown(
+                    "**API keys** are read from environment variables:  \n"
+                    "`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,  \n"
+                    "`OLLAMA_BASE_URL`  \n"
+                    "Set `OPENAI_BASE_URL` to route the OpenAI provider to vLLM, "
+                    "llama.cpp, or another OpenAI-compatible server."
+                )
 
-        with gr.Row(elem_id="top-row"):
 
             # ── Main area ─────────────────────────────────────────────────────
+
             with gr.Column(scale=4):
 
                 # Stale-prompt popup (top level — must NOT live inside a tab;
@@ -3740,12 +3896,6 @@ def build_ui() -> gr.Blocks:
                                     send_btn = gr.Button("➤", variant="primary", scale=0, min_width=48, elem_id="send-btn", interactive=False)
                                     stop_btn = gr.Button("⏹", variant="stop", scale=0, min_width=48, elem_id="stop-btn", visible=False)
                                     export_pdf_btn = gr.Button("🖨", variant="secondary", scale=0, min_width=48, elem_id="export-pdf-btn")
-                                # Always visible under the input (the settings sidebar is
-                                # closed by default): context usage and a fresh start.
-                                with gr.Row(equal_height=False, elem_classes="chat-footer-row"):
-                                    context_bar = gr.HTML(value="", elem_id="context-bar")
-                                    reset_btn = gr.Button("New conversation", size="sm", scale=0,
-                                                          min_width=150, elem_id="new-chat-btn")
 
                             with gr.Column(scale=1, min_width=360):
                                 with gr.Row():
@@ -3840,12 +3990,6 @@ def build_ui() -> gr.Blocks:
                                     send_btn = gr.Button("➤", variant="primary", scale=0, min_width=48, elem_id="send-btn", interactive=False)
                                     stop_btn = gr.Button("⏹", variant="stop", scale=0, min_width=48, elem_id="stop-btn", visible=False)
                                     export_pdf_btn = gr.Button("🖨", variant="secondary", scale=0, min_width=48, elem_id="export-pdf-btn")
-                                # Always visible under the input (the settings sidebar is
-                                # closed by default): context usage and a fresh start.
-                                with gr.Row(equal_height=False, elem_classes="chat-footer-row"):
-                                    context_bar = gr.HTML(value="", elem_id="context-bar")
-                                    reset_btn = gr.Button("New conversation", size="sm", scale=0,
-                                                          min_width=150, elem_id="new-chat-btn")
 
                             with gr.Column(scale=2, min_width=300):
                                 gr.HTML(
@@ -4102,6 +4246,11 @@ def build_ui() -> gr.Blocks:
             fn=None, inputs=[], outputs=[], queue=False,
             js="() => { if (window._exportPdf) window._exportPdf(); }",
         )
+
+        # Note: the settings collapse button is a plain DOM element rendered
+        # via gr.HTML (see the "settings-header" HTML block above), so its
+        # click handler is bound directly in JS (window._toggleSettings)
+        # rather than wired through Gradio here.
 
         provider_radio.change(
             fn=on_provider_change,
