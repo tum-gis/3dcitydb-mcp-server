@@ -229,20 +229,12 @@
 
     function hasZ(coords) { return coords.length && coords[0].length > 2; }
 
-    // Cross-section of a pipe (LineString3D), radius in metres.
-    function circle(r) {
-        var pts = [];
-        for (var i = 0; i < 16; i++) {
-            var a = (i / 16) * Math.PI * 2;
-            pts.push(new Cesium.Cartesian2(r * Math.cos(a), r * Math.sin(a)));
-        }
-        return pts;
-    }
-
     function addPart(it, part, color, fill) {
         var L = ensureLayer().entities;
         var t = part.type, c = part.coordinates;
-        var label = it.label || it.name;
+        // Scene labels: only a non-empty saved label is drawn; no fallback
+        // to the item name (the list still shows the name).
+        var label = it.label ? String(it.label).trim() : "";
         var cls = it["class"] || "";
         if (t === "Point" && cls === "Point3D") {
             // A true 3D sphere, radius from size_m (original design: Point3D).
@@ -264,32 +256,31 @@
                              disableDepthTestDistance: Number.POSITIVE_INFINITY } });
             return;
         }
-        if (t === "LineString" && /LineString3D$/.test(cls) && hasZ(c) && !it.clamp) {
-            // A pipe along the line, radius from size_m (original design: LineString3D).
-            L.add({ polylineVolume: { positions: positions(c, false), shape: circle(it.size_m || 0.5),
-                                      cornerType: Cesium.CornerType.ROUNDED, material: fill } });
-            return;
-        }
         if (t === "Point") {
             var clampP = it.clamp || c.length < 3;
-            L.add({
+            var pin = {
                 position: Cesium.Cartesian3.fromDegrees(c[0], c[1], clampP ? 0 : c[2]),
                 point: { pixelSize: 14, color: color, outlineColor: Cesium.Color.WHITE, outlineWidth: 2,
                          heightReference: clampP ? Cesium.HeightReference.CLAMP_TO_GROUND
                                                  : Cesium.HeightReference.NONE,
                          disableDepthTestDistance: Number.POSITIVE_INFINITY },
-                label: { text: label, font: "600 14px sans-serif", fillColor: Cesium.Color.WHITE,
+            };
+            if (label) pin.label = { text: label, font: "600 14px sans-serif", fillColor: Cesium.Color.WHITE,
                          outlineColor: Cesium.Color.BLACK, outlineWidth: 3,
                          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
                          pixelOffset: new Cesium.Cartesian2(0, -22),
                          heightReference: clampP ? Cesium.HeightReference.CLAMP_TO_GROUND
                                                  : Cesium.HeightReference.NONE,
-                         disableDepthTestDistance: Number.POSITIVE_INFINITY },
-            });
+                         disableDepthTestDistance: Number.POSITIVE_INFINITY };
+            L.add(pin);
             if (!clampP && cls === "3Dmarker") addStem(c, color);
         } else if (t === "LineString") {
+            // All lines are plain polylines with a constant pixel width: always
+            // visible, and safe for any shape (a pipe crashed the viewer on
+            // purely vertical segments). 3D lines get a thicker stroke.
             var clampL = it.clamp || !hasZ(c);
-            L.add({ polyline: { positions: positions(c, clampL), width: 4, material: color,
+            var w3 = /LineString3D$/.test(cls) && hasZ(c) && !it.clamp;
+            L.add({ polyline: { positions: positions(c, clampL), width: w3 ? 6 : 4, material: color,
                                 clampToGround: clampL } });
         } else if (t === "Polygon") {
             var ring = c[0];
@@ -325,8 +316,11 @@
     }
 
     function addLabel(it) {
-        // Markers carry their own label; other geometries get one above their box.
-        if (!it.bbox || /marker$/.test(it["class"] || "")) return;
+        // Markers carry their own label; other geometries get one above their
+        // box. Only a non-empty saved label is drawn in the scene; items
+        // without one show no label (the item list still shows the name).
+        var text = it.label ? String(it.label).trim() : "";
+        if (!text || !it.bbox || /marker$/.test(it["class"] || "")) return;
         var b = it.bbox;
         // Above the item: a sphere's top, else its box; items without heights
         // (2D, draped) relative to the terrain, which is not at height 0.
@@ -335,7 +329,7 @@
         var h = ground ? sphere + 3 : b[5] + (sphere ? sphere / 2 : 0) + 3;
         ensureLayer().entities.add({
             position: Cesium.Cartesian3.fromDegrees((b[0] + b[2]) / 2, (b[1] + b[3]) / 2, h),
-            label: { text: it.label || it.name, font: "600 14px sans-serif",
+            label: { text: text, font: "600 14px sans-serif",
                      fillColor: Cesium.Color.WHITE, outlineColor: Cesium.Color.BLACK, outlineWidth: 3,
                      style: Cesium.LabelStyle.FILL_AND_OUTLINE,
                      heightReference: ground ? Cesium.HeightReference.RELATIVE_TO_GROUND

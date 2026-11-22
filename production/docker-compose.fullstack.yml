@@ -66,10 +66,10 @@ services:
       - CITYDB_MCP_SSE=1
       - MCP_SSE_HOST=0.0.0.0
       - MCP_SSE_PORT=${MCP_SSE_PORT:-8811}
-      - GRADIO_PORT=${GRADIO_PORT:-7811}
+      - GRADIO_PORT=${GRADIO_PORT:-7860}
     ports:
       # Gradio UI; change the port with GRADIO_PORT in .env.
-      - "${GRADIO_PORT:-7811}:${GRADIO_PORT:-7811}"
+      - "${GRADIO_PORT:-7860}:${GRADIO_PORT:-7860}"
       - "127.0.0.1:7861:7861"
       # MCP server, published on this machine only. To reach it from other
       # machines on purpose, drop the "127.0.0.1:" prefix, keep the token set,

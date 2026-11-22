@@ -32,6 +32,15 @@ CITYDB_SCRATCHPAD=true
   (via `extra_prompt_blocks()` in `production/webui/llm_utils.py`), so the web UI and the benchmark CLI
   see the same prompt (and get the same tools, see [CLI and benchmark](#cli-and-benchmark)). The
   block is `SCRATCHPAD_TOOLS_INSTRUCTIONS`.
+- **When, and when not.** The block is in every system prompt, also for questions that have nothing
+  to do with the scratchpad, so it is short (about 860 characters) and says first WHEN to use the
+  tools (the user explicitly asks to create, draw, save, keep, mark or pin something, or to manage
+  items they saved) and when NOT: questions that find, list, count, compare or "show me" data are
+  answered with `run_query` only, because the viewer highlights a query's objects by itself; if
+  unsure, the model answers with `run_query` and does not save. How to save (columns, `item_name`,
+  classes, 2D/3D, boxes, heights, opacity) is in the tool descriptions. The ReAct backend shows the
+  model only a tool's main description and its argument names, not the argument descriptions, so
+  everything the model needs is in the main description.
 - The MCP server (`src/citydb_mcp/server.py`) lists the four scratchpad tools only when
   `CITYDB_SCRATCHPAD=true`; `_execute_tool` dispatches them to `scratchpad.run_tool`.
 - The 3D viewer (`ENABLE_VIZ=true`) is needed to **display** items. Without it, saving and querying
@@ -229,7 +238,7 @@ Table `<schema>.scratchpad` (default `citydb.scratchpad`), created by `provision
 | `geom` | geometry | set for `geometry` items only (CHECK), GiST index (`gist_geometry_ops_nd`) |
 | `objectids` | text[] | set for `featureset` items only (CHECK) |
 | `is_visible` | boolean | show / hide |
-| `data` | jsonb | `{"sql": <first 4000 chars>, "count": n}`, plus `size_m` when given (sphere / pipe radius) |
+| `data` | jsonb | `{"sql": <first 4000 chars>, "count": n}`, plus `size_m` when given (sphere radius) |
 | `created_at`, `updated_at` | timestamptz | |
 
 **Migration.** `provision()` also upgrades an existing table: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS
@@ -243,7 +252,7 @@ the view `my_scratchpad` with `class` appended as its last column.
 `FeatureSet`. `kind` (featureset / geometry) stays as well.
 
 `2Dmarker`, `3Dmarker`, `Point2D`, `LineString2D`, `MultiLineString2D`, `Polygon2D`, `MultiPolygon2D`,
-`Point3D`, `LineString3D`, `MultiLineString3D`, `Polygon3D`, `MultiPolygon3D`, `Surface3D`, `Solid3D`,
+`Point3D`, `LineString3D`, `MultiLineString3D`, `Polygon3D`, `MultiPolygon3D`, `CompositeSurface3D`, `Solid3D`,
 `MultiSolid3D`.
 
 `classify()` derives the class from the geometry unless one is requested:
@@ -251,7 +260,7 @@ the view `my_scratchpad` with `class` appended as its last column.
 - points: `2Dmarker` (no Z) or `3Dmarker` (with Z);
 - LineString / MultiLineString / Polygon / MultiPolygon: the `2D` or `3D` variant (`2D` if there is no Z
   or `clamp` is set);
-- POLYHEDRALSURFACE / TIN: `Solid3D` if closed, else `Surface3D`;
+- POLYHEDRALSURFACE / TIN: `Solid3D` if closed, else `CompositeSurface3D`;
 - a collection of closed polyhedral surfaces: `MultiSolid3D`; a collection of polygons:
   `MultiPolygon2D` / `MultiPolygon3D`; mixed collections are rejected.
 
@@ -270,7 +279,7 @@ drawing it flat. Now the **class and the stored geometry always agree** (`FLAT_C
 | Request | What `_shape()` does to the stored geometry | Class afterwards |
 |---|---|---|
 | `height_m: 20` | Lifts the item so its lowest point is 20 m above the ground (`ST_Force3DZ` + `ST_Translate`). A 3D item is moved to that height. Negative values (below ground) are allowed. | the 3D variant: `2Dmarker` -> `3Dmarker`, `Polygon2D` -> `Polygon3D`, ... |
-| `extrude_m: 25` | Lifts a 2D area/line onto the ground, then `CG_Extrude(g, 0, 0, 25)` (SFCGAL). A 3D area is extruded from its own height. | area -> `Solid3D` (closed), multi-area -> `MultiSolid3D`, line -> `Surface3D` (a wall). Points cannot be extruded. |
+| `extrude_m: 25` | Lifts a 2D area/line onto the ground, then `CG_Extrude(g, 0, 0, 25)` (SFCGAL). A 3D area is extruded from its own height. | area -> `Solid3D` (closed), multi-area -> `MultiSolid3D`, line -> `CompositeSurface3D` (a wall). Points cannot be extruded. |
 | `base_z: 350` | Like `height_m`, but measured from this absolute height (m, the data's height system, e.g. NHN) instead of the ground. Both together: `base_z + height_m`. | 3D variant |
 | a 3D `class` on a 2D item, e.g. `3Dmarker` | Lifts it onto the ground (height 0). A `Point3D` sphere is lifted by its radius, so it rests on the ground. | the requested class |
 | `class: Solid3D` on an area without `extrude_m` | Nothing; error "an area becomes a Solid3D with extrude_m". | unchanged |
@@ -284,7 +293,7 @@ it errs low (the lowest of the three), so a solid rather stands slightly in the 
 
 **Bounding boxes.** The model used `ST_MakeEnvelope` with six coordinates for a "3D bounding box";
 that function is 2D only. A 3D box is `ST_3DExtent(...)`, which returns a `box3d`. The tool's
-description and the prompt block now say so:
+description says so:
 
 ```sql
 -- 3D box around a saved set (closed box, Solid3D)
@@ -302,8 +311,8 @@ SELECT ST_Extent(f.envelope) AS geom FROM feature f WHERE ...
 | `geometry` POINT / MULTIPOINT (Z) | `ST_MakePoint`, GeoJSON | as is | `2Dmarker` / `3Dmarker` (`Point2D` / `Point3D` on request) |
 | `geometry` LINESTRING / MULTILINESTRING (Z) | `ST_MakeLine` | as is | `LineString2D/3D`, `MultiLineString2D/3D` |
 | `geometry` POLYGON / MULTIPOLYGON (Z) | `ST_Buffer`, `ST_MakeEnvelope` | as is | `Polygon2D/3D`, `MultiPolygon2D/3D` |
-| `geometry` POLYHEDRALSURFACE Z / TIN / TRIANGLE | 3DCityDB solids, `CG_Extrude`, `CG_3DConvexHull`, `CG_MakeSolid` | as is | `Solid3D` if closed, else `Surface3D` |
-| `geometry` GEOMETRYCOLLECTION of polyhedral surfaces | `CG_Extrude` of a multipolygon, `ST_Collect` of solids | as is | `MultiSolid3D` (closed) / `Surface3D` |
+| `geometry` POLYHEDRALSURFACE Z / TIN / TRIANGLE | 3DCityDB solids, `CG_Extrude`, `CG_3DConvexHull`, `CG_MakeSolid` | as is | `Solid3D` if closed, else `CompositeSurface3D` |
+| `geometry` GEOMETRYCOLLECTION of polyhedral surfaces | `CG_Extrude` of a multipolygon, `ST_Collect` of solids | as is | `MultiSolid3D` (closed) / `CompositeSurface3D` |
 | `box3d` | `ST_3DExtent`, `ST_3DMakeBox` | closed `POLYHEDRALSURFACE Z` (6 faces); a flat box becomes a `POLYGON Z` | `Solid3D` / `Polygon3D` |
 | `box2d` | `ST_Extent`, `ST_MakeBox2D` | `POLYGON` (gets the dataset SRID) | `Polygon2D` |
 | `geography` | `ST_Buffer(geography, ...)` | `geometry` in EPSG:4326, then transformed to the dataset CRS | as its geometry type |
@@ -411,7 +420,8 @@ viewer replaces its scratchpad layer with it.
   convention as tiles and the flood water). The drawing follows the `class`:
   markers (`2Dmarker`, `3Dmarker`): pin with a label; `Point3D`: ellipsoid sphere with radius `size_m` (centred at the point's height; a point without height, e.g. from GeoJSON, gets a sphere resting on the terrain)
   (default 1 m); `Point2D`: a plain dot on the ground; `LineString3D` / `MultiLineString3D` with Z:
-  a `polylineVolume` pipe with radius `size_m` (default 0.5 m); other lines: polylines. A floating
+  a plain `polyline` at its raw heights with a thicker constant pixel width (6 px, 4 px for
+  2D/clamped lines); other lines: plain polylines. A floating
   `3Dmarker` also gets a thin vertical line from the pin down to the terrain (`addStem`; the terrain
   height is sampled once with `sampleTerrainMostDetailed`, 0 without terrain). Polygons and
   solid faces: filled polygons with `alpha`. `clamp` or a missing Z drapes the shape on the
@@ -593,7 +603,7 @@ kept copy `window.__citydbScratchpad` also has no notice). Import reads the file
 - 2D/3D (`_shape`, with a fake that answers the shape query according to the expression):
   `height_m` turns a `2Dmarker` into a `3Dmarker` (lift to ground + height, the new EWKB stored),
   a 3D class alone lifts to the ground and a `Point3D` by its radius, a 2D class flattens, an area
-  needs `extrude_m` for `Solid3D`, a line becomes a `Surface3D` wall, points cannot be extruded,
+  needs `extrude_m` for `Solid3D`, a line becomes a `CompositeSurface3D` wall, points cannot be extruded,
   `base_z` skips the ground estimate, no ground -> "give base_z", featuresets refuse heights;
   `_number` parsing and the new tool properties.
 - `tests/test_chat_cli.py`: the CLI passes the four tools and its own user in `_ctx`, two consoles
@@ -628,14 +638,14 @@ Live checks done:
   without calling a tool and the items were still there. "Ja, lösche beide" -> `scratchpad_action`
   `delete` with `confirm=true`, both items deleted (both backends).
 - **Headless Chrome, 3D classes**: a `Point3D` sphere (radius 6 m), a `3Dmarker` floating at 345 m with
-  its line down to the ground, and a `LineString3D` pipe (radius 2 m) are all drawn at their heights,
+  its line down to the ground, and a `LineString3D` line are all drawn at their heights,
   with labels.
 - **2D -> 3D against PostGIS** (all through `run_tool`): GeoJSON point -> `height_m: 20` ->
   `3Dmarker`, `POINT Z` at ground (295.3 m) + 20; `class: 2Dmarker` -> `POINT` again; the
   `ST_MakeEnvelope` box of 3 buildings -> `class: Solid3D` refused ("extrude_m"), `Polygon3D`
   (`POLYGON Z` at 309.98 m), `extrude_m: "25 m"` -> `Solid3D` `POLYHEDRALSURFACE Z`; `ST_3DExtent` ->
   `Solid3D` directly (309.36 to 336.8 m); `ST_Extent` -> `Polygon2D`; a line with `extrude_m` -> wall
-  `Surface3D`; a `CIRCULARSTRING` -> linearised `LineString2D`; `base_z: 350` -> `POINT Z` at 350.
+  `CompositeSurface3D`; a `CIRCULARSTRING` -> linearised `LineString2D`; `base_z: 350` -> `POINT Z` at 350.
 - **CLI with qwen3.8:27b-q8_0 (ReAct)**, five questions in one run: 2D marker from GeoJSON ->
   "Gib dem treffpunkt eine Höhe von 20 m" (`update_scratchpad_item` `height_m: 20`) -> 2D bounding box
   of 3 buildings (`ST_Extent`) -> "Mach aus bbox_sel einen 3D-Körper, 25 m hoch" (`extrude_m: 25`) ->

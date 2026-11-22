@@ -234,7 +234,7 @@ def test_list_items_shapes_the_viewer_payload():
     (("LINESTRING", 3), "LineString3D"), (("LINESTRING", 3, (), False, True), "LineString2D"),
     (("MULTILINESTRING", 2), "MultiLineString2D"), (("POLYGON", 3), "Polygon3D"),
     (("MULTIPOLYGON", 2), "MultiPolygon2D"),
-    (("POLYHEDRALSURFACE", 3, (), True), "Solid3D"), (("POLYHEDRALSURFACE", 3, (), False), "Surface3D"),
+    (("POLYHEDRALSURFACE", 3, (), True), "Solid3D"), (("POLYHEDRALSURFACE", 3, (), False), "CompositeSurface3D"),
     (("GEOMETRYCOLLECTION", 3, ("POLYHEDRALSURFACE",), True), "MultiSolid3D"),
     (("GEOMETRYCOLLECTION", 3, ("POLYGON",), False), "MultiPolygon3D"),
 ])
@@ -442,7 +442,7 @@ def test_an_area_becomes_a_solid_with_extrude_m():
     shape_call = next((q, p) for q, p, _ in wdb.calls if "CG_Extrude" in q)
     assert shape_call[1]["extrude"] == 25.0 and shape_call[1]["lift_to"] == 310.0
     # a line becomes a wall (open surface)
-    assert sp.update_item(UID, "l", extrude_m=3, wdb=_item("LINESTRING", 2))["updated"]["class"] == "Surface3D"
+    assert sp.update_item(UID, "l", extrude_m=3, wdb=_item("LINESTRING", 2))["updated"]["class"] == "CompositeSurface3D"
 
 
 def test_height_errors_and_base_z():
@@ -720,3 +720,35 @@ def test_label_column_sets_the_label_and_the_web_ui_reads_grouped_results():
 def test_the_tool_description_offers_the_item_name_column():
     spec = sp.TOOL_SCHEMAS["save_to_scratchpad"]
     assert "SEVERAL ITEMS IN ONE CALL" in spec["description"] and "item_name" in spec["description"]
+
+
+# ── Prompt: when (and when not) to use the scratchpad (2026-11-20) ─────────────
+
+def test_the_prompt_block_says_when_and_when_not():
+    """Thomas: the scratchpad must not be confused with normal requests. The
+    block is in every system prompt, so it is short and starts with WHEN/NOT."""
+    import sys as _sys
+    _sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "production"))
+    from webui import llm_utils
+
+    block = llm_utils.SCRATCHPAD_TOOLS_INSTRUCTIONS
+    assert len(block) < 1200
+    assert "WHEN: only if the user explicitly asks" in block
+    assert "NOT for questions that find, list, count, compare or \"show me\" data" in block
+    assert "If unsure, answer with run_query and do not save" in block
+    # the old open trigger ("show/hide or delete something") and the example that
+    # mirrored an ordinary question (tall buildings) are gone
+    assert "delete something" not in block and "tall_buildings" not in block
+
+
+def test_tool_descriptions_carry_the_rule_and_the_how_to():
+    """The ReAct backend shows only the main description (not the parameter
+    descriptions), so the rule and the details must be in it."""
+    save = sp.TOOL_SCHEMAS["save_to_scratchpad"]["description"]
+    assert save.startswith("Save an item") and "ONLY when the user asks to create" in save
+    assert "never to answer a question" in save
+    for needed in ("item_name", "alpha = 1 - X/100", "Polygon2D", "Solid3D", "ST_3DExtent", "name:"):
+        assert needed in save
+    action = sp.TOOL_SCHEMAS["scratchpad_action"]["description"]
+    assert "SAVED before" in action and "Not for showing query results" in action
+    assert "my_scratchpad" in sp.TOOL_SCHEMAS["list_scratchpad"]["description"]

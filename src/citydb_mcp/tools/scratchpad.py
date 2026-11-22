@@ -43,7 +43,7 @@ GEOMETRY_CLASSES = (
     "2Dmarker", "3Dmarker",
     "Point2D", "LineString2D", "MultiLineString2D", "Polygon2D", "MultiPolygon2D",
     "Point3D", "LineString3D", "MultiLineString3D", "Polygon3D", "MultiPolygon3D",
-    "Surface3D", "Solid3D", "MultiSolid3D",
+    "CompositeSurface3D", "Solid3D", "MultiSolid3D",
 )
 CLASSES = GEOMETRY_CLASSES + ("FeatureSet",)
 # Which geometry types each class accepts (PostGIS GeometryType names).
@@ -55,7 +55,8 @@ _CLASS_TYPES = {
     "MultiLineString3D": {"MULTILINESTRING", "LINESTRING"},
     "Polygon2D": {"POLYGON"}, "Polygon3D": {"POLYGON"},
     "MultiPolygon2D": {"MULTIPOLYGON", "POLYGON"}, "MultiPolygon3D": {"MULTIPOLYGON", "POLYGON"},
-    "Surface3D": {"POLYHEDRALSURFACE", "TIN", "TRIANGLE", "POLYGON", "MULTIPOLYGON", "GEOMETRYCOLLECTION"},
+    "CompositeSurface3D": {"POLYHEDRALSURFACE", "TIN", "TRIANGLE", "POLYGON", "MULTIPOLYGON",
+                            "GEOMETRYCOLLECTION"},
     "Solid3D": {"POLYHEDRALSURFACE", "TIN"},
     "MultiSolid3D": {"GEOMETRYCOLLECTION", "POLYHEDRALSURFACE", "TIN"},
 }
@@ -99,9 +100,9 @@ def classify(gtype: str, ndims: int, member_types=(), all_closed=False, clamp=Fa
     if gtype == "MULTIPOLYGON":
         return "MultiPolygon" + d
     if gtype in ("POLYHEDRALSURFACE", "TIN"):
-        return "Solid3D" if all_closed else "Surface3D"
+        return "Solid3D" if all_closed else "CompositeSurface3D"
     if gtype == "GEOMETRYCOLLECTION" and members and members <= {"POLYHEDRALSURFACE", "TIN"}:
-        return "MultiSolid3D" if all_closed else "Surface3D"
+        return "MultiSolid3D" if all_closed else "CompositeSurface3D"
     if gtype == "GEOMETRYCOLLECTION" and members and members <= {"POLYGON", "MULTIPOLYGON"}:
         return "MultiPolygon" + d
     raise ValueError(f"cannot store a {gtype} with mixed parts ({', '.join(sorted(members))}); "
@@ -296,7 +297,7 @@ _CLASS_MIGRATION = [
     """UPDATE {schema}.scratchpad SET class = CASE
          WHEN kind = 'featureset' THEN 'FeatureSet'
          WHEN GeometryType(geom) IN ('POLYHEDRALSURFACE', 'TIN') THEN
-              CASE WHEN ST_IsClosed(geom) THEN 'Solid3D' ELSE 'Surface3D' END
+              CASE WHEN ST_IsClosed(geom) THEN 'Solid3D' ELSE 'CompositeSurface3D' END
          WHEN GeometryType(geom) = 'GEOMETRYCOLLECTION' THEN 'MultiSolid3D'
          ELSE (CASE GeometryType(geom)
                  WHEN 'POINT' THEN '' WHEN 'MULTIPOINT' THEN ''
@@ -306,6 +307,11 @@ _CLASS_MIGRATION = [
               || (CASE WHEN GeometryType(geom) IN ('POINT', 'MULTIPOINT') THEN 'marker' ELSE '' END)
        END
        WHERE class IS NULL""",
+    # Surface3D was renamed to CompositeSurface3D (a topologically connected
+    # set of surfaces): drop the old class constraint, re-point the rows, and
+    # provision() re-adds the constraint with the new name below.
+    "ALTER TABLE {schema}.scratchpad DROP CONSTRAINT IF EXISTS scratchpad_class_check",
+    "UPDATE {schema}.scratchpad SET class = 'CompositeSurface3D' WHERE class = 'Surface3D'",
 ]
 
 _INDEX_DDL = ("CREATE INDEX IF NOT EXISTS scratchpad_geom_idx "
@@ -492,8 +498,8 @@ def _shape(db: DatabaseConnection, ewkb: str, *, clamp=False, item_class=None, h
             raise ValueError("extrude_m must be positive")
         params["extrude"] = float(extrude_m)
         expr = f"CG_Extrude({expr}, 0, 0, %(extrude)s)"
-        if item_class not in _SOLID_CLASSES + ("Surface3D",):
-            item_class = None  # the extruded shape decides (Solid3D, MultiSolid3D, Surface3D)
+        if item_class not in _SOLID_CLASSES + ("CompositeSurface3D",):
+            item_class = None  # the extruded shape decides (Solid3D, MultiSolid3D, CompositeSurface3D)
     if expr == "g" and meta["ndims"] > 2:
         if classify(gtype, meta["ndims"], meta.get("members") or (), bool(meta.get("closed")),
                     clamp, item_class) in FLAT_CLASSES:
@@ -665,7 +671,7 @@ def save_item(user_id: str, name: str, sql: str, *, label: str | None = None,
             raise ValueError(f"scratchpad full ({MAX_ITEMS} items); delete some first")
         data = {"sql": inner[:4000], "count": count}
         if isinstance(size_m, (int, float)) and size_m > 0:
-            data["size_m"] = float(size_m)  # sphere radius / pipe radius in the viewer
+            data["size_m"] = float(size_m)  # sphere radius in the viewer
         wdb.execute(_pg_sql.SQL(_UPSERT_SQL).format(schema=schema),
                     (user_id, name, label, kind, cls, color, alpha, bool(clamp), ewkb, ewkb, ids,
                      json.dumps(data)))
@@ -977,6 +983,8 @@ def _check_item(it) -> dict:
         except ValueError:
             created = None
     cls = it.get("class")
+    if cls == "Surface3D":
+        cls = "CompositeSurface3D"  # old name in pre-rename export files
     if cls is not None and cls not in CLASSES:
         raise ValueError(f"unknown class {cls!r}")
     out = {"name": name, "label": label or None, "kind": kind, "class": cls, "color": color,
@@ -1203,21 +1211,32 @@ _HEIGHT_PROPS = {
 TOOL_SCHEMAS = {
     "save_to_scratchpad": {
         "description": (
-            "Save a result under a name in the user's personal scratchpad (shown in the 3D viewer "
-            "when there is one, and reusable in later SQL through the view my_scratchpad). Give "
-            "EITHER `sql`: a read-only SELECT returning an `objectid` column (saved as a set of "
-            "features, e.g. buildings) or a `geom` column (saved as one geometry: point, line, "
-            "polygon, solid; several rows are combined), OR `geojson`: a GeoJSON geometry, Feature "
-            "or FeatureCollection in WGS84 lon/lat (e.g. points the user pasted). Saving an "
-            "existing name replaces it. SEVERAL ITEMS IN ONE CALL: add an `item_name` column; "
-            "every distinct value becomes its own item <name>_<value>, with its own `label` and "
-            "(optional `color` column, #rrggbb) its own colour, e.g. one group per class, one "
-            "marker per building, one line per pair. "
-            "Returns whether it was saved, how many objects and the "
-            "stored geometry type (\"Z\" = with heights). A 3D bounding box is "
-            "`ST_3DExtent(...) AS geom` (stored as a closed box, Solid3D), a 2D one "
-            "`ST_Extent(...) AS geom` (ST_MakeEnvelope is 2D only). height_m / extrude_m make "
-            "a 2D geometry 3D."
+            "Save an item in the user's personal scratchpad (drawn in the 3D viewer, reusable in "
+            "SQL via the view my_scratchpad). ONLY when the user asks to create, draw, save, keep, "
+            "mark or pin something; never to answer a question (finding, listing, counting or "
+            "showing data is run_query). "
+            "Give EITHER `sql`: a read-only SELECT returning an `objectid` column (a set of "
+            "features, e.g. buildings, coloured in the viewer) or a `geom` column (one geometry: "
+            "point, line, polygon, solid; several rows are combined), OR `geojson`: a GeoJSON "
+            "geometry, Feature or FeatureCollection in WGS84 lon/lat (e.g. points the user pasted). "
+            "Optional SELECT columns: `label` (a computed label, e.g. a height or distance); "
+            "`item_name` for SEVERAL ITEMS IN ONE CALL: every distinct value becomes its own item "
+            "<name>_<value> with its own label and (`color` column, #rrggbb) colour, e.g. one "
+            "group per class, one marker per building, one line per pair. "
+            "name: letters, digits, _ (no spaces); pick a short one if the user gives none and "
+            "tell it; saving an existing name replaces it. alpha = opacity 0-1: "
+            "X % transparency -> alpha = 1 - X/100. class = 2D or 3D as the user says (2D: "
+            "Polygon2D, LineString2D, 2Dmarker; 3D: Polygon3D, Solid3D, LineString3D, 3Dmarker; "
+            "Point3D = sphere); the stored geometry always matches the class (\"Z\" = with "
+            "heights). Several 3D areas: if they form ONE topologically connected surface "
+            "(walls + roof, a mesh), save it as a single polyhedral surface (POLYHEDRALSURFACE/"
+            "TIN, e.g. ST_Collect of the touching facets or a CityGML Surface) -> class "
+            "CompositeSurface3D (Solid3D when closed); if the areas are DISJOINT flat 3D "
+            "polygons, save them as one MULTIPOLYGON Z -> class MultiPolygon3D. Flat 2D areas "
+            "are always MultiPolygon2D. Bounding box: 3D `ST_3DExtent(...) AS geom` (a closed "
+            "box, Solid3D), 2D `ST_Extent(...) AS geom` (ST_MakeEnvelope is 2D only). height_m "
+            "/ extrude_m make a 2D geometry 3D. Returns ok, name, count, stored type, colour "
+            "and opacity: tell the user the name and count."
         ),
         "inputSchema": {
             "type": "object",
@@ -1239,9 +1258,11 @@ TOOL_SCHEMAS = {
                 "class": {"type": "string", "enum": list(GEOMETRY_CLASSES), "description":
                           "How to draw a geometry (optional, derived from the geometry "
                           "otherwise): 2Dmarker/3Dmarker = pin with label, Point3D = sphere, "
-                          "LineString3D = pipe, Solid3D = closed solid, ..."},
+                          "LineString3D = 3D line, Solid3D = closed solid, CompositeSurface3D = "
+                          "one connected (open) 3D surface, MultiPolygon3D = disjoint flat 3D "
+                          "polygons, ..."},
                 "size_m": {"type": "number", "description":
-                           "Radius in metres for Point3D spheres and LineString3D pipes (optional)."},
+                           "Radius in metres for Point3D spheres (optional)."},
                 **_HEIGHT_PROPS,
             },
             "required": ["name"],
@@ -1249,9 +1270,10 @@ TOOL_SCHEMAS = {
     },
     "scratchpad_action": {
         "description": (
-            "Show, hide, delete or fly to saved scratchpad items by name. "
-            "action: show | hide | delete | goto. Deleting more than one item needs confirm=true, "
-            "which you may only set after the user has confirmed that list."
+            "Show, hide, delete or fly to items the user SAVED before, by name. Not for showing "
+            "query results (the viewer highlights those by itself). "
+            "action: show | hide | delete | goto. Deleting more than one item: first ask the user "
+            "to confirm the list, then call again with confirm=true."
         ),
         "inputSchema": {
             "type": "object",
@@ -1267,11 +1289,13 @@ TOOL_SCHEMAS = {
     "update_scratchpad_item": {
         "description": (
             "Change a saved item in place: label, color, alpha (opacity 0-1), class, size_m "
-            "(sphere/pipe radius), clamp, and its height. Only the given fields change. To give "
+            "(sphere radius), clamp, and its height. Only the given fields change. To give "
             "an item a height or make an area a solid use height_m / extrude_m: the stored "
             "geometry is converted and the class follows (2Dmarker -> 3Dmarker, Polygon2D -> "
-            "Polygon3D or Solid3D). A 3D class on a 2D item puts it on the ground with heights, "
-            "a 2D class removes the heights. For other changes save again under the same name."
+            "Polygon3D or Solid3D); base_z = absolute height instead of the ground. A 3D class on "
+            "a 2D item puts it on the ground with heights, a 2D class removes the heights; changing "
+            "only the class adds no height. X % transparency -> alpha = 1 - X/100. For other "
+            "changes save again under the same name."
         ),
         "inputSchema": {
             "type": "object",
@@ -1292,7 +1316,9 @@ TOOL_SCHEMAS = {
         "description": (
             "List the user's saved scratchpad items (name, label, kind, colour, visibility, "
             "number of objects or geometry type). For calculations query the view my_scratchpad "
-            "with run_query instead."
+            "with run_query instead, e.g. buildings within 100 m of a saved point: SELECT count(*) "
+            "FROM feature f, my_scratchpad p WHERE p.name = '<name>' AND f.objectclass_id = 901 "
+            "AND ST_DWithin(f.envelope, p.geom, 100)."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },

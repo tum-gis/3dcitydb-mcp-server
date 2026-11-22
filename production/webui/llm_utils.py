@@ -1186,47 +1186,21 @@ def scratchpad_tool_specs() -> list[dict]:
             for n, spec in scratchpad.TOOL_SCHEMAS.items()]
 
 
-SCRATCHPAD_TOOLS_INSTRUCTIONS = """[SCRATCHPAD] The user's personal saved items, shown in the 3D viewer
-- Tools: save_to_scratchpad (save a result under a name), update_scratchpad_item (change label,
-  color, opacity, class or size of a saved item in place), scratchpad_action (show, hide, delete,
-  goto), list_scratchpad (what is saved). Use them whenever the user asks to save, store, mark,
-  pin, remember, recolour, show/hide or delete something ("speichern", "merken", "markieren",
-  "umfärben", ...).
-- Deleting SEVERAL items: first ask the user to confirm the list; call scratchpad_action with
-  confirm=true only after a yes. Deleting one item needs no confirmation.
-- Names: letters, digits and underscore, no spaces (e.g. affected_2013). Pick a short name
-  yourself if the user gives none, and tell it.
-- save_to_scratchpad with `sql`: a SELECT returning objectid rows (a set of features, coloured in
-  the viewer) OR a geom column (a geometry in the data's CRS; several rows become one item).
-  With `geojson`: a GeoJSON geometry/Feature/FeatureCollection in lon/lat (e.g. points the user
-  pasted); it is converted to the data's CRS. Optional: label, color ('#rrggbb'), clamp,
-  class (how to draw a geometry; derived otherwise: 2Dmarker/3Dmarker pin, Point3D sphere,
-  LineString3D pipe, Polygon2D/3D, Solid3D, ...), size_m (sphere/pipe radius).
-  The tool runs the SQL itself and reports the saved count; report name and count.
-- 2D/3D: the class and the stored geometry always match ("POLYGON Z" = with heights). To give a
-  saved item a height ("add height", "make it 3D", "20 m hoch") call update_scratchpad_item with
-  height_m (metres above ground: 2Dmarker -> 3Dmarker, Polygon2D -> Polygon3D); to turn an area
-  into a solid ("Körper", "solid", "extrudieren") use extrude_m (Polygon2D -> Solid3D).
-  base_z = absolute height instead of the ground. Changing only the class does not add a height.
-- Bounding boxes: 3D box `ST_3DExtent(f.envelope) AS geom` (saved as a closed box, Solid3D);
-  2D `ST_Extent(f.envelope) AS geom`. ST_MakeEnvelope has no heights.
-- REUSE saved items in run_query through the view my_scratchpad(name, label, kind, class, color, geom,
-  objectids text[], is_visible, data, created_at). There is no other scratchpad table. Select
-  cardinality(objectids) and GeometryType(geom) rather than the raw columns when listing.
-
-Scratchpad examples:
-save_to_scratchpad {"name": "tall_buildings", "color": "#dc2626", "sql":
-  "SELECT f.objectid FROM feature f WHERE f.objectclass_id = 901 AND ST_ZMax(f.envelope) - ST_ZMin(f.envelope) > 30"}
-save_to_scratchpad {"name": "meeting_point", "label": "Meeting point",
-  "geojson": {"type": "Point", "coordinates": [13.4735, 48.5740]}}
-save_to_scratchpad {"name": "cluster_hull", "sql":
-  "SELECT CG_3DConvexHull(ST_Collect(f.envelope)) AS geom FROM feature f WHERE f.objectid IN ('<id1>', '<id2>')"}
-update_scratchpad_item {"name": "meeting_point", "height_m": 20}
-save_to_scratchpad {"name": "set_box", "sql": "SELECT ST_3DExtent(f.envelope) AS geom FROM feature f
-  JOIN my_scratchpad p ON f.objectid = ANY(p.objectids) WHERE p.name = 'tall_buildings'"}
-run_query: buildings within 100 m of a saved point
-  SELECT count(*) FROM feature f, my_scratchpad p WHERE p.name = 'meeting_point'
-    AND f.objectclass_id = 901 AND ST_DWithin(f.envelope, p.geom, 100)"""
+# In every system prompt while the scratchpad is on, also for questions that
+# have nothing to do with it: keep it short and say first WHEN (and when not)
+# to use the tools. How to save (columns, classes, boxes, heights) is in the
+# tool descriptions, which both backends show the model.
+SCRATCHPAD_TOOLS_INSTRUCTIONS = """[SCRATCHPAD] The user's personal saved items in the 3D viewer
+(save_to_scratchpad, update_scratchpad_item, scratchpad_action, list_scratchpad).
+- WHEN: only if the user explicitly asks to create, draw, save, keep, mark or pin something
+  as an item, or to change, show/hide, delete or list items they SAVED before.
+- NOT for questions that find, list, count, compare or "show me" data: answer those with
+  run_query only. The viewer highlights a query's objects by itself; nothing needs saving.
+  If unsure, answer with run_query and do not save.
+- HOW: one save call per request (an item_name column for several items); 2D or 3D as
+  the user says (class); "X % transparency" -> alpha = 1 - X/100.
+- REUSE saved items in run_query via the view my_scratchpad(name, label, class, color,
+  geom, objectids). Deleting several items: ask first, then confirm=true."""
 
 
 def _scratch_reports(report) -> list:
