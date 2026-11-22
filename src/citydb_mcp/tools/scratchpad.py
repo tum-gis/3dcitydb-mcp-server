@@ -671,7 +671,7 @@ def save_item(user_id: str, name: str, sql: str, *, label: str | None = None,
             raise ValueError(f"scratchpad full ({MAX_ITEMS} items); delete some first")
         data = {"sql": inner[:4000], "count": count}
         if isinstance(size_m, (int, float)) and size_m > 0:
-            data["size_m"] = float(size_m)  # sphere radius / pipe radius in the viewer
+            data["size_m"] = float(size_m)  # sphere radius in the viewer
         wdb.execute(_pg_sql.SQL(_UPSERT_SQL).format(schema=schema),
                     (user_id, name, label, kind, cls, color, alpha, bool(clamp), ewkb, ewkb, ids,
                      json.dumps(data)))
@@ -1258,11 +1258,11 @@ TOOL_SCHEMAS = {
                 "class": {"type": "string", "enum": list(GEOMETRY_CLASSES), "description":
                           "How to draw a geometry (optional, derived from the geometry "
                           "otherwise): 2Dmarker/3Dmarker = pin with label, Point3D = sphere, "
-                          "LineString3D = pipe, Solid3D = closed solid, CompositeSurface3D = "
+                          "LineString3D = 3D line, Solid3D = closed solid, CompositeSurface3D = "
                           "one connected (open) 3D surface, MultiPolygon3D = disjoint flat 3D "
                           "polygons, ..."},
                 "size_m": {"type": "number", "description":
-                           "Radius in metres for Point3D spheres and LineString3D pipes (optional)."},
+                           "Radius in metres for Point3D spheres (optional)."},
                 **_HEIGHT_PROPS,
             },
             "required": ["name"],
@@ -1289,7 +1289,7 @@ TOOL_SCHEMAS = {
     "update_scratchpad_item": {
         "description": (
             "Change a saved item in place: label, color, alpha (opacity 0-1), class, size_m "
-            "(sphere/pipe radius), clamp, and its height. Only the given fields change. To give "
+            "(sphere radius), clamp, and its height. Only the given fields change. To give "
             "an item a height or make an area a solid use height_m / extrude_m: the stored "
             "geometry is converted and the class follows (2Dmarker -> 3Dmarker, Polygon2D -> "
             "Polygon3D or Solid3D); base_z = absolute height instead of the ground. A 3D class on "

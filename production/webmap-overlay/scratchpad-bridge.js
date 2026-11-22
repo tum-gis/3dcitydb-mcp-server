@@ -229,16 +229,6 @@
 
     function hasZ(coords) { return coords.length && coords[0].length > 2; }
 
-    // Cross-section of a pipe (LineString3D), radius in metres.
-    function circle(r) {
-        var pts = [];
-        for (var i = 0; i < 16; i++) {
-            var a = (i / 16) * Math.PI * 2;
-            pts.push(new Cesium.Cartesian2(r * Math.cos(a), r * Math.sin(a)));
-        }
-        return pts;
-    }
-
     function addPart(it, part, color, fill) {
         var L = ensureLayer().entities;
         var t = part.type, c = part.coordinates;
@@ -266,12 +256,6 @@
                              disableDepthTestDistance: Number.POSITIVE_INFINITY } });
             return;
         }
-        if (t === "LineString" && /LineString3D$/.test(cls) && hasZ(c) && !it.clamp) {
-            // A pipe along the line, radius from size_m (original design: LineString3D).
-            L.add({ polylineVolume: { positions: positions(c, false), shape: circle(it.size_m || 0.5),
-                                      cornerType: Cesium.CornerType.ROUNDED, material: fill } });
-            return;
-        }
         if (t === "Point") {
             var clampP = it.clamp || c.length < 3;
             var pin = {
@@ -291,8 +275,12 @@
             L.add(pin);
             if (!clampP && cls === "3Dmarker") addStem(c, color);
         } else if (t === "LineString") {
+            // All lines are plain polylines with a constant pixel width: always
+            // visible, and safe for any shape (a pipe crashed the viewer on
+            // purely vertical segments). 3D lines get a thicker stroke.
             var clampL = it.clamp || !hasZ(c);
-            L.add({ polyline: { positions: positions(c, clampL), width: 4, material: color,
+            var w3 = /LineString3D$/.test(cls) && hasZ(c) && !it.clamp;
+            L.add({ polyline: { positions: positions(c, clampL), width: w3 ? 6 : 4, material: color,
                                 clampToGround: clampL } });
         } else if (t === "Polygon") {
             var ring = c[0];

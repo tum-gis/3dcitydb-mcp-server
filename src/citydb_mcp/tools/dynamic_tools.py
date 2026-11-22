@@ -2948,7 +2948,7 @@ def get_spatial_capabilities(db: DatabaseConnection) -> dict:
 # geometry, so the prompt only advertises what really works on this server.
 _SFCGAL_OPTIONAL = (
     ("SELECT CG_3DAlphaWrapping('MULTIPOINT Z (0 0 0, 1 0 0, 0 1 0, 0 0 1)'::geometry, 10) IS NOT NULL AS ok",
-     "CG_3DAlphaWrapping(geom, relative_alpha int, relative_offset int) - computes the 3D alpha wrapping of a geometry (always a 3D surface; NEVER for a 2D request, use CG_OptimalAlphaShape then); relative_alpha: 0-100 (default 10), relative_offset: 0-100 (default 10)",
+     "CG_3DAlphaWrapping(geom, relative_alpha int, relative_offset int) - computes the 3D alpha wrapping of a geometry (always creates a 3D polyhedral surface; NEVER use when wanting a 2D alpha hull, use CG_OptimalAlphaShape then); relative_alpha: 0-100 (default 10, smaller values create tighter wraps), relative_offset: 0-100 (default 10)",
      # Only the 3D wrapping is missing; gpt-oss read an earlier wording as "alpha
      # shapes are not available" and used the 3D convex hull for a 2D request.
      "CG_3DAlphaWrapping (the 3D alpha wrapping only) is NOT available on this server (PostGIS built "

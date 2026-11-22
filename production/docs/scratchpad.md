@@ -238,7 +238,7 @@ Table `<schema>.scratchpad` (default `citydb.scratchpad`), created by `provision
 | `geom` | geometry | set for `geometry` items only (CHECK), GiST index (`gist_geometry_ops_nd`) |
 | `objectids` | text[] | set for `featureset` items only (CHECK) |
 | `is_visible` | boolean | show / hide |
-| `data` | jsonb | `{"sql": <first 4000 chars>, "count": n}`, plus `size_m` when given (sphere / pipe radius) |
+| `data` | jsonb | `{"sql": <first 4000 chars>, "count": n}`, plus `size_m` when given (sphere radius) |
 | `created_at`, `updated_at` | timestamptz | |
 
 **Migration.** `provision()` also upgrades an existing table: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS
@@ -420,7 +420,8 @@ viewer replaces its scratchpad layer with it.
   convention as tiles and the flood water). The drawing follows the `class`:
   markers (`2Dmarker`, `3Dmarker`): pin with a label; `Point3D`: ellipsoid sphere with radius `size_m` (centred at the point's height; a point without height, e.g. from GeoJSON, gets a sphere resting on the terrain)
   (default 1 m); `Point2D`: a plain dot on the ground; `LineString3D` / `MultiLineString3D` with Z:
-  a `polylineVolume` pipe with radius `size_m` (default 0.5 m); other lines: polylines. A floating
+  a plain `polyline` at its raw heights with a thicker constant pixel width (6 px, 4 px for
+  2D/clamped lines); other lines: plain polylines. A floating
   `3Dmarker` also gets a thin vertical line from the pin down to the terrain (`addStem`; the terrain
   height is sampled once with `sampleTerrainMostDetailed`, 0 without terrain). Polygons and
   solid faces: filled polygons with `alpha`. `clamp` or a missing Z drapes the shape on the
@@ -637,7 +638,7 @@ Live checks done:
   without calling a tool and the items were still there. "Ja, lösche beide" -> `scratchpad_action`
   `delete` with `confirm=true`, both items deleted (both backends).
 - **Headless Chrome, 3D classes**: a `Point3D` sphere (radius 6 m), a `3Dmarker` floating at 345 m with
-  its line down to the ground, and a `LineString3D` pipe (radius 2 m) are all drawn at their heights,
+  its line down to the ground, and a `LineString3D` line are all drawn at their heights,
   with labels.
 - **2D -> 3D against PostGIS** (all through `run_tool`): GeoJSON point -> `height_m: 20` ->
   `3Dmarker`, `POINT Z` at ground (295.3 m) + 20; `class: 2Dmarker` -> `POINT` again; the
