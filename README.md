@@ -67,7 +67,7 @@ There are four ways to run the 3DCityDB MCP Server (Option 3b is a 3D-viewer var
 |---|---|---|---|---|
 | **Best for** | Claude Code / Claude Desktop power users | Existing 3DCityDB instances | Starting from a `.gml`/`.json`/`.ifc` file | 3D exploration & highlighting of query results |
 | **Requires** | Python 3.10+, running 3DCityDB | Docker, running 3DCityDB | Docker only | Docker only (same as Option 3) |
-| **Gradio UI** | No (uses your AI client directly) | Yes (`localhost:7811`) | Yes (`localhost:7811`) | Yes (`localhost:7811`) with embedded 3D viewer |
+| **Gradio UI** | No (uses your AI client directly) | Yes (`localhost:7860`) | Yes (`localhost:7860`) | Yes (`localhost:7860`) with embedded 3D viewer |
 | **CityGML/CityJSON/IFC import** | Manual | Manual | Via Gradio UI | Via Gradio UI |
 | **Database** | Your own | Your own | Bundled (PostgreSQL + PostGIS + SFCGAL) | Bundled (same as Option 3) |
 
@@ -387,7 +387,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 docker compose -f docker-compose.byod.yml up -d
 
 # 4. Open the UI
-# http://localhost:7811
+# http://localhost:7860
 ```
 
 The pre-built image (`ghcr.io/tum-gis/3dcitydb-mcp-agent:latest`) is pulled automatically from the GitHub Container Registry on first run.
@@ -514,7 +514,7 @@ cp /path/to/your/city.gml data/
 docker compose -f docker-compose.fullstack.yml up -d
 
 # 5. Open the UI
-# http://localhost:7811
+# http://localhost:7860
 ```
 
 Both images are pulled automatically from the GitHub Container Registry on first run. The first start takes ~60 seconds while PostgreSQL initialises.
@@ -713,7 +713,7 @@ All options are set via environment variables (`.env` file or Docker Compose `en
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GRADIO_PORT` | `7811` | Web UI port (Docker variants; host and container side) |
+| `GRADIO_PORT` | `7860` | Web UI port (Docker variants; host and container side) |
 | `MCP_SSE_PORT` | `8811` | Port of `3dcitydb-mcp-sse` (also `--port`) |
 | `CITYDB_MCP_SSE` | `0` | Docker: `1` also starts the MCP server over HTTP (on by default in the fullstack compose file) |
 | `CITYDB_MCP_AUTH_TOKEN` | *(unset)* | Bearer token required on `/mcp`, `/sse` and `/messages/`; generated and stored in `mcp_auth_token` when unset and not bound to loopback |
@@ -917,7 +917,7 @@ Per-user state (user identity, per-tab Stop, parallel chats) — see
                (PostgreSQL + PostGIS)
 
 
-      Browser ──► Gradio UI (port 7811)       [Docker variants only]
+      Browser ──► Gradio UI (port 7860)       [Docker variants only]
                                 │
           ┌─────────────────────┴────────────────────┐
           │                                          │

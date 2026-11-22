@@ -9,6 +9,8 @@ published GitHub release notes and the commit history.
 ## [Unreleased]
 
 ### Changed
+- Gradio web UI default port back to `7860` (was `7811` since 1.2.1;
+  `GRADIO_PORT` still overrides).
 - Scratchpad prompt: the `[SCRATCHPAD]` block in the system prompt is short
   (3,307 -> about 860 characters) and says first when to use the tools (the
   user explicitly asks to create, draw, save, keep, mark or pin something, or

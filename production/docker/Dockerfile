@@ -70,12 +70,12 @@ USER appuser
 
 # Gradio UI port (override with GRADIO_PORT; the compose files keep the
 # container and host side in sync).
-ENV GRADIO_PORT=7811
-EXPOSE 7811
+ENV GRADIO_PORT=7860
+EXPOSE 7860
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD python -c "import os,urllib.request,sys; \
-port=os.environ.get('GRADIO_PORT') or '7811'; \
+port=os.environ.get('GRADIO_PORT') or '7860'; \
 sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/' % port, timeout=5).status<500 else 1)" \
     || exit 1
 
