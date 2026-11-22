@@ -234,7 +234,7 @@ def test_list_items_shapes_the_viewer_payload():
     (("LINESTRING", 3), "LineString3D"), (("LINESTRING", 3, (), False, True), "LineString2D"),
     (("MULTILINESTRING", 2), "MultiLineString2D"), (("POLYGON", 3), "Polygon3D"),
     (("MULTIPOLYGON", 2), "MultiPolygon2D"),
-    (("POLYHEDRALSURFACE", 3, (), True), "Solid3D"), (("POLYHEDRALSURFACE", 3, (), False), "Surface3D"),
+    (("POLYHEDRALSURFACE", 3, (), True), "Solid3D"), (("POLYHEDRALSURFACE", 3, (), False), "CompositeSurface3D"),
     (("GEOMETRYCOLLECTION", 3, ("POLYHEDRALSURFACE",), True), "MultiSolid3D"),
     (("GEOMETRYCOLLECTION", 3, ("POLYGON",), False), "MultiPolygon3D"),
 ])
@@ -442,7 +442,7 @@ def test_an_area_becomes_a_solid_with_extrude_m():
     shape_call = next((q, p) for q, p, _ in wdb.calls if "CG_Extrude" in q)
     assert shape_call[1]["extrude"] == 25.0 and shape_call[1]["lift_to"] == 310.0
     # a line becomes a wall (open surface)
-    assert sp.update_item(UID, "l", extrude_m=3, wdb=_item("LINESTRING", 2))["updated"]["class"] == "Surface3D"
+    assert sp.update_item(UID, "l", extrude_m=3, wdb=_item("LINESTRING", 2))["updated"]["class"] == "CompositeSurface3D"
 
 
 def test_height_errors_and_base_z():

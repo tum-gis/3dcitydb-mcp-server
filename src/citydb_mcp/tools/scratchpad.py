@@ -43,7 +43,7 @@ GEOMETRY_CLASSES = (
     "2Dmarker", "3Dmarker",
     "Point2D", "LineString2D", "MultiLineString2D", "Polygon2D", "MultiPolygon2D",
     "Point3D", "LineString3D", "MultiLineString3D", "Polygon3D", "MultiPolygon3D",
-    "Surface3D", "Solid3D", "MultiSolid3D",
+    "CompositeSurface3D", "Solid3D", "MultiSolid3D",
 )
 CLASSES = GEOMETRY_CLASSES + ("FeatureSet",)
 # Which geometry types each class accepts (PostGIS GeometryType names).
@@ -55,7 +55,8 @@ _CLASS_TYPES = {
     "MultiLineString3D": {"MULTILINESTRING", "LINESTRING"},
     "Polygon2D": {"POLYGON"}, "Polygon3D": {"POLYGON"},
     "MultiPolygon2D": {"MULTIPOLYGON", "POLYGON"}, "MultiPolygon3D": {"MULTIPOLYGON", "POLYGON"},
-    "Surface3D": {"POLYHEDRALSURFACE", "TIN", "TRIANGLE", "POLYGON", "MULTIPOLYGON", "GEOMETRYCOLLECTION"},
+    "CompositeSurface3D": {"POLYHEDRALSURFACE", "TIN", "TRIANGLE", "POLYGON", "MULTIPOLYGON",
+                            "GEOMETRYCOLLECTION"},
     "Solid3D": {"POLYHEDRALSURFACE", "TIN"},
     "MultiSolid3D": {"GEOMETRYCOLLECTION", "POLYHEDRALSURFACE", "TIN"},
 }
@@ -99,9 +100,9 @@ def classify(gtype: str, ndims: int, member_types=(), all_closed=False, clamp=Fa
     if gtype == "MULTIPOLYGON":
         return "MultiPolygon" + d
     if gtype in ("POLYHEDRALSURFACE", "TIN"):
-        return "Solid3D" if all_closed else "Surface3D"
+        return "Solid3D" if all_closed else "CompositeSurface3D"
     if gtype == "GEOMETRYCOLLECTION" and members and members <= {"POLYHEDRALSURFACE", "TIN"}:
-        return "MultiSolid3D" if all_closed else "Surface3D"
+        return "MultiSolid3D" if all_closed else "CompositeSurface3D"
     if gtype == "GEOMETRYCOLLECTION" and members and members <= {"POLYGON", "MULTIPOLYGON"}:
         return "MultiPolygon" + d
     raise ValueError(f"cannot store a {gtype} with mixed parts ({', '.join(sorted(members))}); "
@@ -296,7 +297,7 @@ _CLASS_MIGRATION = [
     """UPDATE {schema}.scratchpad SET class = CASE
          WHEN kind = 'featureset' THEN 'FeatureSet'
          WHEN GeometryType(geom) IN ('POLYHEDRALSURFACE', 'TIN') THEN
-              CASE WHEN ST_IsClosed(geom) THEN 'Solid3D' ELSE 'Surface3D' END
+              CASE WHEN ST_IsClosed(geom) THEN 'Solid3D' ELSE 'CompositeSurface3D' END
          WHEN GeometryType(geom) = 'GEOMETRYCOLLECTION' THEN 'MultiSolid3D'
          ELSE (CASE GeometryType(geom)
                  WHEN 'POINT' THEN '' WHEN 'MULTIPOINT' THEN ''
@@ -306,6 +307,11 @@ _CLASS_MIGRATION = [
               || (CASE WHEN GeometryType(geom) IN ('POINT', 'MULTIPOINT') THEN 'marker' ELSE '' END)
        END
        WHERE class IS NULL""",
+    # Surface3D was renamed to CompositeSurface3D (a topologically connected
+    # set of surfaces): drop the old class constraint, re-point the rows, and
+    # provision() re-adds the constraint with the new name below.
+    "ALTER TABLE {schema}.scratchpad DROP CONSTRAINT IF EXISTS scratchpad_class_check",
+    "UPDATE {schema}.scratchpad SET class = 'CompositeSurface3D' WHERE class = 'Surface3D'",
 ]
 
 _INDEX_DDL = ("CREATE INDEX IF NOT EXISTS scratchpad_geom_idx "
@@ -492,8 +498,8 @@ def _shape(db: DatabaseConnection, ewkb: str, *, clamp=False, item_class=None, h
             raise ValueError("extrude_m must be positive")
         params["extrude"] = float(extrude_m)
         expr = f"CG_Extrude({expr}, 0, 0, %(extrude)s)"
-        if item_class not in _SOLID_CLASSES + ("Surface3D",):
-            item_class = None  # the extruded shape decides (Solid3D, MultiSolid3D, Surface3D)
+        if item_class not in _SOLID_CLASSES + ("CompositeSurface3D",):
+            item_class = None  # the extruded shape decides (Solid3D, MultiSolid3D, CompositeSurface3D)
     if expr == "g" and meta["ndims"] > 2:
         if classify(gtype, meta["ndims"], meta.get("members") or (), bool(meta.get("closed")),
                     clamp, item_class) in FLAT_CLASSES:
@@ -977,6 +983,8 @@ def _check_item(it) -> dict:
         except ValueError:
             created = None
     cls = it.get("class")
+    if cls == "Surface3D":
+        cls = "CompositeSurface3D"  # old name in pre-rename export files
     if cls is not None and cls not in CLASSES:
         raise ValueError(f"unknown class {cls!r}")
     out = {"name": name, "label": label or None, "kind": kind, "class": cls, "color": color,
@@ -1220,10 +1228,15 @@ TOOL_SCHEMAS = {
             "X % transparency -> alpha = 1 - X/100. class = 2D or 3D as the user says (2D: "
             "Polygon2D, LineString2D, 2Dmarker; 3D: Polygon3D, Solid3D, LineString3D, 3Dmarker; "
             "Point3D = sphere); the stored geometry always matches the class (\"Z\" = with "
-            "heights). Bounding box: 3D `ST_3DExtent(...) AS geom` (a closed box, Solid3D), 2D "
-            "`ST_Extent(...) AS geom` (ST_MakeEnvelope is 2D only). height_m / extrude_m make a 2D "
-            "geometry 3D. Returns ok, name, count, stored type, colour and opacity: tell the user "
-            "the name and count."
+            "heights). Several 3D areas: if they form ONE topologically connected surface "
+            "(walls + roof, a mesh), save it as a single polyhedral surface (POLYHEDRALSURFACE/"
+            "TIN, e.g. ST_Collect of the touching facets or a CityGML Surface) -> class "
+            "CompositeSurface3D (Solid3D when closed); if the areas are DISJOINT flat 3D "
+            "polygons, save them as one MULTIPOLYGON Z -> class MultiPolygon3D. Flat 2D areas "
+            "are always MultiPolygon2D. Bounding box: 3D `ST_3DExtent(...) AS geom` (a closed "
+            "box, Solid3D), 2D `ST_Extent(...) AS geom` (ST_MakeEnvelope is 2D only). height_m "
+            "/ extrude_m make a 2D geometry 3D. Returns ok, name, count, stored type, colour "
+            "and opacity: tell the user the name and count."
         ),
         "inputSchema": {
             "type": "object",
@@ -1245,7 +1258,9 @@ TOOL_SCHEMAS = {
                 "class": {"type": "string", "enum": list(GEOMETRY_CLASSES), "description":
                           "How to draw a geometry (optional, derived from the geometry "
                           "otherwise): 2Dmarker/3Dmarker = pin with label, Point3D = sphere, "
-                          "LineString3D = pipe, Solid3D = closed solid, ..."},
+                          "LineString3D = pipe, Solid3D = closed solid, CompositeSurface3D = "
+                          "one connected (open) 3D surface, MultiPolygon3D = disjoint flat 3D "
+                          "polygons, ..."},
                 "size_m": {"type": "number", "description":
                            "Radius in metres for Point3D spheres and LineString3D pipes (optional)."},
                 **_HEIGHT_PROPS,

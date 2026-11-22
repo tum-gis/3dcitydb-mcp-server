@@ -91,7 +91,7 @@ the row and which geometry column is authoritative.
 |-------|:---------:|-----------------|-----------|
 | `2Dmarker`, `3Dmarker` | pin | `geometry2D` (2D) **or** `geometry3D` (3D) | A pin/point marker **connected to the ground** (`2Dmarker`) or floating at a 3D coordinate (`3Dmarker`), with a **text label** (`COALESCE(label, name)`) |
 | `Point2D`, `LineString2D`, `MultiLineString2D`, `Polygon2D`, `MultiPolygon2D` | 2 | `geometry2D` | Rendered **draped over the terrain** (clamped to ground) |
-| `Point3D`, `LineString3D`, `MultiLineString3D`, `Polygon3D`, `MultiPolygon3D`, `Surface3D`, `Solid3D`, `MultiSolid3D` | 3 | `geometry3D` | Rendered as **floating 3D geometry** at its own height (not clamped) |
+| `Point3D`, `LineString3D`, `MultiLineString3D`, `Polygon3D`, `MultiPolygon3D`, `CompositeSurface3D`, `Solid3D`, `MultiSolid3D` | 3 | `geometry3D` | Rendered as **floating 3D geometry** at its own height (not clamped) |
 
 Conventions:
 
@@ -142,7 +142,7 @@ CREATE TABLE IF NOT EXISTS citydb.scratchpad (
             '2Dmarker','3Dmarker',
             'Point2D','LineString2D','MultiLineString2D','Polygon2D','MultiPolygon2D',
             'Point3D','LineString3D','MultiLineString3D',
-            'Polygon3D','MultiPolygon3D','Surface3D','Solid3D','MultiSolid3D'
+            'Polygon3D','MultiPolygon3D','CompositeSurface3D','Solid3D','MultiSolid3D'
         )),
 
     -- styling (per-item, viewer-consumed)
@@ -674,7 +674,7 @@ rendering — see [Rendering notes per class geometry](#rendering-notes-per-clas
 | `Polygon2D` / `MultiPolygon2D` | `polygon` | `material` fill + `outline` (`color`, `width` in px), `clampToGround: true` (drape) |
 | `Point3D` | `ellipsoid` — **true 3D sphere** | `radii: [r, r, r]` in **world units** (`r` from `data.size_m`, default e.g. 1 m) |
 | `LineString3D` / `MultiLineString3D` | `polylineVolume` — **pipe** | circular cross-section: `width` = `extrudedWidth` (meters) from `data.size_m`, high `corners`, `material` |
-| `Polygon3D` / `MultiPolygon3D` / `Surface3D` | `polygon` (per planar part) / triangle-mesh `Primitive` for triangulated surfaces | at native height (not clamped), `material` fill, `color`, `transparency` |
+| `Polygon3D` / `MultiPolygon3D` / `CompositeSurface3D` | `polygon` (per planar part) / triangle-mesh `Primitive` for triangulated surfaces | at native height (not clamped), `material` fill, `color`, `transparency` |
 | `Solid3D` / `MultiSolid3D` | triangle-mesh `Primitive` (no entity class for arbitrary solids) | at native height, `material` fill, `color`, `transparency` |
 
 ### Rendering notes per class geometry
@@ -704,7 +704,7 @@ source/API):
   messages as everything else.
 - **Unified rendering path.** Markers, 2D geometries, 3D points and 3D pipes
   are all **Entities** — only arbitrary `Solid3D`/`MultiSolid3D` meshes (and
-  possibly triangulated `Surface3D`s) need `Cesium.Primitive`s. The viewer
+  possibly triangulated `CompositeSurface3D`s) need `Cesium.Primitive`s. The viewer
   bridge therefore manages one entity collection plus one primitive collection
   for solids.
 - **Visibility sizing differs by dimension.** **2D** items use **screen-space**

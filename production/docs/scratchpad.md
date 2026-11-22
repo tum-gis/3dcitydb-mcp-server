@@ -252,7 +252,7 @@ the view `my_scratchpad` with `class` appended as its last column.
 `FeatureSet`. `kind` (featureset / geometry) stays as well.
 
 `2Dmarker`, `3Dmarker`, `Point2D`, `LineString2D`, `MultiLineString2D`, `Polygon2D`, `MultiPolygon2D`,
-`Point3D`, `LineString3D`, `MultiLineString3D`, `Polygon3D`, `MultiPolygon3D`, `Surface3D`, `Solid3D`,
+`Point3D`, `LineString3D`, `MultiLineString3D`, `Polygon3D`, `MultiPolygon3D`, `CompositeSurface3D`, `Solid3D`,
 `MultiSolid3D`.
 
 `classify()` derives the class from the geometry unless one is requested:
@@ -260,7 +260,7 @@ the view `my_scratchpad` with `class` appended as its last column.
 - points: `2Dmarker` (no Z) or `3Dmarker` (with Z);
 - LineString / MultiLineString / Polygon / MultiPolygon: the `2D` or `3D` variant (`2D` if there is no Z
   or `clamp` is set);
-- POLYHEDRALSURFACE / TIN: `Solid3D` if closed, else `Surface3D`;
+- POLYHEDRALSURFACE / TIN: `Solid3D` if closed, else `CompositeSurface3D`;
 - a collection of closed polyhedral surfaces: `MultiSolid3D`; a collection of polygons:
   `MultiPolygon2D` / `MultiPolygon3D`; mixed collections are rejected.
 
@@ -279,7 +279,7 @@ drawing it flat. Now the **class and the stored geometry always agree** (`FLAT_C
 | Request | What `_shape()` does to the stored geometry | Class afterwards |
 |---|---|---|
 | `height_m: 20` | Lifts the item so its lowest point is 20 m above the ground (`ST_Force3DZ` + `ST_Translate`). A 3D item is moved to that height. Negative values (below ground) are allowed. | the 3D variant: `2Dmarker` -> `3Dmarker`, `Polygon2D` -> `Polygon3D`, ... |
-| `extrude_m: 25` | Lifts a 2D area/line onto the ground, then `CG_Extrude(g, 0, 0, 25)` (SFCGAL). A 3D area is extruded from its own height. | area -> `Solid3D` (closed), multi-area -> `MultiSolid3D`, line -> `Surface3D` (a wall). Points cannot be extruded. |
+| `extrude_m: 25` | Lifts a 2D area/line onto the ground, then `CG_Extrude(g, 0, 0, 25)` (SFCGAL). A 3D area is extruded from its own height. | area -> `Solid3D` (closed), multi-area -> `MultiSolid3D`, line -> `CompositeSurface3D` (a wall). Points cannot be extruded. |
 | `base_z: 350` | Like `height_m`, but measured from this absolute height (m, the data's height system, e.g. NHN) instead of the ground. Both together: `base_z + height_m`. | 3D variant |
 | a 3D `class` on a 2D item, e.g. `3Dmarker` | Lifts it onto the ground (height 0). A `Point3D` sphere is lifted by its radius, so it rests on the ground. | the requested class |
 | `class: Solid3D` on an area without `extrude_m` | Nothing; error "an area becomes a Solid3D with extrude_m". | unchanged |
@@ -311,8 +311,8 @@ SELECT ST_Extent(f.envelope) AS geom FROM feature f WHERE ...
 | `geometry` POINT / MULTIPOINT (Z) | `ST_MakePoint`, GeoJSON | as is | `2Dmarker` / `3Dmarker` (`Point2D` / `Point3D` on request) |
 | `geometry` LINESTRING / MULTILINESTRING (Z) | `ST_MakeLine` | as is | `LineString2D/3D`, `MultiLineString2D/3D` |
 | `geometry` POLYGON / MULTIPOLYGON (Z) | `ST_Buffer`, `ST_MakeEnvelope` | as is | `Polygon2D/3D`, `MultiPolygon2D/3D` |
-| `geometry` POLYHEDRALSURFACE Z / TIN / TRIANGLE | 3DCityDB solids, `CG_Extrude`, `CG_3DConvexHull`, `CG_MakeSolid` | as is | `Solid3D` if closed, else `Surface3D` |
-| `geometry` GEOMETRYCOLLECTION of polyhedral surfaces | `CG_Extrude` of a multipolygon, `ST_Collect` of solids | as is | `MultiSolid3D` (closed) / `Surface3D` |
+| `geometry` POLYHEDRALSURFACE Z / TIN / TRIANGLE | 3DCityDB solids, `CG_Extrude`, `CG_3DConvexHull`, `CG_MakeSolid` | as is | `Solid3D` if closed, else `CompositeSurface3D` |
+| `geometry` GEOMETRYCOLLECTION of polyhedral surfaces | `CG_Extrude` of a multipolygon, `ST_Collect` of solids | as is | `MultiSolid3D` (closed) / `CompositeSurface3D` |
 | `box3d` | `ST_3DExtent`, `ST_3DMakeBox` | closed `POLYHEDRALSURFACE Z` (6 faces); a flat box becomes a `POLYGON Z` | `Solid3D` / `Polygon3D` |
 | `box2d` | `ST_Extent`, `ST_MakeBox2D` | `POLYGON` (gets the dataset SRID) | `Polygon2D` |
 | `geography` | `ST_Buffer(geography, ...)` | `geometry` in EPSG:4326, then transformed to the dataset CRS | as its geometry type |
@@ -602,7 +602,7 @@ kept copy `window.__citydbScratchpad` also has no notice). Import reads the file
 - 2D/3D (`_shape`, with a fake that answers the shape query according to the expression):
   `height_m` turns a `2Dmarker` into a `3Dmarker` (lift to ground + height, the new EWKB stored),
   a 3D class alone lifts to the ground and a `Point3D` by its radius, a 2D class flattens, an area
-  needs `extrude_m` for `Solid3D`, a line becomes a `Surface3D` wall, points cannot be extruded,
+  needs `extrude_m` for `Solid3D`, a line becomes a `CompositeSurface3D` wall, points cannot be extruded,
   `base_z` skips the ground estimate, no ground -> "give base_z", featuresets refuse heights;
   `_number` parsing and the new tool properties.
 - `tests/test_chat_cli.py`: the CLI passes the four tools and its own user in `_ctx`, two consoles
@@ -644,7 +644,7 @@ Live checks done:
   `ST_MakeEnvelope` box of 3 buildings -> `class: Solid3D` refused ("extrude_m"), `Polygon3D`
   (`POLYGON Z` at 309.98 m), `extrude_m: "25 m"` -> `Solid3D` `POLYHEDRALSURFACE Z`; `ST_3DExtent` ->
   `Solid3D` directly (309.36 to 336.8 m); `ST_Extent` -> `Polygon2D`; a line with `extrude_m` -> wall
-  `Surface3D`; a `CIRCULARSTRING` -> linearised `LineString2D`; `base_z: 350` -> `POINT Z` at 350.
+  `CompositeSurface3D`; a `CIRCULARSTRING` -> linearised `LineString2D`; `base_z: 350` -> `POINT Z` at 350.
 - **CLI with qwen3.8:27b-q8_0 (ReAct)**, five questions in one run: 2D marker from GeoJSON ->
   "Gib dem treffpunkt eine Höhe von 20 m" (`update_scratchpad_item` `height_m: 20`) -> 2D bounding box
   of 3 buildings (`ST_Extent`) -> "Mach aus bbox_sel einen 3D-Körper, 25 m hoch" (`extrude_m: 25`) ->
