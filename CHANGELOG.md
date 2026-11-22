@@ -6,11 +6,19 @@ Both components are versioned together. The format is loosely based on
 with 1.2.0; the 1.0.x and 1.1.0 entries below were reconstructed from the
 published GitHub release notes and the commit history.
 
-## [Unreleased]
+## [1.2.2]
 
 ### Changed
 - Gradio web UI default port back to `7860` (was `7811` since 1.2.1;
   `GRADIO_PORT` still overrides).
+- Scratchpad 3D lines are drawn as plain polylines instead of Cesium
+  `polylineVolume` pipes (the pipes crashed the viewer on purely vertical
+  segments); `size_m` no longer applies to lines.
+- Scratchpad class `Surface3D` renamed to `CompositeSurface3D`; the
+  `save_to_scratchpad` tool now distinguishes a connected 3D surface
+  (`CompositeSurface3D`) from disjoint flat 3D polygons (`MultiPolygon3D`).
+- Scene labels in the 3D viewer are drawn only for non-empty saved labels
+  (the item list still shows the name).
 - Scratchpad prompt: the `[SCRATCHPAD]` block in the system prompt is short
   (3,307 -> about 860 characters) and says first when to use the tools (the
   user explicitly asks to create, draw, save, keep, mark or pin something, or
@@ -19,6 +27,8 @@ published GitHub release notes and the commit history.
   (columns, classes, boxes, heights, opacity) moved into the tool
   descriptions, which also start with the rule; the example that saved "tall
   buildings" (an ordinary question) is gone.
+- Bumped the MCP server, ChatBot and PyPI library version from 1.2.1 to
+  1.2.2.
 
 ## [1.2.1]
 
