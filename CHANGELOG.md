@@ -11,14 +11,27 @@ published GitHub release notes and the commit history.
 ### Changed
 - Gradio web UI default port back to `7860` (was `7811` since 1.2.1;
   `GRADIO_PORT` still overrides).
+- Default thinking level is `medium` for both the Ollama and the OpenAI
+  provider (`high`/`max` break tool calling on small local models).
+- Web UI refinements: the Settings collapse button sits on the "Settings"
+  heading row (no wasted row), the "Scratchpad items" heading, the context
+  bar next to "New conversation", a settings-collapse tab in the menu line,
+  and an emoji rendering fix.
+- Query-grain prompt rules (stop double-counting features with multiple
+  addresses): RULE 0 asks for one row per feature on list questions
+  (`GROUP BY f.objectid`, `array_agg` for multi-valued attributes; grouping
+  by street also groups by city), RULE 1c treats a repeated objectid across
+  rows as a query-grain error, and Pattern 9 is included only when the
+  database actually contains addresses. The synthesized "buildings in
+  street" example is fixed (it used a 1:N join without `GROUP BY`).
 - Scratchpad 3D lines are drawn as plain polylines instead of Cesium
   `polylineVolume` pipes (the pipes crashed the viewer on purely vertical
   segments); `size_m` no longer applies to lines.
+- Scene labels in the 3D viewer are drawn only for non-empty saved labels
+  (the item list still shows the name).
 - Scratchpad class `Surface3D` renamed to `CompositeSurface3D`; the
   `save_to_scratchpad` tool now distinguishes a connected 3D surface
   (`CompositeSurface3D`) from disjoint flat 3D polygons (`MultiPolygon3D`).
-- Scene labels in the 3D viewer are drawn only for non-empty saved labels
-  (the item list still shows the name).
 - Scratchpad prompt: the `[SCRATCHPAD]` block in the system prompt is short
   (3,307 -> about 860 characters) and says first when to use the tools (the
   user explicitly asks to create, draw, save, keep, mark or pin something, or
@@ -27,6 +40,13 @@ published GitHub release notes and the commit history.
   (columns, classes, boxes, heights, opacity) moved into the tool
   descriptions, which also start with the rule; the example that saved "tall
   buildings" (an ordinary question) is gone.
+- Anti-hallucination rules for the chat: the `[SCRATCHPAD]` block gains a
+  REPORT rule (an item may be described as saved/changed/deleted only after
+  a scratchpad tool confirmed it in this turn), and the tool-use discipline
+  now covers all side-effect claims (saved, changed, deleted, shown/hidden,
+  queried) — a plan or a quoted tool schema is not a result.
+- Wording: the `CG_3DAlphaWrapping` prompt line now says it creates a 3D
+  polyhedral surface and that `relative_alpha` tightens the wrap.
 - Bumped the MCP server, ChatBot and PyPI library version from 1.2.1 to
   1.2.2.
 

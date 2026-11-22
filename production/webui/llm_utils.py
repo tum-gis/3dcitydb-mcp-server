@@ -185,6 +185,7 @@ the UI uses these to highlight objects on a map.
 - Property names live in a specific namespace_id — always use the namespace_id given in the schema for each property (schema properties are typically ns:8 or ns:10; only generic attributes are ns:3) — and when the question asks about a grouping entity (street, owner, usage), GROUP BY that entity alone, never by feature.objectid.
 - Some properties (e.g. height) are nested containers whose own val_* columns are NULL — if the schema marks a property as ⚠️ NESTED TYPE, you MUST join property→property via parent_id to a child row where name = 'value' and read val_double from the child, never from the parent.
 - If a `[VIEWER SELECTION]` system block is present, it lists features the user picked in the 3D view. Demonstratives in their question ("these", "the selected ones", "diese Gebäude", ...) refer to those features; filter on those objectids. The block is absent when nothing is selected — then never claim a selection exists.
+- Never claim you performed an action with side effects (saved, changed, deleted, showed or hid a scratchpad item, ran a query) unless the tool result of THIS turn confirms it. A plan, a quoted tool schema, or your own reasoning is not a result.
 
 **Ambiguous questions (mandatory):**
 Many everyday words map to more than one thing in this database. "Area" may be a stored \
@@ -1197,6 +1198,10 @@ SCRATCHPAD_TOOLS_INSTRUCTIONS = """[SCRATCHPAD] The user's personal saved items 
 - NOT for questions that find, list, count, compare or "show me" data: answer those with
   run_query only. The viewer highlights a query's objects by itself; nothing needs saving.
   If unsure, answer with run_query and do not save.
+- REPORT: say an item was saved, changed or deleted ONLY after a scratchpad tool
+  returned ok for it in THIS turn. If you did not call the tool, you saved nothing —
+  answer the question with run_query and, if saving seems wanted, offer to save
+  instead of claiming it.
 - HOW: one save call per request (an item_name column for several items); 2D or 3D as
   the user says (class); "X % transparency" -> alpha = 1 - X/100.
 - REUSE saved items in run_query via the view my_scratchpad(name, label, class, color,
