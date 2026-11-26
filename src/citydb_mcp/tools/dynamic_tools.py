@@ -2495,6 +2495,37 @@ WHERE f.objectclass_id = 610
     )
 
 
+def get_extra_schema_columns(db: DatabaseConnection, entries: list[str]) -> list[dict]:
+    """Every column of the tables, views and materialized views named by
+    ``entries`` (a schema, or ``schema.table``) that the connected role may
+    read, in table and column order, with its type (``geometry(MultiPolygon,25832)``,
+    ``text[]``) and the table and column comments. Table and column names come
+    quoted where SQL needs it (``poi."Schools View"``).
+
+    Only relations the role holds SELECT on, in schemas it holds USAGE on, are
+    listed, so a table closed to it stays out of the prompt. Partitions are
+    left out; their parent table stands for them.
+    """
+    schemas = [e for e in entries if "." not in e]
+    tables = [e for e in entries if "." in e]
+    return db.execute("""
+        SELECT format('%%I.%%I', n.nspname, cl.relname) AS table_ref,
+               quote_ident(a.attname) AS column_ref,
+               format_type(a.atttypid, a.atttypmod) AS col_type,
+               obj_description(cl.oid, 'pg_class') AS table_comment,
+               col_description(cl.oid, a.attnum) AS column_comment
+        FROM pg_class cl
+        JOIN pg_namespace n ON n.oid = cl.relnamespace
+        JOIN pg_attribute a ON a.attrelid = cl.oid AND a.attnum > 0 AND NOT a.attisdropped
+        WHERE (n.nspname = ANY(%s) OR n.nspname || '.' || cl.relname = ANY(%s))
+          AND cl.relkind IN ('r', 'p', 'v', 'm', 'f')
+          AND NOT cl.relispartition
+          AND has_schema_privilege(n.oid, 'USAGE')
+          AND has_table_privilege(cl.oid, 'SELECT')
+        ORDER BY n.nspname, cl.relname, a.attnum
+    """, (schemas, tables))
+
+
 def get_datatypes_reference(db: DatabaseConnection) -> list:
     """Compact reference for every datatype_id actually used by `property`
     rows in this database — id, qualified type name, the val_* column

@@ -19,6 +19,21 @@ _SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _DEFAULT_STATEMENT_TIMEOUT_MS = 600000  # 10 minutes; large datasets need long queries
 
 
+def _extra_schemas() -> list[str]:
+    """CITYDB_EXTRA_SCHEMAS (comma-separated) as a list of entries, each a
+    schema (``poi``) or one table of it (``energy.heat_demand``), every
+    part validated like CITYDB_SCHEMA. Empty when the variable is unset."""
+    entries = [e.strip() for e in os.getenv("CITYDB_EXTRA_SCHEMAS", "").split(",") if e.strip()]
+    for entry in entries:
+        parts = entry.split(".")
+        if len(parts) > 2 or not all(_SCHEMA_RE.match(part) for part in parts):
+            raise ValueError(
+                f"Invalid CITYDB_EXTRA_SCHEMAS entry {entry!r}: must be schema or "
+                f"schema.table, each matching {_SCHEMA_RE.pattern}"
+            )
+    return entries
+
+
 def _statement_timeout_ms() -> int:
     """CITYDB_STATEMENT_TIMEOUT_MS as a non-negative int (0 = no timeout)."""
     raw = os.getenv("CITYDB_STATEMENT_TIMEOUT_MS", "").strip()
@@ -55,6 +70,8 @@ class DatabaseConnection:
                 f"Invalid CITYDB_SCHEMA {schema!r}: must match {_SCHEMA_RE.pattern}"
             )
         self.schema = schema
+        # Schemas and tables beside 3DCityDB that assemble_prompt describes.
+        self.extra_schemas = _extra_schemas()
         self._pool: _pg_pool.ThreadedConnectionPool | None = None
         self._pool_lock = threading.Lock()
 

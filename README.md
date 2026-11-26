@@ -707,7 +707,28 @@ All options are set via environment variables (`.env` file or Docker Compose `en
 | `CITYDB_USER` | `citydb` | Database user |
 | `CITYDB_PASSWORD` | *(required)* | Database password |
 | `CITYDB_SCHEMA` | `citydb` | 3DCityDB schema name |
+| `CITYDB_EXTRA_SCHEMAS` | *(empty)* | Schemas (`poi`) or single tables (`energy.heat_demand`) beside 3DCityDB that `assemble_prompt` describes, comma-separated, so queries can join them; see below |
 | `DATABASE_URL` | *(auto-built)* | Full PostgreSQL URL (overrides individual vars) |
+
+#### Tables beside 3DCityDB
+
+`CITYDB_EXTRA_SCHEMAS=energy.heat_demand,poi` adds an "Other Schemas"
+section to the prompt (full and compact). It lists the named tables and every
+table, view and materialized view of the named schemas that `CITYDB_USER` can
+read (`USAGE` on the schema, `SELECT` on the table), with their columns and
+types (`geometry(MultiPolygon,25832)` carries the geometry type and SRID).
+Name single tables to keep the prompt short when a schema holds more than the
+model needs. Table and column comments go into the section too, so write what
+the rows mean and how they join there:
+
+```sql
+COMMENT ON TABLE energy.heat_demand IS 'Annual heat demand per building, in kWh.';
+COMMENT ON COLUMN energy.heat_demand.building_objectid IS 'citydb.feature.objectid';
+```
+
+Queries reach these tables by schema-qualified name. With the scratchpad on,
+`run_query` reads as `CITYDB_QUERY_USER`, which is granted only the 3DCityDB
+schema: grant it `USAGE` and `SELECT` on the extra schemas yourself.
 
 ### Ports and MCP server over HTTP
 

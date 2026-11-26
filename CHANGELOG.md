@@ -6,6 +6,16 @@ Both components are versioned together. The format is loosely based on
 with 1.2.0; the 1.0.x and 1.1.0 entries below were reconstructed from the
 published GitHub release notes and the commit history.
 
+## [Unreleased]
+
+### Added
+- `CITYDB_EXTRA_SCHEMAS` (comma-separated schemas or `schema.table`
+  entries): `assemble_prompt` adds an "Other Schemas" section, in full and
+  compact mode, listing those tables, views and materialized views that the
+  connected role can read, with column types (geometry type and SRID
+  included) and their table and column comments, so queries can join tables
+  kept beside 3DCityDB. Unset, the prompt is unchanged.
+
 ## [1.2.2]
 
 ### Changed
