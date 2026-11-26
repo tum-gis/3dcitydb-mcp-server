@@ -17,6 +17,7 @@ from .dynamic_tools import (
     get_spatial_capabilities, scan_objectclasses, resolve_properties, get_generic_attributes,
     get_db_context_snapshot, get_lod_config, get_examples, get_geometry_types_per_class,
     get_vocabulary, synthesize_examples, get_static_codelists, get_datatypes_reference,
+    get_extra_schema_columns,
 )
 
 # Compact schema constant — 5 core tables, only query-relevant columns
@@ -228,7 +229,8 @@ def _assemble_prompt_uncached(
     # ordered step-label list (and therefore the numbering) is built per mode —
     # see _assembly_steps() — and consumed in execution order below, so the
     # number shown ("Step 4/9", "Step 4/12", …) is always correct for the mode.
-    step_labels = [label for _, label in _assembly_steps(compact, include_query_agent_extras)]
+    step_labels = [label for _, label in _assembly_steps(compact, include_query_agent_extras,
+                                                         bool(db.extra_schemas))]
     step_iter = iter(step_labels)
     global _current_progress
     if os.environ.get(PROGRESS_FILE_ENV):
@@ -287,6 +289,9 @@ def _assemble_prompt_uncached(
     examples = _run(get_examples, available_ids, classnames=available_classnames,
                     addresses_present=addresses_present) if include_query_agent_extras else None
 
+    # Tables beside the 3DCityDB schema, when CITYDB_EXTRA_SCHEMAS names any
+    extra_columns = _run(get_extra_schema_columns, db, db.extra_schemas) if db.extra_schemas else []
+
     # Concrete synthesized examples using real DB values
     synth_examples = synthesize_examples(db, catalog, static_cl, vocab)
 
@@ -305,6 +310,10 @@ def _assemble_prompt_uncached(
         sections.append(_render_address_vocabulary(vocab, compact=True))
     else:
         sections.append(_render_database_schema(schema, vocab))
+
+    # 3b. Tables beside 3DCityDB (CITYDB_EXTRA_SCHEMAS)
+    if extra_columns:
+        sections.append(_render_extra_schemas(extra_columns))
 
     # 4. DB context
     sections.append(_render_db_context(db_context, toplevel_ids, datatypes=datatypes))
@@ -357,7 +366,8 @@ def _assemble_prompt_uncached(
     return "\n\n".join(sections)
 
 
-def _assembly_steps(compact: bool, include_query_agent_extras: bool) -> list:
+def _assembly_steps(compact: bool, include_query_agent_extras: bool,
+                    extra_schemas: bool = False) -> list:
     """The ordered (step_index, label) pairs actually executed for this mode.
 
     Only DB-backed work is counted as a step — cheap in-memory rendering and the
@@ -385,12 +395,39 @@ def _assembly_steps(compact: bool, include_query_agent_extras: bool) -> list:
     add("Building vocabulary (street names & attribute values)")
     if include_query_agent_extras:
         add("Gathering curated SQL examples")
+    if extra_schemas:
+        add("Describing the tables of CITYDB_EXTRA_SCHEMAS")
     return steps
 
 
 # ============================================================
 # Render functions for each component
 # ============================================================
+
+def _render_extra_schemas(columns: list[dict]) -> str:
+    """Tables beside 3DCityDB (CITYDB_EXTRA_SCHEMAS), one bullet per table with
+    its comment and its columns (type and comment). Table and column comments
+    are where their owner says what the rows mean and how they join."""
+    tables: dict[str, list[str]] = {}
+    comments: dict[str, str | None] = {}
+    for col in columns:
+        comments.setdefault(col["table_ref"], col["table_comment"])
+        text = f"`{col['column_ref']}` {col['col_type']}"
+        if col["column_comment"]:
+            text += f" ({col['column_comment']})"
+        tables.setdefault(col["table_ref"], []).append(text)
+    lines = [
+        "## Other Schemas",
+        "",
+        "These tables are not part of 3DCityDB. Query them with schema-qualified "
+        "names (`schema.table`); they may be joined to the 3DCityDB tables above.",
+        "",
+    ]
+    for name, cols in tables.items():
+        lines.append(f"- `{name}`" + (f": {comments[name]}" if comments[name] else ""))
+        lines.append("  " + ", ".join(cols))
+    return "\n".join(lines)
+
 
 def _lookup_datatype_id(attr_name: str, generic_attrs: dict | None) -> int | None:
     """Best-effort datatype_id lookup by attribute name across all classes'
